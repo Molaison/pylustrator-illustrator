@@ -35,6 +35,7 @@ from matplotlib.legend import Legend
 from matplotlib.patches import Rectangle, Ellipse, FancyArrowPatch
 from matplotlib.text import Text
 from matplotlib.figure import Figure
+from matplotlib.transforms import BboxTransformFrom, BboxTransformTo
 
 try:
     from matplotlib.figure import SubFigure  # since matplotlib 3.4.0
@@ -82,6 +83,21 @@ def cache_property(object, name):
 
     setattr(object, f"get_{name}", new_getter)
     setattr(object, f"set_{name}", new_setter)
+
+
+def legend_loc_transform(legend: Legend):
+    bbox = legend.get_bbox_to_anchor()
+    if bbox.width == 0 or bbox.height == 0:
+        legend.set_bbox_to_anchor(None)
+        bbox = legend.get_bbox_to_anchor()
+    return BboxTransformFrom(bbox)
+
+
+def legend_display_loc(legend: Legend):
+    bbox = legend.get_frame().get_bbox()
+    if isinstance(legend._get_loc(), int):
+        legend._set_loc(tuple(legend_loc_transform(legend).transform((bbox.x0, bbox.y0))))
+    return BboxTransformTo(legend.get_bbox_to_anchor()).transform(legend._get_loc())
 
 
 class TargetWrapper(object):
@@ -213,18 +229,7 @@ class TargetWrapper(object):
             points.append(p2)
         elif isinstance(self.target, Legend):
             bbox = self.target.get_frame().get_bbox()
-            if isinstance(self.target.axes, Axes):
-                transform = self.target.axes.transAxes
-            elif isinstance(self.target.figure, Figure):
-                transform = self.target.figure.transFigure
-            else:
-                transform = self.target.figure.transSubfigure
-            if isinstance(self.target._get_loc(), int):
-                # if the legend doesn't have a location yet, use the left bottom corner of the bounding box
-                self.target._set_loc(
-                    tuple(transform.inverted().transform(tuple([bbox.x0, bbox.y0])))
-                )
-            points.append(transform.transform(self.target._get_loc()))
+            points.append(legend_display_loc(self.target))
             # add points to span bounding box around the frame
             points.append([bbox.x0, bbox.y0])
             points.append([bbox.x1, bbox.y1])
@@ -320,15 +325,7 @@ class TargetWrapper(object):
                         self.target, ".xy = (%f, %f)" % tuple(self.target.xy)
                     )
         elif isinstance(self.target, Legend):
-            if isinstance(self.target.axes, Axes):
-                transform = self.target.axes.transAxes
-            elif isinstance(self.target.figure, Figure):
-                transform = self.target.figure.transFigure
-            else:
-                transform = self.target.figure.transSubfigure
-            point = transform.inverted().transform(
-                self.transform_inverted_points(points)[0]
-            )
+            point = legend_loc_transform(self.target).transform(self.transform_inverted_points(points)[0])
             self.target._loc = tuple(point)
             change_tracker.addNewLegendChange(self.target)
             # change_tracker.addChange(self.target, "._set_loc((%f, %f))" % tuple(point))

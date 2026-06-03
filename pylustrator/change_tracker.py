@@ -349,7 +349,9 @@ def getReference(element: Artist, allow_using_variable_names=True):
         return getReference(element.figure) + ".axes[%d]" % index
 
     if isinstance(element, matplotlib.legend.Legend):
-        return getReference(element.axes) + ".get_legend()"
+        if element.axes is not None:
+            return getReference(element.axes) + ".get_legend()"
+        return getReference(element.figure) + ".legends[%d]" % element.figure.legends.index(element)
     raise TypeError(str(type(element)) + " not found")
 
 

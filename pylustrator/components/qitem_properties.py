@@ -47,6 +47,7 @@ from pylustrator.QLinkableWidgets import (
 )
 from pylustrator.helper_functions import main_figure
 from pylustrator.change_tracker import UndoRedo, add_text_default, add_axes_default
+from pylustrator.snap import legend_loc_transform
 
 
 class TextPropertiesWidget(QtWidgets.QWidget):
@@ -550,14 +551,17 @@ class LegendPropertiesWidget(QtWidgets.QWidget):
             nonlocal target
             bbox = target.get_frame().get_bbox()
             axes = target.axes
-            axes.legend(**properties)
-            target = axes.get_legend()
             fig = main_figure(target)
+            if axes is None:
+                target.remove()
+                fig.legend(**properties)
+                target = fig.legends[-1]
+            else:
+                axes.legend(**properties)
+                target = axes.get_legend()
             target._set_loc(
                 tuple(
-                    target.axes.transAxes.inverted().transform(
-                        tuple([bbox.x0, bbox.y0])
-                    )
+                    legend_loc_transform(target).transform(tuple([bbox.x0, bbox.y0]))
                 )
             )
             fig.change_tracker.addNewLegendChange(target)
