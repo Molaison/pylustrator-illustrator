@@ -248,21 +248,23 @@ class GrabbableRectangleSelection(GrabFunctions):
             self.targets_rects.append(rect1)
             self.targets_rects.append(rect2)
         else:
-            pen1 = QtGui.QPen(QtGui.QColor("white"), 2)
-            pen2 = QtGui.QPen(QtGui.QColor("black"), 2)
+            pen1 = QtGui.QPen(QtGui.QColor("#1E88E5"), 3)
+            pen2 = QtGui.QPen(QtGui.QColor("white"), 1)
             pen2.setStyle(QtCore.Qt.DashLine)
-            # pen3 = QtGui.QPen(QtGui.QColor("black"), 2)
-            # brush1 = QtGui.QBrush(QtGui.QColor("red"))
+            brush1 = QtGui.QBrush(QtGui.QColor(30, 136, 229, 32))
 
             w0, h0 = x1 - x0, y1 - y0
             rect1 = QtWidgets.QGraphicsRectItem(
                 x0, y0, w0, h0, self.graphics_scene_myparent
             )
             rect1.setPen(pen1)
+            rect1.setBrush(brush1)
+            rect1.setZValue(900)
             rect2 = QtWidgets.QGraphicsRectItem(
                 x0, y0, w0, h0, self.graphics_scene_myparent
             )
             rect2.setPen(pen2)
+            rect2.setZValue(901)
 
             self.targets_rects.append(rect1)
             self.targets_rects.append(rect2)
