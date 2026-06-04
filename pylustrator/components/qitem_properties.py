@@ -47,7 +47,7 @@ from pylustrator.QLinkableWidgets import (
 )
 from pylustrator.helper_functions import main_figure
 from pylustrator.change_tracker import UndoRedo, add_text_default, add_axes_default
-from pylustrator.snap import legend_loc_transform
+from pylustrator.snap import legend_anchor_is_point, legend_loc_transform, set_legend_point_anchor_display
 
 
 class TextPropertiesWidget(QtWidgets.QWidget):
@@ -549,21 +549,32 @@ class LegendPropertiesWidget(QtWidgets.QWidget):
 
         def setProperties(properties):
             nonlocal target
+            handles = target.legend_handles
+            labels = [text.get_text() for text in target.get_texts()]
+            old_loc = target._loc
+            old_anchor = target.get_bbox_to_anchor()
+            old_point_anchor = legend_anchor_is_point(target)
+            if old_point_anchor:
+                anchor_point = old_anchor.p0
             bbox = target.get_frame().get_bbox()
             axes = target.axes
             fig = main_figure(target)
             if axes is None:
                 target.remove()
-                fig.legend(**properties)
+                fig.legend(handles=handles, labels=labels, **properties)
                 target = fig.legends[-1]
             else:
-                axes.legend(**properties)
+                axes.legend(handles=handles, labels=labels, **properties)
                 target = axes.get_legend()
-            target._set_loc(
-                tuple(
-                    legend_loc_transform(target).transform(tuple([bbox.x0, bbox.y0]))
+            if old_point_anchor:
+                set_legend_point_anchor_display(target, anchor_point)
+                target._set_loc(old_loc)
+            else:
+                target._set_loc(
+                    tuple(
+                        legend_loc_transform(target).transform(tuple([bbox.x0, bbox.y0]))
+                    )
                 )
-            )
             fig.change_tracker.addNewLegendChange(target)
             fig.figure_dragger.make_draggable(target)
             fig.figure_dragger.select_element(target)

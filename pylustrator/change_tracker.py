@@ -91,6 +91,34 @@ def unescape_string(str):
     return str
 
 
+def get_legend_reference(element: Artist):
+    figure = getattr(element, "figure", None)
+    if figure is None:
+        return None
+    legends = list(
+        dict.fromkeys(
+            list(figure.legends)
+            + [
+                legend
+                for axes in figure.axes
+                for legend in [axes.get_legend()]
+                if legend is not None
+            ]
+        )
+    )
+    for legend in legends:
+        if element in legend.legend_handles:
+            return (
+                getReference(legend)
+                + ".legend_handles[%d]" % legend.legend_handles.index(element)
+            )
+        texts = legend.get_texts()
+        if element in texts:
+            return getReference(legend) + ".get_texts()[%d]" % texts.index(element)
+        if element == legend.get_title():
+            return getReference(legend) + ".get_title()"
+
+
 def to_str(v):
     if isinstance(v, list) and len(v) and isinstance(v[0], float):
         return (
@@ -250,6 +278,9 @@ def getReference(element: Artist, allow_using_variable_names=True):
     ):
         index = element._parent.subfigs.index(element)
         return getReference(element._parent) + ".subfigs[%d]" % index
+    legend_reference = get_legend_reference(element)
+    if legend_reference is not None:
+        return legend_reference
     if isinstance(element, matplotlib.lines.Line2D):
         index = element.axes.lines.index(element)
         return getReference(element.axes) + ".lines[%d]" % index
@@ -532,7 +563,13 @@ class ChangeTracker:
             ]
 
             # get current property values
+            anchor = element.get_bbox_to_anchor()
             kwargs = {"loc": element._loc}
+            if anchor.width == 0 and anchor.height == 0:
+                transform = getattr(anchor, "_transform", element.parent.transFigure)
+                kwargs["bbox_to_anchor"] = tuple(
+                    transform.inverted().transform(anchor.p0)
+                )
             for prop, func in property_names:
                 value = func(element)
                 try:

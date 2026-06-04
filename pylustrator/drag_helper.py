@@ -23,6 +23,7 @@ import numpy as np
 from matplotlib.artist import Artist
 from matplotlib.figure import Figure, SubFigure
 from matplotlib.axes import Axes
+from matplotlib.legend import Legend
 from matplotlib.text import Text
 from matplotlib.patches import Rectangle
 from matplotlib.backend_bases import MouseEvent, KeyEvent
@@ -30,7 +31,7 @@ from typing import Sequence
 from qtpy import QtCore, QtGui, QtWidgets
 
 from .snap import TargetWrapper, getSnaps, checkSnaps, checkSnapsActive, SnapBase
-from .change_tracker import ChangeTracker
+from .change_tracker import ChangeTracker, add_text_default
 from .components.plot_layout import scene_point_to_canvas_pixels
 from pylustrator.change_tracker import UndoRedo
 import time
@@ -748,7 +749,16 @@ class DragManager:
         """make an artist draggable"""
         target.set_picker(True)
         if isinstance(target, Text):
+            add_text_default(target)
             target.set_bbox(dict(facecolor="none", edgecolor="none"))
+        if isinstance(target, Legend):
+            for handle in target.legend_handles:
+                self.make_draggable(handle)
+            for text in target.get_texts():
+                self.make_draggable(text)
+            title = target.get_title()
+            if title is not None:
+                self.make_draggable(title)
 
     def make_axes_draggable(self, axes: list[Axes]) -> None:
         for index, ax in enumerate(axes):

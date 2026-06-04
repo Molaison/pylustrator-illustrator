@@ -35,7 +35,7 @@ from matplotlib.legend import Legend
 from matplotlib.patches import Rectangle, Ellipse, FancyArrowPatch
 from matplotlib.text import Text
 from matplotlib.figure import Figure
-from matplotlib.transforms import BboxTransformFrom, BboxTransformTo
+from matplotlib.transforms import BboxTransformFrom, BboxTransformTo, IdentityTransform
 
 try:
     from matplotlib.figure import SubFigure  # since matplotlib 3.4.0
@@ -86,17 +86,33 @@ def cache_property(object, name):
 
 
 def legend_loc_transform(legend: Legend):
+    return BboxTransformFrom(legend.get_bbox_to_anchor())
+
+
+def legend_anchor_is_point(legend: Legend):
     bbox = legend.get_bbox_to_anchor()
-    if bbox.width == 0 or bbox.height == 0:
-        legend.set_bbox_to_anchor(None)
-        bbox = legend.get_bbox_to_anchor()
-    return BboxTransformFrom(bbox)
+    return bbox.width == 0 and bbox.height == 0
+
+
+def set_legend_point_anchor_display(legend: Legend, point, transform=None):
+    if transform is None:
+        transform = getattr(
+            legend.get_bbox_to_anchor(),
+            "_transform",
+            BboxTransformTo(legend.parent.bbox),
+        )
+    legend.set_bbox_to_anchor(
+        tuple(float(x) for x in transform.inverted().transform(point)),
+        transform=transform,
+    )
 
 
 def legend_display_loc(legend: Legend):
+    if legend_anchor_is_point(legend):
+        return np.array(legend.get_bbox_to_anchor().p0)
     bbox = legend.get_frame().get_bbox()
     if isinstance(legend._get_loc(), int):
-        legend._set_loc(tuple(legend_loc_transform(legend).transform((bbox.x0, bbox.y0))))
+        return np.array([bbox.x0, bbox.y0])
     return BboxTransformTo(legend.get_bbox_to_anchor()).transform(legend._get_loc())
 
 
@@ -156,6 +172,9 @@ class TargetWrapper(object):
                     )
                 self.label_x = self.target.get_position()[0]
             self.get_transform = self.target.get_transform
+        elif isinstance(self.target, Legend):
+            self.get_transform = IdentityTransform
+            self.do_scale = False
         # the default is to use get_transform
         else:
             self.get_transform = self.target.get_transform
@@ -325,8 +344,16 @@ class TargetWrapper(object):
                         self.target, ".xy = (%f, %f)" % tuple(self.target.xy)
                     )
         elif isinstance(self.target, Legend):
-            point = legend_loc_transform(self.target).transform(self.transform_inverted_points(points)[0])
-            self.target._loc = tuple(point)
+            bbox = self.target.get_bbox_to_anchor()
+            if bbox.width == 0 and bbox.height == 0:
+                set_legend_point_anchor_display(
+                    self.target, self.transform_inverted_points(points)[0]
+                )
+            else:
+                point = legend_loc_transform(self.target).transform(
+                    self.transform_inverted_points(points)[0]
+                )
+                self.target._loc = tuple(point)
             change_tracker.addNewLegendChange(self.target)
             # change_tracker.addChange(self.target, "._set_loc((%f, %f))" % tuple(point))
         elif isinstance(self.target, Axes):
