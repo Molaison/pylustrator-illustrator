@@ -182,3 +182,47 @@ def test_legend_marker_hit_testing_prefers_handle() -> None:
     assert handle.contains(event)[0]
     assert picked is handle
     plt.close(fig)
+
+
+def test_axes_legend_change_description_uses_axes_parent_transform() -> None:
+    from pylustrator.change_tracker import ChangeTracker
+
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    ax.plot([0, 1], [0, 1], label="line")
+    legend = ax.legend(loc="upper right", bbox_to_anchor=(0.95, 0.95))
+    fig.canvas.draw()
+
+    tracker = ChangeTracker.__new__(ChangeTracker)
+    command_parent, command = tracker.get_describtion_string(legend, exclude_default=False)
+
+    assert command_parent is ax
+    assert command.startswith(".legend(")
+    assert "bbox_to_anchor=" in command
+    plt.close(fig)
+
+
+def test_axes_legend_move_records_change_without_transfigure_error() -> None:
+    from pylustrator.change_tracker import ChangeTracker
+    from pylustrator.snap import TargetWrapper
+
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    tracker = ChangeTracker.__new__(ChangeTracker)
+    tracker.figure = fig
+    tracker.changes = {}
+    tracker.saved = True
+    tracker.no_save = False
+    tracker.changeCountChanged = lambda: None
+    fig.change_tracker = tracker
+    ax.plot([0, 1], [0, 1], label="line")
+    legend = ax.legend(loc="upper right", bbox_to_anchor=(0.95, 0.95))
+    fig.canvas.draw()
+
+    wrapper = TargetWrapper(legend)
+    moved_positions = [point + [8, -4] for point in wrapper.get_positions()]
+    wrapper.set_positions(moved_positions)
+
+    commands = list(tracker.changes.values())
+    assert commands[0][0] is ax
+    assert commands[0][1].startswith(".legend(")
+    assert "bbox_to_anchor=" in commands[0][1]
+    plt.close(fig)

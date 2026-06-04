@@ -386,6 +386,21 @@ def getReference(element: Artist, allow_using_variable_names=True):
     raise TypeError(str(type(element)) + " not found")
 
 
+def get_legend_anchor_transform(legend: Legend):
+    parent = legend.parent
+    if isinstance(parent, Axes):
+        return parent.transAxes
+    if isinstance(parent, Figure):
+        return parent.transFigure
+    if (
+        version.parse(mpl.__version__) >= version.parse("3.4.0")
+        and SubFigure is not None
+        and isinstance(parent, SubFigure)
+    ):
+        return parent.transSubfigure
+    raise TypeError(f"Unsupported legend parent: {type(parent)!r}")
+
+
 def setFigureVariableNames(figure: Figure):
     """get the global variable names that refer to the given figure"""
     import inspect
@@ -566,7 +581,7 @@ class ChangeTracker:
             anchor = element.get_bbox_to_anchor()
             kwargs = {"loc": element._loc}
             if anchor.width == 0 and anchor.height == 0:
-                transform = getattr(anchor, "_transform", element.parent.transFigure)
+                transform = getattr(anchor, "_transform", get_legend_anchor_transform(element))
                 kwargs["bbox_to_anchor"] = tuple(
                     transform.inverted().transform(anchor.p0)
                 )
