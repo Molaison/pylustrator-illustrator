@@ -6,6 +6,7 @@ matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.backend_bases import MouseEvent
 from matplotlib.patches import Patch
 
 
@@ -150,4 +151,34 @@ def test_legend_children_are_pickable_and_referenceable() -> None:
 
     assert (text, ".set(text='edited')") in tracker.changes.values()
     assert (handle, ".set_alpha(0.500000)") in tracker.changes.values()
+    plt.close(fig)
+
+
+def test_legend_marker_hit_testing_prefers_handle() -> None:
+    from pylustrator.drag_helper import DragManager, get_artist_children
+
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    ax.plot([0, 1], [0, 1], marker="o", markersize=10, label="line")
+    legend = ax.legend()
+    fig.canvas.draw()
+    handle = legend.legend_handles[0]
+
+    manager = DragManager.__new__(DragManager)
+    manager.figure = fig
+    manager.make_draggable(legend)
+    fig.canvas.draw()
+
+    bbox = handle.get_window_extent(fig.canvas.get_renderer())
+    event = MouseEvent(
+        "button_press_event",
+        fig.canvas,
+        (bbox.x0 + bbox.x1) / 2,
+        (bbox.y0 + bbox.y1) / 2,
+        button=1,
+    )
+    picked, _finished = manager.get_picked_element(event)
+
+    assert handle in get_artist_children(legend)
+    assert handle.contains(event)[0]
+    assert picked is handle
     plt.close(fig)

@@ -27,7 +27,7 @@ from matplotlib.legend import Legend
 from matplotlib.text import Text
 from matplotlib.patches import Rectangle
 from matplotlib.backend_bases import MouseEvent, KeyEvent
-from typing import Sequence
+from typing import Iterable, Sequence
 from qtpy import QtCore, QtGui, QtWidgets
 
 from .snap import TargetWrapper, getSnaps, checkSnaps, checkSnapsActive, SnapBase
@@ -42,6 +42,61 @@ DIR_X1 = 4
 DIR_Y1 = 8
 
 blit = False
+
+
+def _legend_selectable_children(legend: Legend) -> list[Artist]:
+    """Return legend parts that Matplotlib does not expose reliably as children."""
+    children = []
+    children.extend(getattr(legend, "legend_handles", []))
+    children.extend(legend.get_texts())
+    title = legend.get_title()
+    if title is not None:
+        children.append(title)
+    return children
+
+
+def iter_artist_children(element: Artist) -> list[tuple[Artist, bool]]:
+    """Return normal children plus explicit editable children.
+
+    The boolean marks explicit children that Pylustrator exposes even when
+    Matplotlib gives them private labels, such as legend handles.
+    """
+    children: list[tuple[Artist, bool]] = [
+        (child, False) for child in element.get_children()
+    ]
+    if isinstance(element, Legend):
+        children.extend((child, True) for child in _legend_selectable_children(element))
+
+    by_id: dict[int, int] = {}
+    unique: list[tuple[Artist, bool]] = []
+    for child, explicit in children:
+        key = id(child)
+        if key in by_id:
+            index = by_id[key]
+            unique[index] = (unique[index][0], unique[index][1] or explicit)
+            continue
+        by_id[key] = len(unique)
+        unique.append((child, explicit))
+    return unique
+
+
+def get_artist_children(element: Artist) -> list[Artist]:
+    return [child for child, _explicit in iter_artist_children(element)]
+
+
+def _is_internal_label(artist: Artist, explicit: bool = False) -> bool:
+    if explicit:
+        return False
+    label = artist.get_label()
+    return isinstance(label, str) and label.startswith("_")
+
+
+def _event_has_modifier(event, modifier: str) -> bool:
+    return (
+        modifier in event.key.split("+")
+        if event is not None and event.key is not None
+        else False
+    )
 
 
 class GrabFunctions(object):
@@ -198,6 +253,8 @@ class GrabbableRectangleSelection(GrabFunctions):
 
     def add_target(self, target: Artist):
         """add an artist to the selection"""
+        if target in [wrapped.target for wrapped in self.targets]:
+            return
         target = TargetWrapper(target)
 
         new_points = np.array(target.get_positions())
@@ -708,6 +765,11 @@ class DragManager:
     def __init__(self, figure: Figure, no_save):
         self.figure = figure
         self.figure.figure_dragger = self
+        self.marquee_start = None
+        self.marquee_rect = None
+        self.marquee_active = False
+        self.marquee_additive = False
+        self.marquee_click_element = None
 
         self.figure.canvas.mpl_disconnect(
             self.figure.canvas.manager.key_press_handler_id
@@ -733,12 +795,16 @@ class DragManager:
         self.c4 = self.figure.canvas.mpl_connect(
             "key_press_event", self.key_press_event
         )
+        self.c5 = self.figure.canvas.mpl_connect(
+            "motion_notify_event", self.motion_notify_event0
+        )
 
     def deactivate(self):
         """deactivate the interaction callbacks from the figure"""
         self.figure.canvas.mpl_disconnect(self.c3)
         self.figure.canvas.mpl_disconnect(self.c2)
         self.figure.canvas.mpl_disconnect(self.c4)
+        self.figure.canvas.mpl_disconnect(self.c5)
 
         self.selection.clear_targets()
         self.selected_element = None
@@ -789,6 +855,38 @@ class DragManager:
         for subfig in fig.subfigs:
             self.make_figure_draggable(subfig)
 
+    def iter_selectable_artists(
+        self, element: Artist = None, seen: set[int] = None
+    ) -> Iterable[Artist]:
+        if element is None:
+            element = self.figure
+        if seen is None:
+            seen = set()
+
+        for child, explicit in iter_artist_children(element):
+            key = id(child)
+            if key in seen:
+                continue
+            seen.add(key)
+            if self._is_pick_candidate(child, explicit=explicit):
+                yield child
+            yield from self.iter_selectable_artists(child, seen)
+
+    def _is_pick_candidate(
+        self, child: Artist, event: MouseEvent = None, explicit: bool = False
+    ) -> bool:
+        if not child.get_visible():
+            return False
+        if isinstance(child, Text) and child.get_text() == "":
+            return False
+        if _is_internal_label(child, explicit):
+            return False
+        if not (child.pickable() or isinstance(child, GrabberGeneric)):
+            return False
+        if event is not None and not child.contains(event)[0]:
+            return False
+        return True
+
     def get_picked_element(
         self,
         event: MouseEvent,
@@ -804,18 +902,15 @@ class DragManager:
             element = self.figure
         finished = False
         # iterate over all children
-        for child in sorted(element.get_children(), key=lambda x: x.get_zorder()):
+        children = sorted(
+            iter_artist_children(element),
+            key=lambda entry: (entry[0].get_zorder(), int(entry[1])),
+        )
+        for child, explicit in children:
             # check if the element is contained in the event and has an active dragger
             # if child.contains(event)[0] and ((getattr(child, "_draggable", None) and getattr(child, "_draggable",
             #                                                                               None).connected) or isinstance(child, GrabberGeneric) or isinstance(child, GrabbableRectangleSelection)):
-            if (
-                child.get_visible()
-                and child.contains(event)[0]
-                and (child.pickable() or isinstance(child, GrabberGeneric))
-                and not (
-                    child.get_label() is not None and child.get_label().startswith("_")
-                )
-            ):
+            if self._is_pick_candidate(child, event, explicit):
                 # if the element is the last selected, finish the search
                 if child == last_selected:
                     return picked_element, True
@@ -830,8 +925,95 @@ class DragManager:
                 break
         return picked_element, finished
 
+    def _start_marquee_selection(self, event: MouseEvent, click_element: Artist = None):
+        self.marquee_start = np.array([event.x, event.y], dtype=float)
+        self.marquee_active = False
+        self.marquee_additive = _event_has_modifier(event, "shift")
+        self.marquee_click_element = click_element
+        self._remove_marquee_rect()
+
+    def _remove_marquee_rect(self):
+        if self.marquee_rect is not None:
+            scene = self.marquee_rect.scene()
+            if scene is not None:
+                scene.removeItem(self.marquee_rect)
+            self.marquee_rect = None
+
+    def _ensure_marquee_rect(self):
+        if self.marquee_rect is not None:
+            return
+        pen = QtGui.QPen(QtGui.QColor("#1E88E5"), 1)
+        pen.setStyle(QtCore.Qt.DashLine)
+        brush = QtGui.QBrush(QtGui.QColor(30, 136, 229, 24))
+        self.marquee_rect = QtWidgets.QGraphicsRectItem(0, 0, 0, 0, self.figure._pyl_scene)
+        self.marquee_rect.setPen(pen)
+        self.marquee_rect.setBrush(brush)
+        self.marquee_rect.setZValue(899)
+
+    def _update_marquee_rect(self, event: MouseEvent):
+        if self.marquee_start is None:
+            return
+        current = np.array([event.x, event.y], dtype=float)
+        delta = current - self.marquee_start
+        if not self.marquee_active and np.max(np.abs(delta)) < 3:
+            return
+        self.marquee_active = True
+        self._ensure_marquee_rect()
+        x0, y0 = np.minimum(self.marquee_start, current)
+        x1, y1 = np.maximum(self.marquee_start, current)
+        self.marquee_rect.setRect(float(x0), float(y0), float(x1 - x0), float(y1 - y0))
+
+    def _finish_marquee_selection(self, event: MouseEvent):
+        start = self.marquee_start
+        active = self.marquee_active
+        additive = self.marquee_additive
+        click_element = self.marquee_click_element
+        self.marquee_start = None
+        self.marquee_active = False
+        self.marquee_additive = False
+        self.marquee_click_element = None
+        self._remove_marquee_rect()
+        if start is None:
+            return
+        if active:
+            self.select_elements_in_bbox(start[0], start[1], event.x, event.y, additive=additive)
+        else:
+            self.select_element(click_element, event)
+
+    def motion_notify_event0(self, event: MouseEvent):
+        self._update_marquee_rect(event)
+
+    def _artist_intersects_bbox(
+        self, artist: Artist, x0: float, y0: float, x1: float, y1: float
+    ) -> bool:
+        points = np.array(TargetWrapper(artist).get_positions())
+        if len(points) == 0:
+            return False
+        ax0, ay0 = np.min(points[:, 0]), np.min(points[:, 1])
+        ax1, ay1 = np.max(points[:, 0]), np.max(points[:, 1])
+        if isinstance(artist, Axes):
+            return ax0 >= x0 and ax1 <= x1 and ay0 >= y0 and ay1 <= y1
+        return ax1 >= x0 and ax0 <= x1 and ay1 >= y0 and ay0 <= y1
+
+    def select_elements_in_bbox(
+        self, x0: float, y0: float, x1: float, y1: float, additive: bool = False
+    ) -> list[Artist]:
+        x0, x1 = sorted((float(x0), float(x1)))
+        y0, y1 = sorted((float(y0), float(y1)))
+        elements = [
+            artist
+            for artist in self.iter_selectable_artists()
+            if self._artist_intersects_bbox(artist, x0, y0, x1, y1)
+        ]
+        if elements or not additive:
+            self.select_elements(elements, additive=additive)
+        return elements
+
     def button_release_event0(self, event: MouseEvent):
         """when the mouse button is released"""
+        if self.marquee_start is not None:
+            self._finish_marquee_selection(event)
+            return
         # release the grabber
         if self.grab_element:
             self.grab_element.button_release_event(event)
@@ -843,7 +1025,11 @@ class DragManager:
     def button_press_event0(self, event: MouseEvent):
         """when the mouse button is pressed"""
         if event.button == 1:
-            last = self.selection.targets[-1] if len(self.selection.targets) else None
+            last = (
+                self.selection.targets[-1].target
+                if len(self.selection.targets)
+                else None
+            )
             contained = np.any(
                 [t.target.contains(event)[0] for t in self.selection.targets]
             )
@@ -856,6 +1042,12 @@ class DragManager:
             # if the element is a grabber, store it
             if isinstance(picked_element, GrabberGeneric):
                 self.grab_element = picked_element
+            elif isinstance(picked_element, Axes) and not contained and not event.dblclick:
+                self._start_marquee_selection(event, click_element=picked_element)
+                return
+            elif picked_element is None and not contained:
+                self._start_marquee_selection(event)
+                return
             # if not, we want to keep our selected element, if the click was in the area of the selected element
             elif len(self.selection.targets) == 0 or not contained or event.dblclick:
                 self.select_element(picked_element, event)
@@ -870,24 +1062,55 @@ class DragManager:
 
     def select_element(self, element: Artist, event: MouseEvent = None):
         """select an artist in a figure"""
-        # do nothing if it is already selected
-        if element == self.selected_element:
-            return
-        # if there was was previously selected element, deselect it
-        if self.selected_element is not None:
-            self.on_deselect(event)
+        self.select_elements(
+            [] if element is None else [element],
+            event=event,
+            additive=_event_has_modifier(event, "shift"),
+            primary=element,
+        )
 
-        # if there is a new element, select it
-        self.on_select(element, event)
-        self.selected_element = element
+    def select_elements(
+        self,
+        elements: Iterable[Artist],
+        event: MouseEvent = None,
+        additive: bool = False,
+        primary: Artist = None,
+    ):
+        """Select one or more artists through the same model used by the canvas."""
+        elements = [element for element in elements if element is not None]
+        unique = []
+        for element in elements:
+            if element not in unique:
+                unique.append(element)
+        elements = unique
+        if primary is None and elements:
+            primary = elements[-1]
+
+        current = [target.target for target in self.selection.targets]
+        if (
+            not additive
+            and primary == self.selected_element
+            and len(current) == len(elements) == 1
+            and current[0] == primary
+        ):
+            return
+
+        if not additive:
+            self.selection.clear_targets()
+
+        for element in elements:
+            if element != primary:
+                self.selection.add_target(element)
+
+        if primary is not None:
+            self.on_select(primary, event)
+        else:
+            self.on_select(None, event)
+        self.selected_element = primary
 
     def on_deselect(self, event: MouseEvent):
         """deselect currently selected artists"""
-        modifier = (
-            "shift" in event.key.split("+")
-            if event is not None and event.key is not None
-            else False
-        )
+        modifier = _event_has_modifier(event, "shift")
         # only if the modifier key is not used
         if not modifier:
             self.selection.clear_targets()

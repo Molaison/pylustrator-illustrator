@@ -6,6 +6,8 @@ from qtpy import QtCore, QtGui, QtWidgets
 import matplotlib as mpl
 from matplotlib.artist import Artist
 
+from pylustrator.drag_helper import get_artist_children
+
 
 class myTreeWidgetItem(QtGui.QStandardItem):
     def __init__(self, parent: QtWidgets.QWidget = None):
@@ -37,7 +39,7 @@ class MyTreeView(QtWidgets.QTreeView):
     last_hover = None
 
     def item_selected(self, x):
-        if not self.fig.no_figure_dragger_selection_update:
+        if not getattr(self.fig, "no_figure_dragger_selection_update", False):
             if getattr(self.fig, "figure_dragger", None) is not None:
                 self.fig.figure_dragger.select_element(x)
 
@@ -71,6 +73,7 @@ class MyTreeView(QtWidgets.QTreeView):
         self.setUniformRowHeights(True)
         self.setHeaderHidden(True)
         self.setAnimated(True)
+        self.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
         self.setModel(self.model)
         self.expanded.connect(self.TreeExpand)
         self.clicked.connect(self.treeClicked)
@@ -88,6 +91,16 @@ class MyTreeView(QtWidgets.QTreeView):
 
     def select_element(self, element: Artist):
         """select an element"""
+        selected_entries = []
+        for index in self.selectionModel().selectedIndexes():
+            if index.column() != 0:
+                continue
+            try:
+                selected_entries.append(index.model().itemFromIndex(index).entry)
+            except AttributeError:
+                continue
+        if element in selected_entries:
+            return
         if element is None:
             self.setCurrentIndex(self.fig)
         else:
@@ -107,18 +120,36 @@ class MyTreeView(QtWidgets.QTreeView):
         self, selection: QtCore.QItemSelection, y: QtCore.QItemSelection
     ):
         """when the selection in the tree view changes"""
-        try:
-            entry = (
-                selection.indexes()[0]
-                .model()
-                .itemFromIndex(selection.indexes()[0])
-                .entry
-            )
-        except IndexError:
-            entry = None
-        if self.last_selection != entry:
-            self.last_selection = entry
-            self.item_selected(entry)
+        if getattr(self, "fig", None) is None:
+            return
+        entries = []
+        for index in self.selectionModel().selectedIndexes():
+            if index.column() != 0:
+                continue
+            try:
+                entry = index.model().itemFromIndex(index).entry
+            except AttributeError:
+                continue
+            if entry is not None and entry not in entries:
+                entries.append(entry)
+        entry = entries[-1] if entries else None
+        current_index = self.currentIndex()
+        if current_index.isValid():
+            try:
+                current_entry = current_index.model().itemFromIndex(current_index).entry
+            except AttributeError:
+                current_entry = None
+            if current_entry in entries:
+                entry = current_entry
+        if self.last_selection != entries:
+            self.last_selection = list(entries)
+            if len(entries) > 1 and not getattr(
+                self.fig, "no_figure_dragger_selection_update", False
+            ):
+                if getattr(self.fig, "figure_dragger", None) is not None:
+                    self.fig.figure_dragger.select_elements(entries, primary=entry)
+            else:
+                self.item_selected(entry)
 
     def setCurrentIndex(self, entry: Artist):
         """set the currently selected entry"""
@@ -126,7 +157,13 @@ class MyTreeView(QtWidgets.QTreeView):
             item = self.getItemFromEntry(entry)
             if item is not None:
                 try:
-                    super().setCurrentIndex(item.index())
+                    index = item.index()
+                    self.selectionModel().select(
+                        index,
+                        QtCore.QItemSelectionModel.ClearAndSelect
+                        | QtCore.QItemSelectionModel.Rows,
+                    )
+                    super().setCurrentIndex(index)
                 except RuntimeError:  # maybe find out why we run into this error when the figure is changed
                     pass
                 return
@@ -175,7 +212,7 @@ class MyTreeView(QtWidgets.QTreeView):
         """when expanding a tree item"""
         if entry is None:
             return [self.fig]
-        return entry.get_children()
+        return get_artist_children(entry)
 
     def getParentEntry(self, entry: Artist) -> Artist:
         """get the parent of an item"""

@@ -32,6 +32,7 @@ try:  # starting from mpl version 3.6.0
 except ImportError:
     from matplotlib.axes._subplots import Axes
 from matplotlib.legend import Legend
+from matplotlib.lines import Line2D
 from matplotlib.patches import Rectangle, Ellipse, FancyArrowPatch
 from matplotlib.text import Text
 from matplotlib.figure import Figure
@@ -175,6 +176,9 @@ class TargetWrapper(object):
         elif isinstance(self.target, Legend):
             self.get_transform = IdentityTransform
             self.do_scale = False
+        elif isinstance(self.target, Line2D):
+            self.get_transform = IdentityTransform
+            self.do_scale = False
         # the default is to use get_transform
         else:
             self.get_transform = self.target.get_transform
@@ -263,6 +267,10 @@ class TargetWrapper(object):
                     or update_offset
                 ):
                     self.target._pylustrator_offset = points[1] - points[0]
+        elif isinstance(self.target, Line2D):
+            bbox = self.target.get_window_extent(self.figure.canvas.get_renderer())
+            points.append([bbox.x0, bbox.y0])
+            points.append([bbox.x1, bbox.y1])
         return self.transform_points(points)
 
     def set_positions(self, points: (int, int)):
