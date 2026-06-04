@@ -326,6 +326,72 @@ def test_extra_axes_legend_saved_move_reopens_on_same_artist() -> None:
     plt.close(fig2)
 
 
+def test_extra_axes_legend_replay_after_axes_position_change() -> None:
+    from pylustrator.change_tracker import ChangeTracker
+    from pylustrator.snap import TargetWrapper
+
+    axes_position = [0.1239, 0.2097, 0.7228, 0.7258]
+
+    def make_figure():
+        fig, ax = plt.subplots(num=1, clear=True, figsize=(4, 3), dpi=100)
+        method = ax.legend(
+            handles=[Line2D([0], [0], label="method")],
+            labels=["method"],
+            loc="upper right",
+            bbox_to_anchor=(0.944, 0.9818),
+            title="method",
+        )
+        ax.add_artist(method)
+        current = ax.legend(
+            handles=[Line2D([0], [0], label="current")],
+            labels=["current"],
+            loc="lower right",
+            title="current",
+        )
+        fig.canvas.draw()
+        return fig, ax, method, current
+
+    plt.close("all")
+    fig, ax, method, current = make_figure()
+    tracker = ChangeTracker.__new__(ChangeTracker)
+    tracker.figure = fig
+    tracker.changes = {}
+    tracker.saved = True
+    tracker.no_save = False
+    tracker.changeCountChanged = lambda: None
+    fig.change_tracker = tracker
+
+    ax.set(position=axes_position)
+    tracker.addChange(ax, ".set(position=[0.1239, 0.2097, 0.7228, 0.7258])")
+    fig.canvas.draw()
+    before = method.get_window_extent(fig.canvas.get_renderer()).bounds
+    wrapper = TargetWrapper(method)
+    wrapper.set_positions([point + [20, -10] for point in wrapper.get_positions()])
+    fig.canvas.draw()
+    moved = method.get_window_extent(fig.canvas.get_renderer()).bounds
+    saved_lines = tracker.sorted_changes()
+
+    axes_index = next(index for index, line in enumerate(saved_lines) if ".set(position=" in line)
+    legend_index = next(index for index, line in enumerate(saved_lines) if ".artists[0].set_bbox_to_anchor" in line)
+    assert axes_index < legend_index
+
+    plt.close(fig)
+    fig2, ax2, method2, current2 = make_figure()
+    for line in saved_lines:
+        exec(line)
+    fig2.canvas.draw()
+    reopened = method2.get_window_extent(fig2.canvas.get_renderer()).bounds
+
+    assert ax2.get_legend() is current2
+    assert ax2.artists[0] is method2
+    assert [text.get_text() for text in current2.get_texts()] == ["current"]
+    assert [text.get_text() for text in method2.get_texts()] == ["method"]
+    assert np.allclose((moved[0], moved[1]), (reopened[0], reopened[1]), atol=0.1)
+    assert_bbox_close((moved[2], moved[3]), (reopened[2], reopened[3]))
+    assert_bbox_close((moved[0] - before[0], moved[1] - before[1]), (20.0, -10.0))
+    plt.close(fig2)
+
+
 def test_axes_legend_move_records_change_without_transfigure_error() -> None:
     from pylustrator.change_tracker import ChangeTracker
     from pylustrator.snap import TargetWrapper
