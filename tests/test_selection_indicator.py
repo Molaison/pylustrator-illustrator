@@ -6,11 +6,19 @@ matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
 from matplotlib.backend_bases import MouseEvent
+from matplotlib.patches import Patch
 from qtpy import QtCore, QtWidgets
 
 from pylustrator.components.plot_layout import scene_point_to_canvas_pixels, selection_scene_transform
 from pylustrator.components.tree_view import MyTreeView
-from pylustrator.drag_helper import DragManager, GrabbableRectangleSelection
+from pylustrator.drag_helper import (
+    DIR_X0,
+    DIR_X1,
+    DIR_Y0,
+    DIR_Y1,
+    DragManager,
+    GrabbableRectangleSelection,
+)
 from pylustrator.snap import TargetWrapper
 
 
@@ -23,6 +31,18 @@ class SelectionView:
 class ChangeTracker:
     def addEdit(self, edit):
         self.edit = edit
+
+    def addNewLegendChange(self, target):
+        self.legend = target
+
+    def addNewTextChange(self, target):
+        self.text = target
+
+    def addNewAxesChange(self, target):
+        self.axes = target
+
+    def addChange(self, target, command):
+        self.change = (target, command)
 
 
 class Signals:
@@ -96,6 +116,31 @@ def attach_drag_manager(fig):
     fig.selection = manager.selection
     fig.figure_dragger = manager
     return manager
+
+
+def selection_target_extents(selection):
+    extents = []
+    for target in selection.targets:
+        points = TargetWrapper(target.target).get_positions()
+        x_values = [point[0] for point in points]
+        y_values = [point[1] for point in points]
+        extents.append((min(x_values), min(y_values), max(x_values), max(y_values)))
+    return extents
+
+
+def selection_rect_extents(selection):
+    extents = []
+    for index in range(0, len(selection.targets_rects), 2):
+        rect = selection.targets_rects[index].rect()
+        extents.append(
+            (
+                rect.x(),
+                rect.y(),
+                rect.x() + rect.width(),
+                rect.y() + rect.height(),
+            )
+        )
+    return extents
 
 
 def test_multi_selection_has_visible_per_target_indicators() -> None:
@@ -259,4 +304,44 @@ def test_tree_view_extended_selection_updates_drag_manager_selection() -> None:
     manager.selection.clear_targets()
     plt.close(fig)
     container.deleteLater()
+    assert app is not None
+
+
+def test_multi_selection_drag_keeps_legend_child_rectangles_aligned() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(3.56, 3.35), dpi=100)
+    legend = fig.legend(
+        handles=[
+            Patch(label="ipTM-oriented"),
+            Patch(label="+ pocket-oriented"),
+            Patch(label="+ trajectory rescue"),
+        ],
+        loc="upper center",
+        bbox_to_anchor=(0.628, 0.99),
+        ncol=3,
+        fontsize=5.25,
+        handlelength=0.72,
+        columnspacing=0.3,
+        handletextpad=0.2,
+        borderaxespad=0.0,
+        labelspacing=0.3,
+        borderpad=0.28,
+        frameon=False,
+    )
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    bbox = legend.get_window_extent(fig.canvas.get_renderer()).expanded(1.05, 1.2)
+
+    manager.select_elements_in_bbox(bbox.x0, bbox.y0, bbox.x1, bbox.y1)
+    manager.selection.start_move()
+    manager.selection.addOffset((12, -7), DIR_X0 | DIR_X1 | DIR_Y0 | DIR_Y1)
+
+    for target_extent, rect_extent in zip(
+        selection_target_extents(manager.selection),
+        selection_rect_extents(manager.selection),
+    ):
+        assert target_extent == rect_extent
+
+    manager.selection.clear_targets()
+    plt.close(fig)
     assert app is not None

@@ -671,7 +671,7 @@ class GrabbableRectangleSelection(GrabFunctions):
         for target in self.targets:
             self.transform_target(transform, target)
 
-        self.update_selection_rectangles(True)
+        self.update_selection_rectangles()
         # for rect in self.targets_rects:
         #    self.transform_target(transform, TargetWrapper(rect))
 
@@ -887,6 +887,40 @@ class DragManager:
             return False
         return True
 
+    def _artist_contains_descendant(self, parent: Artist, descendant: Artist) -> bool:
+        for child, _explicit in iter_artist_children(parent):
+            if child is descendant:
+                return True
+            if self._artist_contains_descendant(child, descendant):
+                return True
+        return False
+
+    def _normalize_selection(
+        self, elements: Iterable[Artist], primary: Artist = None
+    ) -> tuple[list[Artist], Artist]:
+        unique = []
+        for element in elements:
+            if element is not None and element not in unique:
+                unique.append(element)
+
+        normalized = [
+            element
+            for element in unique
+            if not any(
+                other is not element and self._artist_contains_descendant(other, element)
+                for other in unique
+            )
+        ]
+
+        if primary not in normalized:
+            for element in normalized:
+                if primary is not None and self._artist_contains_descendant(element, primary):
+                    primary = element
+                    break
+            else:
+                primary = normalized[-1] if normalized else None
+        return normalized, primary
+
     def get_picked_element(
         self,
         event: MouseEvent,
@@ -991,7 +1025,7 @@ class DragManager:
             return False
         ax0, ay0 = np.min(points[:, 0]), np.min(points[:, 1])
         ax1, ay1 = np.max(points[:, 0]), np.max(points[:, 1])
-        if isinstance(artist, Axes):
+        if isinstance(artist, (Axes, Legend)):
             return ax0 >= x0 and ax1 <= x1 and ay0 >= y0 and ay1 <= y1
         return ax1 >= x0 and ax0 <= x1 and ay1 >= y0 and ay0 <= y1
 
@@ -1077,26 +1111,15 @@ class DragManager:
         primary: Artist = None,
     ):
         """Select one or more artists through the same model used by the canvas."""
-        elements = [element for element in elements if element is not None]
-        unique = []
-        for element in elements:
-            if element not in unique:
-                unique.append(element)
-        elements = unique
-        if primary is None and elements:
-            primary = elements[-1]
+        if additive:
+            elements = [target.target for target in self.selection.targets] + list(elements)
+        elements, primary = self._normalize_selection(elements, primary)
 
         current = [target.target for target in self.selection.targets]
-        if (
-            not additive
-            and primary == self.selected_element
-            and len(current) == len(elements) == 1
-            and current[0] == primary
-        ):
+        if primary == self.selected_element and current == elements:
             return
 
-        if not additive:
-            self.selection.clear_targets()
+        self.selection.clear_targets()
 
         for element in elements:
             if element != primary:
