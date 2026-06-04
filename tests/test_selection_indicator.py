@@ -345,3 +345,52 @@ def test_multi_selection_drag_keeps_legend_child_rectangles_aligned() -> None:
     manager.selection.clear_targets()
     plt.close(fig)
     assert app is not None
+
+
+def test_pyl_show_initializes_axes_defaults_before_drag_changes() -> None:
+    from matplotlib import _pylab_helpers
+    from pylustrator import QtGuiDrag
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    created_windows = []
+
+    class PlotWindowDouble:
+        def __init__(self):
+            self.fig = None
+            self.updated = False
+            created_windows.append(self)
+
+        def setFigure(self, fig):
+            self.fig = fig
+
+        def addFigure(self, fig):
+            assert self.fig is fig
+
+        def update(self):
+            self.updated = True
+
+    original_plot_window = QtGuiDrag.PlotWindow
+    original_app = QtGuiDrag.app
+    try:
+        QtGuiDrag.app = app
+        fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+        _scene, origin = make_selection_scene()
+        fig._pyl_scene = origin
+        assert getattr(ax, "_pylustrator_old_args", None) is None
+
+        QtGuiDrag.PlotWindow = PlotWindowDouble
+        QtGuiDrag.pyl_show(hide_window=True)
+
+        assert created_windows[0].updated is True
+        assert getattr(ax, "_pylustrator_old_args", None) is not None
+        selection = fig.selection
+        fig.figure_dragger.select_element(ax)
+        selection.start_move()
+        selection.addOffset((2, 0), selection.dir)
+        selection.end_move()
+    finally:
+        plt.close("all")
+        _pylab_helpers.Gcf.destroy_all()
+        QtGuiDrag.PlotWindow = original_plot_window
+        QtGuiDrag.app = original_app
+    assert app is not None

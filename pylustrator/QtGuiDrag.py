@@ -205,6 +205,7 @@ def pyl_show(hide_window: bool = False):
         warnAboutTicks(fig)
         # add dragger
         DragManager(fig, no_save_allowed)
+        init_figure(fig)
         window.setFigure(fig)
         window.addFigure(fig)
         window.update()
