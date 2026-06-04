@@ -422,6 +422,11 @@ class PlotWindow(QtWidgets.QWidget):
         self.redo_act.setShortcut("Ctrl+Y")
         file_menu.addAction(self.redo_act)
 
+        delete_act = QAction("Delete", self)
+        delete_act.triggered.connect(self.delete_selection)
+        delete_act.setShortcuts(["Delete", "Backspace"])
+        file_menu.addAction(delete_act)
+
         self.menuBar.addAction(info_act)
 
         layout_parent.addWidget(self.menuBar)
@@ -431,6 +436,9 @@ class PlotWindow(QtWidgets.QWidget):
 
     def redo(self):
         self.fig.figure_dragger.redo()
+
+    def delete_selection(self):
+        self.fig.selection.delete_targets()
 
     def __init__(self, number: int = 0):
         """The main window of pylustrator

@@ -402,13 +402,19 @@ class GrabbableRectangleSelection(GrabFunctions):
                     track_changes=False,
                 )
 
+        def reference_bounds():
+            if len(self.targets) == 1:
+                bbox = self.figure.bbox
+                return np.array([bbox.x0, bbox.y0, bbox.x1, bbox.y1])
+            return self.positions
+
         def align(y: int, func: callable):
             self.start_move()
             centers = []
             for target in self.targets:
                 new_points = np.array(target.get_positions())
                 centers.append(func(new_points[:, y]))
-            new_center = func(self.positions[y::2])
+            new_center = func(reference_bounds()[y::2])
             for index, target in enumerate(self.targets):
                 new_points = np.array(target.get_positions())
                 new_points[:, y] += new_center - centers[index]
@@ -469,6 +475,14 @@ class GrabbableRectangleSelection(GrabFunctions):
             distribute(1)
 
         self.figure.signals.figure_selection_moved.emit()
+
+    def delete_targets(self):
+        """Delete all selected targets."""
+        if len(self.targets) == 0:
+            return
+        for target in self.targets[::-1]:
+            self.figure.change_tracker.removeElement(target.target)
+        self.figure.canvas.draw()
 
     def update_selection_rectangles(self, use_previous_offset=False):
         """update the selection visualisation"""
@@ -758,10 +772,8 @@ class GrabbableRectangleSelection(GrabFunctions):
             self.has_moved = True
             self.end_move()
             self.figure.canvas.schedule_draw()
-        if event.key == "delete":
-            for target in self.targets[::-1]:
-                self.figure.change_tracker.removeElement(target.target)
-            self.figure.canvas.draw()
+        if event.key in ["delete", "backspace"]:
+            self.delete_targets()
 
 
 class DragManager:

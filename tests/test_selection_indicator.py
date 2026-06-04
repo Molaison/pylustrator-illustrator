@@ -5,7 +5,7 @@ import matplotlib
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
-from matplotlib.backend_bases import MouseEvent
+from matplotlib.backend_bases import KeyEvent, MouseEvent
 from matplotlib.patches import Patch
 from qtpy import QtCore, QtGui, QtWidgets
 
@@ -43,6 +43,10 @@ class ChangeTracker:
 
     def addChange(self, target, command):
         self.change = (target, command)
+
+    def removeElement(self, target):
+        self.removed = target
+        target.set_visible(False)
 
 
 class Signals:
@@ -199,6 +203,58 @@ def test_axes_selection_indicator_updates_after_axes_move() -> None:
     assert rect.x() == expected_x0
     assert rect.y() == expected_y0
     selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_single_selection_aligns_to_canvas_bounds() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 2), dpi=100)
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    ax.set_position([0.2, 0.2, 0.3, 0.3])
+    manager.selection.add_target(ax)
+
+    manager.selection.align_points("left_x")
+    fig.canvas.draw()
+
+    assert abs(ax.get_position().x0) < 1e-9
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_multi_selection_aligns_to_selection_bounds() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, axes = plt.subplots(1, 2, figsize=(4, 2), dpi=100)
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    axes[0].set_position([0.2, 0.2, 0.3, 0.3])
+    axes[1].set_position([0.6, 0.1, 0.2, 0.2])
+    manager.selection.add_target(axes[0])
+    manager.selection.add_target(axes[1])
+
+    manager.selection.align_points("left_x")
+    fig.canvas.draw()
+
+    assert abs(axes[0].get_position().x0 - 0.2) < 1e-9
+    assert abs(axes[1].get_position().x0 - 0.2) < 1e-9
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_backspace_deletes_selected_object() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 2), dpi=100)
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.selection.add_target(ax)
+
+    manager.selection.keyPressEvent(KeyEvent("key_press_event", fig.canvas, "backspace"))
+
+    assert fig.change_tracker.removed is ax
+    assert not ax.get_visible()
     plt.close(fig)
     assert app is not None
 

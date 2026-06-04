@@ -253,6 +253,7 @@ def test_extra_axes_legend_uses_artist_reference_not_current_axes_legend() -> No
     assert commands[0] == [method, "._set_loc(1)"]
     assert commands[1][0] is method
     assert commands[1][1].startswith(".set_bbox_to_anchor(")
+    assert "transFigure" in commands[1][1]
     assert "get_legend()" not in commands[1][1]
     for command_parent, command in commands:
         eval("command_parent" + command)
@@ -304,7 +305,7 @@ def test_extra_axes_legend_saved_move_reopens_on_same_artist() -> None:
 
     assert saved_lines == [
         "plt.figure(1).axes[0].artists[0]._set_loc(1)",
-        "plt.figure(1).axes[0].artists[0].set_bbox_to_anchor((0.9387, 0.8697))",
+        "plt.figure(1).axes[0].artists[0].set_bbox_to_anchor((0.8525, 0.7797), transform=plt.figure(1).transFigure)",
     ]
     assert ax.get_legend() is current
     assert ax.artists[0] is method

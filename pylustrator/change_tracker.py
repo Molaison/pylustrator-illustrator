@@ -641,16 +641,15 @@ class ChangeTracker:
                 legend_kwargs.pop("labels", None)
                 loc = legend_kwargs.pop("loc")
                 commands = [[element, f"._set_loc({to_str(loc)})"]]
-                anchor_kwargs = {
-                    key: legend_kwargs.pop(key)
-                    for key in ["bbox_to_anchor"]
-                    if key in legend_kwargs
-                }
-                if anchor_kwargs:
+                if "bbox_to_anchor" in legend_kwargs:
+                    anchor = element.get_bbox_to_anchor()
+                    anchor_point = element.figure.transFigure.inverted().transform(anchor.p0)
                     commands.append(
                         [
                             element,
-                            f".set_bbox_to_anchor({to_str(anchor_kwargs['bbox_to_anchor'])})",
+                            ".set_bbox_to_anchor("
+                            f"{to_str(tuple(anchor_point))}, "
+                            f"transform={getReference(element.figure)}.transFigure)",
                         ]
                     )
                 return commands
