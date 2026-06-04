@@ -396,8 +396,13 @@ def getReference(element: Artist, allow_using_variable_names=True):
         return getReference(element.figure) + ".axes[%d]" % index
 
     if isinstance(element, matplotlib.legend.Legend):
-        if element.axes is not None:
+        if element.axes is not None and element.axes.get_legend() is element:
             return getReference(element.axes) + ".get_legend()"
+        if element.axes is not None and element in element.axes.artists:
+            return (
+                getReference(element.axes)
+                + ".artists[%d]" % element.axes.artists.index(element)
+            )
         return getReference(element.figure) + ".legends[%d]" % element.figure.legends.index(element)
     raise TypeError(str(type(element)) + " not found")
 
@@ -415,6 +420,14 @@ def get_legend_anchor_transform(legend: Legend):
     ):
         return parent.transSubfigure
     raise TypeError(f"Unsupported legend parent: {type(parent)!r}")
+
+
+def get_legend_anchor_kwargs(legend: Legend) -> dict:
+    anchor = legend.get_bbox_to_anchor()
+    if anchor.width == 0 and anchor.height == 0:
+        transform = getattr(anchor, "_transform", get_legend_anchor_transform(legend))
+        return {"bbox_to_anchor": tuple(transform.inverted().transform(anchor.p0))}
+    return {}
 
 
 def setFigureVariableNames(figure: Figure):
@@ -594,17 +607,12 @@ class ChangeTracker:
             ]
 
             # get current property values
-            anchor = element.get_bbox_to_anchor()
             kwargs = {
                 "handles": CodeReference(getReference(element) + ".legend_handles"),
                 "labels": [text.get_text() for text in element.get_texts()],
                 "loc": element._loc,
             }
-            if anchor.width == 0 and anchor.height == 0:
-                transform = getattr(anchor, "_transform", get_legend_anchor_transform(element))
-                kwargs["bbox_to_anchor"] = tuple(
-                    transform.inverted().transform(anchor.p0)
-                )
+            kwargs.update(get_legend_anchor_kwargs(element))
             for prop, func in property_names:
                 value = func(element)
                 try:
@@ -627,6 +635,25 @@ class ChangeTracker:
                 if value != default or not exclude_default:
                     kwargs[prop] = value
             parent = element.figure if element.axes is None else element.axes
+            if element.axes is not None and element.axes.get_legend() is not element:
+                legend_kwargs = dict(kwargs)
+                legend_kwargs.pop("handles", None)
+                legend_kwargs.pop("labels", None)
+                loc = legend_kwargs.pop("loc")
+                commands = [[element, f"._set_loc({to_str(loc)})"]]
+                anchor_kwargs = {
+                    key: legend_kwargs.pop(key)
+                    for key in ["bbox_to_anchor"]
+                    if key in legend_kwargs
+                }
+                if anchor_kwargs:
+                    commands.append(
+                        [
+                            element,
+                            f".set_bbox_to_anchor({to_str(anchor_kwargs['bbox_to_anchor'])})",
+                        ]
+                    )
+                return commands
             return parent, f".legend({kwargs_to_string(kwargs)})"
         elif isinstance(element, Axes):
             properties = [
@@ -770,7 +797,6 @@ class ChangeTracker:
         for reference_obj, reference_command in keys:
             if reference_obj == element:
                 del self.changes[reference_obj, reference_command]
-
         # store the changes
         if getattr(element, "is_new_text", False):
             if not element.get_visible() or element.get_text() == "":
@@ -784,18 +810,20 @@ class ChangeTracker:
             main_figure(element).change_tracker.addChange(command_parent, command)
 
     def addNewLegendChange(self, element):
-        command_parent, command = self.get_describtion_string(element)
+        desc_strings = self.get_describtion_string(element)
+        if not isinstance(desc_strings, list):
+            desc_strings = [desc_strings]
 
         # make sure there are no old changes to this element
         keys = [k for k in self.changes]
         for reference_obj, reference_command in keys:
             if reference_obj == element:
                 del self.changes[reference_obj, reference_command]
-
         # store the changes
         # if not element.get_visible() and getattr(element, "is_new_text", False):
         #    return
-        main_figure(element).change_tracker.addChange(command_parent, command)
+        for command_parent, command in desc_strings:
+            main_figure(element).change_tracker.addChange(command_parent, command)
 
     def addNewAxesChange(self, element):
         desc_strings = self.get_describtion_string(element)

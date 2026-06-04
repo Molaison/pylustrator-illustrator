@@ -7,6 +7,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.backend_bases import MouseEvent
+from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 
 
@@ -222,6 +223,107 @@ def test_axes_legend_change_description_preserves_handles_and_labels() -> None:
     assert [text.get_text() for text in changed.get_texts()] == ["line A", "line B"]
     assert len(changed.legend_handles) == 2
     plt.close(fig)
+
+
+def test_extra_axes_legend_uses_artist_reference_not_current_axes_legend() -> None:
+    from pylustrator.change_tracker import ChangeTracker, getReference
+
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    method = ax.legend(
+        handles=[Line2D([0], [0], label="method")],
+        labels=["method"],
+        loc="upper right",
+        bbox_to_anchor=(0.9, 0.9),
+        title="method",
+    )
+    ax.add_artist(method)
+    current = ax.legend(
+        handles=[Line2D([0], [0], label="current")],
+        labels=["current"],
+        loc="lower right",
+        title="current",
+    )
+    fig.canvas.draw()
+
+    tracker = ChangeTracker.__new__(ChangeTracker)
+    commands = tracker.get_describtion_string(method, exclude_default=False)
+
+    assert getReference(method).endswith(".artists[0]")
+    assert getReference(current).endswith(".get_legend()")
+    assert commands[0] == [method, "._set_loc(1)"]
+    assert commands[1][0] is method
+    assert commands[1][1].startswith(".set_bbox_to_anchor(")
+    assert "get_legend()" not in commands[1][1]
+    for command_parent, command in commands:
+        eval("command_parent" + command)
+    assert ax.get_legend() is current
+    assert ax.artists[0] is method
+    plt.close(fig)
+
+
+def test_extra_axes_legend_saved_move_reopens_on_same_artist() -> None:
+    from pylustrator.change_tracker import ChangeTracker
+    from pylustrator.snap import TargetWrapper
+
+    def make_figure():
+        fig, ax = plt.subplots(num=1, clear=True, figsize=(4, 3), dpi=100)
+        method = ax.legend(
+            handles=[Line2D([0], [0], label="method")],
+            labels=["method"],
+            loc="upper right",
+            bbox_to_anchor=(0.9, 0.9),
+            title="method",
+        )
+        ax.add_artist(method)
+        current = ax.legend(
+            handles=[Line2D([0], [0], label="current")],
+            labels=["current"],
+            loc="lower right",
+            title="current",
+        )
+        fig.canvas.draw()
+        return fig, ax, method, current
+
+    plt.close("all")
+    fig, ax, method, current = make_figure()
+    tracker = ChangeTracker.__new__(ChangeTracker)
+    tracker.figure = fig
+    tracker.changes = {}
+    tracker.saved = True
+    tracker.no_save = False
+    tracker.changeCountChanged = lambda: None
+    fig.change_tracker = tracker
+    renderer = fig.canvas.get_renderer()
+    before = method.get_window_extent(renderer).bounds
+
+    wrapper = TargetWrapper(method)
+    wrapper.set_positions([point + [12, -7] for point in wrapper.get_positions()])
+    fig.canvas.draw()
+    moved = method.get_window_extent(renderer).bounds
+    saved_lines = tracker.sorted_changes()
+
+    assert saved_lines == [
+        "plt.figure(1).axes[0].artists[0]._set_loc(1)",
+        "plt.figure(1).axes[0].artists[0].set_bbox_to_anchor((0.9387, 0.8697))",
+    ]
+    assert ax.get_legend() is current
+    assert ax.artists[0] is method
+
+    plt.close(fig)
+    fig2, ax2, method2, current2 = make_figure()
+    for line in saved_lines:
+        exec(line)
+    fig2.canvas.draw()
+    reopened = method2.get_window_extent(fig2.canvas.get_renderer()).bounds
+
+    assert ax2.get_legend() is current2
+    assert ax2.artists[0] is method2
+    assert [text.get_text() for text in current2.get_texts()] == ["current"]
+    assert [text.get_text() for text in method2.get_texts()] == ["method"]
+    assert np.allclose((moved[0], moved[1]), (reopened[0], reopened[1]), atol=0.01)
+    assert_bbox_close((moved[2], moved[3]), (reopened[2], reopened[3]))
+    assert_bbox_close((moved[0] - before[0], moved[1] - before[1]), (12.0, -7.0))
+    plt.close(fig2)
 
 
 def test_axes_legend_move_records_change_without_transfigure_error() -> None:
