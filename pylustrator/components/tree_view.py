@@ -106,6 +106,16 @@ class MyTreeView(QtWidgets.QTreeView):
         else:
             self.setCurrentIndex(element)
 
+    def selectionCommand(
+        self, index: QtCore.QModelIndex, event: QtCore.QEvent = None
+    ) -> QtCore.QItemSelectionModel.SelectionFlags:
+        command = super().selectionCommand(index, event)
+        modifiers = event.modifiers() if event is not None else QtCore.Qt.NoModifier
+        additive_modifier = QtCore.Qt.ControlModifier | QtCore.Qt.MetaModifier
+        if modifiers & additive_modifier:
+            return QtCore.QItemSelectionModel.Toggle | QtCore.QItemSelectionModel.Rows
+        return command | QtCore.QItemSelectionModel.Rows
+
     def setFigure(self, fig):
         self.fig = fig
         self.model.removeRows(0, self.model.rowCount())

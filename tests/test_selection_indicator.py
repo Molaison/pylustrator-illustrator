@@ -7,7 +7,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.backend_bases import MouseEvent
 from matplotlib.patches import Patch
-from qtpy import QtCore, QtWidgets
+from qtpy import QtCore, QtGui, QtWidgets
 
 from pylustrator.components.plot_layout import scene_point_to_canvas_pixels, selection_scene_transform
 from pylustrator.components.tree_view import MyTreeView
@@ -334,6 +334,45 @@ def test_tree_view_extended_selection_updates_drag_manager_selection() -> None:
     tree.setCurrentIndex(second)
 
     assert tree.selectionMode() == QtWidgets.QAbstractItemView.ExtendedSelection
+    assert [target.target for target in manager.selection.targets] == [axes[0], axes[1]]
+    assert manager.selected_element is axes[1]
+    manager.selection.clear_targets()
+    plt.close(fig)
+    container.deleteLater()
+    assert app is not None
+
+
+def test_tree_view_ctrl_click_uses_additive_row_selection_command() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    signals = TreeSignals()
+    container = QtWidgets.QWidget()
+    layout = QtWidgets.QVBoxLayout(container)
+    tree = MyTreeView(signals, layout)
+    fig, axes = plt.subplots(1, 2, figsize=(4, 2), dpi=100)
+    manager = attach_drag_manager(fig)
+
+    signals.figure_changed.emit(fig)
+    tree.expand(fig)
+    first = tree.getItemFromEntry(axes[0]).index()
+    second = tree.getItemFromEntry(axes[1]).index()
+    event = QtGui.QMouseEvent(
+        QtCore.QEvent.MouseButtonPress,
+        QtCore.QPointF(0, 0),
+        QtCore.Qt.LeftButton,
+        QtCore.Qt.LeftButton,
+        QtCore.Qt.ControlModifier,
+    )
+    command = tree.selectionCommand(second, event)
+
+    tree.selectionModel().select(
+        first,
+        QtCore.QItemSelectionModel.ClearAndSelect | QtCore.QItemSelectionModel.Rows,
+    )
+    tree.selectionModel().select(second, command)
+    tree.setCurrentIndex(second)
+
+    assert command & QtCore.QItemSelectionModel.Toggle
+    assert command & QtCore.QItemSelectionModel.Rows
     assert [target.target for target in manager.selection.targets] == [axes[0], axes[1]]
     assert manager.selected_element is axes[1]
     manager.selection.clear_targets()

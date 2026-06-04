@@ -119,25 +119,41 @@ def get_legend_reference(element: Artist):
             return getReference(legend) + ".get_title()"
 
 
+class CodeReference(str):
+    pass
+
+
+def is_scalar_number(v):
+    return isinstance(v, (int, float, np.integer, np.floating))
+
+
+def format_scalar_number(v):
+    if isinstance(v, (int, np.integer)):
+        return str(int(v))
+    return np.format_float_positional(float(v), 4, fractional=False, trim=".")
+
+
 def to_str(v):
-    if isinstance(v, list) and len(v) and isinstance(v[0], float):
+    if isinstance(v, CodeReference):
+        return str(v)
+    if isinstance(v, list) and len(v) and is_scalar_number(v[0]):
         return (
             "["
             + ", ".join(
-                np.format_float_positional(a, 4, fractional=False, trim=".") for a in v
+                format_scalar_number(a) for a in v
             )
             + "]"
         )
-    elif isinstance(v, tuple) and len(v) and isinstance(v[0], float):
+    elif isinstance(v, tuple) and len(v) and is_scalar_number(v[0]):
         return (
             "("
             + ", ".join(
-                np.format_float_positional(a, 4, fractional=False, trim=".") for a in v
+                format_scalar_number(a) for a in v
             )
             + ")"
         )
-    elif isinstance(v, float):
-        return np.format_float_positional(v, 4, fractional=False, trim=".")
+    elif is_scalar_number(v):
+        return format_scalar_number(v)
     return repr(v)
 
 
@@ -579,7 +595,11 @@ class ChangeTracker:
 
             # get current property values
             anchor = element.get_bbox_to_anchor()
-            kwargs = {"loc": element._loc}
+            kwargs = {
+                "handles": CodeReference(getReference(element) + ".legend_handles"),
+                "labels": [text.get_text() for text in element.get_texts()],
+                "loc": element._loc,
+            }
             if anchor.width == 0 and anchor.height == 0:
                 transform = getattr(anchor, "_transform", get_legend_anchor_transform(element))
                 kwargs["bbox_to_anchor"] = tuple(

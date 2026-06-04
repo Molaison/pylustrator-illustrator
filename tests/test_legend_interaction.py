@@ -201,6 +201,29 @@ def test_axes_legend_change_description_uses_axes_parent_transform() -> None:
     plt.close(fig)
 
 
+def test_axes_legend_change_description_preserves_handles_and_labels() -> None:
+    from pylustrator.change_tracker import ChangeTracker
+
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    line1 = ax.plot([0, 1], [0, 1], label="line A")[0]
+    line2 = ax.plot([0, 1], [1, 0], label="line B")[0]
+    legend = ax.legend(handles=[line1, line2], labels=["line A", "line B"])
+    fig.canvas.draw()
+
+    tracker = ChangeTracker.__new__(ChangeTracker)
+    command_parent, command = tracker.get_describtion_string(legend, exclude_default=False)
+
+    assert command_parent is ax
+    assert "handles=" in command
+    assert "labels=['line A', 'line B']" in command
+    eval("command_parent" + command)
+
+    changed = ax.get_legend()
+    assert [text.get_text() for text in changed.get_texts()] == ["line A", "line B"]
+    assert len(changed.legend_handles) == 2
+    plt.close(fig)
+
+
 def test_axes_legend_move_records_change_without_transfigure_error() -> None:
     from pylustrator.change_tracker import ChangeTracker
     from pylustrator.snap import TargetWrapper
@@ -226,3 +249,11 @@ def test_axes_legend_move_records_change_without_transfigure_error() -> None:
     assert commands[0][1].startswith(".legend(")
     assert "bbox_to_anchor=" in commands[0][1]
     plt.close(fig)
+
+
+def test_numpy_scalar_values_are_saved_as_plain_python_literals() -> None:
+    from pylustrator.change_tracker import kwargs_to_string
+
+    saved = kwargs_to_string({"position": (np.int64(0), np.float64(0.5))})
+
+    assert saved == "position=(0, 0.5)"
