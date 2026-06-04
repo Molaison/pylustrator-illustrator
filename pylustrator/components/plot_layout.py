@@ -78,6 +78,20 @@ class MyEvent:
         self.y = y
 
 
+def canvas_device_pixel_ratio(canvas) -> float:
+    return float(getattr(canvas, "device_pixel_ratio", getattr(canvas, "_dpi_ratio", 1.0)) or 1.0)
+
+
+def selection_scene_transform(device_pixel_ratio: float, height: float) -> QtGui.QTransform:
+    ratio = float(device_pixel_ratio or 1.0)
+    return QtGui.QTransform(1 / ratio, 0, 0, -1 / ratio, 0, height)
+
+
+def scene_point_to_canvas_pixels(view, point: QtCore.QPointF) -> tuple[float, float]:
+    ratio = float(getattr(view, "device_pixel_ratio", 1.0) or 1.0)
+    return point.x() * ratio, (view.h - point.y()) * ratio
+
+
 class MyRect(QtWidgets.QGraphicsRectItem):
     w = 10
 
@@ -88,14 +102,14 @@ class MyRect(QtWidgets.QGraphicsRectItem):
     def mousePressEvent(self, e):
         super().mousePressEvent(e)
         self.view.grabber_found = True
-        p = e.scenePos()
-        self.grabber.button_press_event(MyEvent(p.x(), self.h - p.y()))
+        x, y = scene_point_to_canvas_pixels(self.view, e.scenePos())
+        self.grabber.button_press_event(MyEvent(x, y))
 
     def mouseReleaseEvent(self, e):
         super().mouseReleaseEvent(e)
         self.view.grabber_found = True
-        p = e.scenePos()
-        self.grabber.button_release_event(MyEvent(p.x(), self.h - p.y()))
+        x, y = scene_point_to_canvas_pixels(self.view, e.scenePos())
+        self.grabber.button_release_event(MyEvent(x, y))
 
 
 class Canvas(QtWidgets.QWidget):
@@ -203,6 +217,7 @@ class Canvas(QtWidgets.QWidget):
 
         w = self.canvas.width()
         h = self.canvas.height()
+        device_pixel_ratio = canvas_device_pixel_ratio(self.canvas)
         self.selections_scene.setSceneRect(0, 0, w, h)
         self.selections_view.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
         self.selections_view.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
@@ -210,7 +225,8 @@ class Canvas(QtWidgets.QWidget):
         self.selections_view.setMaximumSize(w, h)
         p = self.canvas_container.pos()
         self.selections_view.move(p.x(), p.y())
-        self.selections_scene_origin.setTransform(QtGui.QTransform(1, 0, 0, -1, 0, h))
+        self.selections_view.device_pixel_ratio = device_pixel_ratio
+        self.selections_scene_origin.setTransform(selection_scene_transform(device_pixel_ratio, h))
 
         self.selections_view.h = h
 

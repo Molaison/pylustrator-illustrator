@@ -31,6 +31,7 @@ from qtpy import QtCore, QtGui, QtWidgets
 
 from .snap import TargetWrapper, getSnaps, checkSnaps, checkSnapsActive, SnapBase
 from .change_tracker import ChangeTracker
+from .components.plot_layout import scene_point_to_canvas_pixels
 from pylustrator.change_tracker import UndoRedo
 import time
 
@@ -1026,16 +1027,16 @@ class MyItem:
     def mousePressEvent(self, e):
         super().mousePressEvent(e)
         self.view.grabber_found = True
-        p = e.scenePos()
         self.scene().grabber_pressed = self
-        self.grabber.button_press_event(MyEvent(p.x(), self.view.h - p.y()))
+        x, y = scene_point_to_canvas_pixels(self.view, e.scenePos())
+        self.grabber.button_press_event(MyEvent(x, y))
 
     def mouseReleaseEvent(self, e):
         super().mouseReleaseEvent(e)
         self.scene().grabber_pressed = None
         self.view.grabber_found = True
-        p = e.scenePos()
-        self.grabber.button_release_event(MyEvent(p.x(), self.view.h - p.y()))
+        x, y = scene_point_to_canvas_pixels(self.view, e.scenePos())
+        self.grabber.button_release_event(MyEvent(x, y))
 
 
 class MyRect(MyItem, QtWidgets.QGraphicsRectItem):
