@@ -420,6 +420,95 @@ def test_axes_legend_move_records_change_without_transfigure_error() -> None:
     plt.close(fig)
 
 
+def test_figure_level_legend_saved_move_reopens_without_duplicate_legend() -> None:
+    from pylustrator.change_tracker import ChangeTracker
+    from pylustrator.snap import TargetWrapper
+
+    def make_figure():
+        fig, ax = plt.subplots(num=1, clear=True, figsize=(3.56, 3.35), dpi=100)
+        method_handles = [
+            Patch(facecolor="red", label="ipTM-oriented"),
+            Patch(facecolor="blue", label="+ pocket-oriented"),
+            Patch(facecolor="green", label="+ trajectory rescue"),
+        ]
+        segment_handles = [
+            Patch(facecolor="#BDBDBD", label="pocket occupancy > 0.8"),
+            Patch(facecolor="#4A4A4A", label="+ ipTM > 0.8"),
+        ]
+        method = fig.legend(
+            handles=method_handles,
+            frameon=False,
+            loc="upper center",
+            bbox_to_anchor=(0.628, 0.99),
+            ncol=3,
+            fontsize=5.25,
+            handlelength=0.72,
+            columnspacing=0.3,
+            handletextpad=0.2,
+            borderaxespad=0.0,
+            labelspacing=0.3,
+            borderpad=0.28,
+        )
+        fig.add_artist(method)
+        segment = fig.legend(
+            handles=segment_handles,
+            frameon=False,
+            loc="upper center",
+            bbox_to_anchor=(0.628, 0.925),
+            ncol=2,
+            fontsize=5.25,
+            handlelength=0.72,
+            columnspacing=0.34,
+            handletextpad=0.2,
+            borderaxespad=0.0,
+            labelspacing=0.3,
+            borderpad=0.28,
+        )
+        fig.canvas.draw()
+        return fig, ax, method, segment
+
+    plt.close("all")
+    fig, ax, method, segment = make_figure()
+    tracker = ChangeTracker.__new__(ChangeTracker)
+    tracker.figure = fig
+    tracker.changes = {}
+    tracker.saved = True
+    tracker.no_save = False
+    tracker.changeCountChanged = lambda: None
+    fig.change_tracker = tracker
+    before_count = len(fig.legends)
+    before = method.get_window_extent(fig.canvas.get_renderer()).bounds
+
+    wrapper = TargetWrapper(method)
+    wrapper.set_positions([point + [10, -6] for point in wrapper.get_positions()])
+    fig.canvas.draw()
+    moved = method.get_window_extent(fig.canvas.get_renderer()).bounds
+    saved_lines = tracker.sorted_changes()
+
+    assert before_count == 2
+    assert all(".legend(" not in line for line in saved_lines)
+
+    plt.close(fig)
+    fig2, ax2, method2, segment2 = make_figure()
+    for line in saved_lines:
+        exec(line)
+    fig2.canvas.draw()
+    reopened = method2.get_window_extent(fig2.canvas.get_renderer()).bounds
+
+    assert len(fig2.legends) == 2
+    assert fig2.legends[0] is method2
+    assert fig2.legends[1] is segment2
+    assert [text.get_text() for text in method2.get_texts()] == [
+        "ipTM-oriented",
+        "+ pocket-oriented",
+        "+ trajectory rescue",
+    ]
+    assert np.allclose((moved[0], moved[1]), (reopened[0], reopened[1]), atol=0.1)
+    assert_bbox_close((moved[2], moved[3]), (reopened[2], reopened[3]))
+    assert_bbox_close((moved[0] - before[0], moved[1] - before[1]), (10.0, -6.0))
+    plt.close(fig2)
+
+
 def test_numpy_scalar_values_are_saved_as_plain_python_literals() -> None:
     from pylustrator.change_tracker import kwargs_to_string
 

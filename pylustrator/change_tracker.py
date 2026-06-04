@@ -635,7 +635,7 @@ class ChangeTracker:
                 if value != default or not exclude_default:
                     kwargs[prop] = value
             parent = element.figure if element.axes is None else element.axes
-            if element.axes is not None and element.axes.get_legend() is not element:
+            if element.axes is None or (element.axes is not None and element.axes.get_legend() is not element):
                 legend_kwargs = dict(kwargs)
                 legend_kwargs.pop("handles", None)
                 legend_kwargs.pop("labels", None)
