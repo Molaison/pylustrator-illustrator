@@ -251,6 +251,41 @@ def test_drag_rectangle_selects_intersecting_artists_without_background_axes() -
     assert app is not None
 
 
+def test_multi_selection_prefers_axes_children_over_parent_axes() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    text = ax.text(0.5, 0.5, "inside")
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+
+    manager.select_elements([ax, text], primary=ax)
+
+    assert [target.target for target in manager.selection.targets] == [text]
+    assert manager.selected_element is text
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_drag_rectangle_prefers_specific_children_over_containing_axes() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    text = ax.text(0.5, 0.5, "inside")
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    bbox = ax.get_window_extent(fig.canvas.get_renderer()).expanded(1.02, 1.02)
+
+    selected = manager.select_elements_in_bbox(bbox.x0, bbox.y0, bbox.x1, bbox.y1)
+
+    assert ax in selected
+    assert text in selected
+    assert [target.target for target in manager.selection.targets] == [text]
+    assert manager.selected_element is text
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
 def test_canvas_drag_rectangle_starts_on_axes_and_selects_after_release() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     fig, ax = plt.subplots(figsize=(4, 3), dpi=100)

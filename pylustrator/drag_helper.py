@@ -91,6 +91,14 @@ def _is_internal_label(artist: Artist, explicit: bool = False) -> bool:
     return isinstance(label, str) and label.startswith("_")
 
 
+def _container_yields_to_children(artist: Artist) -> bool:
+    return isinstance(artist, (Figure, SubFigure, Axes))
+
+
+def _container_keeps_children(artist: Artist) -> bool:
+    return isinstance(artist, Legend)
+
+
 def _event_has_modifier(event, modifier: str) -> bool:
     return (
         modifier in event.key.split("+")
@@ -907,14 +915,24 @@ class DragManager:
             element
             for element in unique
             if not any(
-                other is not element and self._artist_contains_descendant(other, element)
+                other is not element
+                and (
+                    (
+                        _container_yields_to_children(element)
+                        and self._artist_contains_descendant(element, other)
+                    )
+                    or (
+                        _container_keeps_children(other)
+                        and self._artist_contains_descendant(other, element)
+                    )
+                )
                 for other in unique
             )
         ]
 
         if primary not in normalized:
             for element in normalized:
-                if primary is not None and self._artist_contains_descendant(element, primary):
+                if primary is not None and self._artist_contains_descendant(primary, element):
                     primary = element
                     break
             else:
