@@ -211,7 +211,7 @@ def test_plot_canvas_fits_figure_to_visible_viewport_on_show() -> None:
     assert app is not None
 
 
-def test_plot_canvas_refits_figure_when_fit_view_is_resized() -> None:
+def test_plot_canvas_resize_changes_viewport_not_figure_size() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     signals = SignalBundle()
     fig = plt.figure(figsize=(12, 8), dpi=100)
@@ -221,15 +221,17 @@ def test_plot_canvas_refits_figure_when_fit_view_is_resized() -> None:
     canvas.show()
     app.processEvents()
     first_size = fig.canvas.get_width_height()
+    first_dpi = fig.get_dpi()
 
     canvas.resize(320, 240)
     app.processEvents()
-    QtCore.QThread.msleep(40)
-    app.processEvents()
 
     assert canvas.fitted_to_view is True
-    assert_figure_fits_viewport(canvas)
-    assert fig.canvas.get_width_height() != first_size
+    assert fig.canvas.get_width_height() == first_size
+    assert fig.get_dpi() == first_dpi
+    assert canvas.canvas_canvas.width() >= canvas.canvas_scroll.viewport().size().width()
+    assert canvas.canvas_canvas.height() >= canvas.canvas_scroll.viewport().size().height()
+    assert canvas.selections_view.size() == canvas.canvas.size()
 
     canvas.close()
     plt.close(fig)

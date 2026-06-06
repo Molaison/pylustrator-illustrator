@@ -132,10 +132,6 @@ class Canvas(QtWidgets.QWidget):
         self.signals = signals
         self.fitted_to_view = False
         self._last_ruler_state = None
-        self._resize_fit_timer = QtCore.QTimer(self)
-        self._resize_fit_timer.setSingleShot(True)
-        self._resize_fit_timer.setInterval(25)
-        self._resize_fit_timer.timeout.connect(self._applyScheduledFitToView)
 
         self.layout = QtWidgets.QHBoxLayout(self)
         self.layout.setContentsMargins(0, 0, 0, 0)
@@ -508,15 +504,9 @@ class Canvas(QtWidgets.QWidget):
 
     def resizeEvent(self, event: QtCore.QEvent):
         """when the window is resized"""
-        if self.fitted_to_view:
-            self._resize_fit_timer.start()
-        else:
-            self.updateCanvasAreaSize()
-            self.updateRuler()
-
-    def _applyScheduledFitToView(self):
-        if self.fitted_to_view and self.canvas is not None:
-            self.fitToView(True)
+        self.updateCanvasAreaSize()
+        self._centerFigureCanvas()
+        self.updateRuler()
 
     def showEvent(self, event: QtCore.QEvent):
         """when the window is shown"""
