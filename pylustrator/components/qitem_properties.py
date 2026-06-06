@@ -1577,11 +1577,14 @@ class QItemProperties(QtWidgets.QWidget):
         try:
             self.input_font_properties.show()
             elements = [element]
-            elements += [
-                element.target
-                for element in main_figure(element).selection.targets
-                if element.target != element
-            ]
+            figure = main_figure(element)
+            selection = getattr(figure, "selection", None)
+            if selection is not None:
+                elements += [
+                    element.target
+                    for element in selection.targets
+                    if element.target != element
+                ]
             self.input_font_properties.setTarget(elements)
         except AttributeError:
             self.input_font_properties.hide()

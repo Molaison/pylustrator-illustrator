@@ -24,13 +24,22 @@ from matplotlib.artist import Artist
 from matplotlib.figure import Figure, SubFigure
 from matplotlib.axes import Axes
 from matplotlib.legend import Legend
+from matplotlib.lines import Line2D
 from matplotlib.text import Text
-from matplotlib.patches import Rectangle
+from matplotlib.patches import Patch, Rectangle
 from matplotlib.backend_bases import MouseEvent, KeyEvent
 from typing import Iterable, Sequence
 from qtpy import QtCore, QtGui, QtWidgets
 
-from .snap import TargetWrapper, getSnaps, checkSnaps, checkSnapsActive, SnapBase
+from .snap import (
+    TargetWrapper,
+    checkXLabel,
+    checkYLabel,
+    getSnaps,
+    checkSnaps,
+    checkSnapsActive,
+    SnapBase,
+)
 from .change_tracker import ChangeTracker, add_text_default
 from .components.plot_layout import scene_point_to_canvas_pixels
 from pylustrator.change_tracker import UndoRedo
@@ -376,6 +385,188 @@ class GrabbableRectangleSelection(GrabFunctions):
         else:
             self.hide_grabber()
 
+    def _known_legends(self) -> list[Legend]:
+        legends = list(getattr(self.figure, "legends", []))
+        for axes in self.figure.axes:
+            legend = axes.get_legend()
+            if legend is not None:
+                legends.append(legend)
+            legends.extend(
+                artist for artist in axes.artists if isinstance(artist, Legend)
+            )
+
+        unique = []
+        seen = set()
+        for legend in legends:
+            if id(legend) not in seen:
+                unique.append(legend)
+                seen.add(id(legend))
+        return unique
+
+    def _find_direct_parent(self, parent: Artist, target: Artist, seen=None):
+        if seen is None:
+            seen = set()
+        if id(parent) in seen:
+            return None
+        seen.add(id(parent))
+
+        children = get_artist_children(parent)
+        if target in children:
+            return parent
+        for child in children:
+            found = self._find_direct_parent(child, target, seen)
+            if found is not None:
+                return found
+        return None
+
+    def _artist_parent(self, artist: Artist):
+        if isinstance(artist, Figure):
+            return None
+        if isinstance(artist, Legend):
+            return getattr(artist, "parent", None) or artist.figure
+        if isinstance(artist, Text):
+            label_axes = checkXLabel(artist) or checkYLabel(artist)
+            if label_axes is not None:
+                return label_axes
+        for legend in self._known_legends():
+            if artist in get_artist_children(legend):
+                return legend
+        found = self._find_direct_parent(self.figure, artist)
+        if found is not None:
+            return found
+        axes = getattr(artist, "axes", None)
+        if axes is not None and axes is not artist:
+            return axes
+        figure = getattr(artist, "figure", None)
+        if figure is not None and figure is not artist:
+            return figure
+        return None
+
+    def _ancestor_chain(self, artist: Artist) -> list[Artist]:
+        chain = []
+        current = artist
+        seen = set()
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            if isinstance(current, Figure):
+                break
+            chain.append(current)
+            current = self._artist_parent(current)
+        return chain
+
+    @staticmethod
+    def _unique_wrappers(wrappers: Iterable[TargetWrapper]) -> list[TargetWrapper]:
+        unique = []
+        seen = set()
+        for wrapper in wrappers:
+            key = id(wrapper.target)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(wrapper)
+        return unique
+
+    def _resolve_alignment_items(self) -> list[tuple[TargetWrapper, TargetWrapper]]:
+        """Return pairs of selected measurement wrapper and same-layer move wrapper."""
+        if len(self.targets) <= 1:
+            return [(target, target) for target in self.targets]
+
+        chains = [self._ancestor_chain(target.target) for target in self.targets]
+        if any(len(chain) == 0 for chain in chains):
+            raise ValueError("Selected object has no parent layer.")
+
+        best_indices = None
+        best_score = None
+
+        def visit(indices: list[int], index: int) -> None:
+            nonlocal best_indices, best_score
+            if index == len(chains):
+                candidates = [chains[i][indices[i]] for i in range(len(chains))]
+                parents = [self._artist_parent(candidate) for candidate in candidates]
+                if any(parent is None for parent in parents):
+                    return
+                if len({id(parent) for parent in parents}) != 1:
+                    return
+                score = (max(indices), sum(indices), tuple(indices))
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_indices = tuple(indices)
+                return
+            for candidate_index in range(len(chains[index])):
+                indices.append(candidate_index)
+                visit(indices, index + 1)
+                indices.pop()
+
+        visit([], 0)
+        if best_indices is None:
+            raise ValueError("Selected objects do not resolve to one parent layer.")
+
+        wrappers_by_artist = {
+            id(target.target): target for target in self.targets
+        }
+        items = []
+        for target, chain, chain_index in zip(self.targets, chains, best_indices):
+            move_artist = chain[chain_index]
+            move_wrapper = wrappers_by_artist.get(id(move_artist))
+            if move_wrapper is None:
+                move_wrapper = TargetWrapper(move_artist)
+                wrappers_by_artist[id(move_artist)] = move_wrapper
+            items.append((target, move_wrapper))
+        return items
+
+    def _delta_plan(
+        self,
+        items: list[tuple[TargetWrapper, TargetWrapper]],
+        deltas: list[float],
+    ) -> list[tuple[TargetWrapper, float]]:
+        plan = {}
+        for (_measure, move_target), delta in zip(items, deltas):
+            key = id(move_target.target)
+            if key in plan:
+                _target, existing_delta = plan[key]
+                if not np.isclose(existing_delta, delta, atol=1e-9):
+                    raise ValueError(
+                        "Selected subobjects resolve to the same parent with conflicting alignment deltas."
+                    )
+                continue
+            plan[key] = (move_target, delta)
+        return list(plan.values())
+
+    @staticmethod
+    def _bounds_from_points(points_list: list[np.ndarray]) -> np.ndarray:
+        points = np.concatenate(points_list)
+        return np.array(
+            [
+                np.min(points[:, 0]),
+                np.min(points[:, 1]),
+                np.max(points[:, 0]),
+                np.max(points[:, 1]),
+            ],
+            dtype=float,
+        )
+
+    def _measure_points(
+        self, measure_target: TargetWrapper, move_target: TargetWrapper
+    ) -> np.ndarray:
+        """Return display-space bounds used to compute alignment deltas."""
+        if measure_target.target is move_target.target:
+            return np.array(measure_target.get_positions(), dtype=float)
+        if isinstance(measure_target.target, (Text, Legend, Line2D)):
+            bbox = measure_target.target.get_window_extent(
+                self.figure.canvas.get_renderer()
+            )
+            return np.array([[bbox.x0, bbox.y0], [bbox.x1, bbox.y1]], dtype=float)
+        points = np.array(measure_target.get_positions(), dtype=float)
+        if points.shape[0] == 3:
+            return points[1:]
+        return points
+
+    @staticmethod
+    def _measure_size(points: np.ndarray, y: int, direct_target: bool) -> float:
+        if direct_target:
+            return np.diff(points[:, y])[0]
+        return np.max(points[:, y]) - np.min(points[:, y])
+
     def align_points(self, mode: str):
         """a function to apply the alignment options, e.g. align all selected elements at the top or with equal spacing."""
         if len(self.targets) == 0:
@@ -402,22 +593,28 @@ class GrabbableRectangleSelection(GrabFunctions):
                     track_changes=False,
                 )
 
-        def reference_bounds():
-            if len(self.targets) == 1:
+        def reference_bounds(points_list: list[np.ndarray]):
+            if len(points_list) == 1:
                 bbox = self.figure.bbox
                 return np.array([bbox.x0, bbox.y0, bbox.x1, bbox.y1])
-            return self.positions
+            return self._bounds_from_points(points_list)
 
         def align(y: int, func: callable):
-            self.start_move()
+            items = self._resolve_alignment_items()
+            measure_points = [
+                self._measure_points(measure_target, move_target)
+                for measure_target, move_target in items
+            ]
             centers = []
-            for target in self.targets:
+            for points in measure_points:
+                centers.append(func(points[:, y]))
+            new_center = func(reference_bounds(measure_points)[y::2])
+            deltas = [new_center - center for center in centers]
+            plan = self._delta_plan(items, deltas)
+            self.start_move(save_targets=[target for target, _delta in plan])
+            for target, delta in plan:
                 new_points = np.array(target.get_positions())
-                centers.append(func(new_points[:, y]))
-            new_center = func(reference_bounds()[y::2])
-            for index, target in enumerate(self.targets):
-                new_points = np.array(target.get_positions())
-                new_points[:, y] += new_center - centers[index]
+                new_points[:, y] += delta
                 target.set_positions(new_points)
             self.update_extent()
             self.has_moved = True
@@ -427,23 +624,36 @@ class GrabbableRectangleSelection(GrabFunctions):
             self.update_selection_rectangles()
 
         def distribute(y: int):
-            self.start_move()
+            items = self._resolve_alignment_items()
             sizes = []
             positions = []
-            for target in self.targets:
-                new_points = np.array(target.get_positions())
-                sizes.append(np.diff(new_points[:, y])[0])
-                positions.append(np.min(new_points[:, y]))
+            measure_points = [
+                self._measure_points(measure_target, move_target)
+                for measure_target, move_target in items
+            ]
+            for points, (measure_target, move_target) in zip(measure_points, items):
+                sizes.append(
+                    self._measure_size(
+                        points, y, measure_target.target is move_target.target
+                    )
+                )
+                positions.append(np.min(points[:, y]))
             order = np.argsort(positions)
-            spaces = np.diff(self.positions[y::2])[0] - np.sum(sizes)
-            spaces /= max([(len(self.targets) - 1), 1])
-            pos = np.min(self.positions[y::2])
+            bounds = self._bounds_from_points(measure_points)
+            spaces = np.diff(bounds[y::2])[0] - np.sum(sizes)
+            spaces /= max([(len(items) - 1), 1])
+            pos = np.min(bounds[y::2])
+            deltas = [0.0] * len(items)
             for index in order:
-                target = self.targets[index]
-                new_points = np.array(target.get_positions())
-                new_points[:, y] += pos - np.min(new_points[:, y])
-                target.set_positions(new_points)
+                points = measure_points[index]
+                deltas[index] = pos - np.min(points[:, y])
                 pos += sizes[index] + spaces
+            plan = self._delta_plan(items, deltas)
+            self.start_move(save_targets=[target for target, _delta in plan])
+            for target, delta in plan:
+                new_points = np.array(target.get_positions())
+                new_points[:, y] += delta
+                target.set_positions(new_points)
             self.has_moved = True
             self.end_move()
 
@@ -476,6 +686,191 @@ class GrabbableRectangleSelection(GrabFunctions):
 
         self.figure.signals.figure_selection_moved.emit()
 
+    @staticmethod
+    def _points_bounds(points: np.ndarray) -> np.ndarray:
+        """Return x0, y0, x1, y1 bounds for a TargetWrapper point set."""
+        if points.shape[0] == 3:
+            points = points[1:]
+        return np.array(
+            [
+                np.min(points[:, 0]),
+                np.min(points[:, 1]),
+                np.max(points[:, 0]),
+                np.max(points[:, 1]),
+            ],
+            dtype=float,
+        )
+
+    def match_size(self, mode: str) -> bool:
+        """Resize selected targets to the first selected target's width/height."""
+        modes = {
+            "width": (True, False),
+            "height": (False, True),
+            "size": (True, True),
+        }
+        if mode not in modes:
+            raise ValueError(f"Unknown size matching mode: {mode}")
+        if len(self.targets) < 2:
+            raise ValueError("Select at least two objects to match size.")
+
+        match_width, match_height = modes[mode]
+        reference_points = np.array(self.targets[0].get_positions(), dtype=float)
+        reference_bounds = self._points_bounds(reference_points)
+        reference_width = reference_bounds[2] - reference_bounds[0]
+        reference_height = reference_bounds[3] - reference_bounds[1]
+        if match_width and reference_width <= 0:
+            raise ValueError("Reference object has no width.")
+        if match_height and reference_height <= 0:
+            raise ValueError("Reference object has no height.")
+
+        non_scalable = [target.target for target in self.targets[1:] if not target.do_scale]
+        if non_scalable:
+            names = ", ".join(type(target).__name__ for target in non_scalable)
+            raise ValueError(f"Selected object cannot be resized: {names}")
+
+        planned: list[tuple[TargetWrapper, np.ndarray, np.ndarray]] = []
+        for target in self.targets[1:]:
+            points = np.array(target.get_positions(), dtype=float)
+            bounds = self._points_bounds(points)
+            current_width = bounds[2] - bounds[0]
+            current_height = bounds[3] - bounds[1]
+            if match_width and current_width <= 0:
+                raise ValueError("Selected object has no width.")
+            if match_height and current_height <= 0:
+                raise ValueError("Selected object has no height.")
+            planned.append((target, points, bounds))
+
+        self.start_move()
+        changed = False
+        for target, points, bounds in planned:
+            current_width = bounds[2] - bounds[0]
+            current_height = bounds[3] - bounds[1]
+            scale_x = reference_width / current_width if match_width else 1.0
+            scale_y = reference_height / current_height if match_height else 1.0
+            if np.isclose(scale_x, 1.0) and np.isclose(scale_y, 1.0):
+                continue
+            center_x = (bounds[0] + bounds[2]) / 2
+            center_y = (bounds[1] + bounds[3]) / 2
+            transform = np.array(
+                [
+                    [scale_x, 0.0, center_x * (1.0 - scale_x)],
+                    [0.0, scale_y, center_y * (1.0 - scale_y)],
+                    [0.0, 0.0, 1.0],
+                ],
+                dtype=float,
+            )
+            target.set_positions(self.apply_transform(transform, points))
+            changed = True
+
+        if changed:
+            self.update_extent()
+            self.has_moved = True
+        self.end_move("Resize")
+        self.figure.canvas.draw()
+        self.update_selection_rectangles()
+        return changed
+
+    def scale_selection(self, factor: float) -> bool:
+        """Scale the current selection around its combined center."""
+        if factor <= 0:
+            raise ValueError("Scale factor must be positive.")
+        if len(self.targets) == 0:
+            return False
+        non_scalable = [target.target for target in self.targets if not target.do_scale]
+        if non_scalable:
+            names = ", ".join(type(target).__name__ for target in non_scalable)
+            raise ValueError(f"Selected object cannot be scaled: {names}")
+        if np.isclose(factor, 1.0):
+            return False
+
+        center_x = (self.positions[0] + self.positions[2]) / 2
+        center_y = (self.positions[1] + self.positions[3]) / 2
+        transform = np.array(
+            [
+                [factor, 0.0, center_x * (1.0 - factor)],
+                [0.0, factor, center_y * (1.0 - factor)],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=float,
+        )
+
+        self.start_move()
+        for target in self.targets:
+            points = np.array(target.get_positions(), dtype=float)
+            target.set_positions(self.apply_transform(transform, points))
+        self.update_extent()
+        self.has_moved = True
+        self.end_move("Scale")
+        self.figure.canvas.draw()
+        self.update_selection_rectangles()
+        return True
+
+    @staticmethod
+    def _rotatable_value(target: Artist) -> float | None:
+        if isinstance(target, Text):
+            return float(target.get_rotation())
+        if (
+            isinstance(target, Patch)
+            and hasattr(target, "get_angle")
+            and hasattr(target, "set_angle")
+        ):
+            return float(target.get_angle())
+        return None
+
+    def _set_rotation_value(self, target: Artist, value: float) -> None:
+        if isinstance(target, Text):
+            add_text_default(target)
+            target.set_rotation(value)
+            self.figure.change_tracker.addNewTextChange(target)
+            return
+        if isinstance(target, Patch) and hasattr(target, "set_angle"):
+            target.set_angle(value)
+            self.figure.change_tracker.addChange(
+                target, ".set_angle(%f)" % target.get_angle()
+            )
+            return
+        raise ValueError(f"Selected object cannot be rotated: {type(target).__name__}")
+
+    def rotate_selection(self, angle_degrees: float) -> bool:
+        """Rotate selected objects that have a native saveable rotation property."""
+        if len(self.targets) == 0:
+            return False
+        if np.isclose(angle_degrees, 0.0):
+            return False
+
+        old_values: list[tuple[Artist, float]] = []
+        unsupported: list[Artist] = []
+        for target in self.targets:
+            value = self._rotatable_value(target.target)
+            if value is None:
+                unsupported.append(target.target)
+            else:
+                old_values.append((target.target, value))
+        if unsupported:
+            names = ", ".join(type(target).__name__ for target in unsupported)
+            raise ValueError(f"Selected object cannot be rotated: {names}")
+
+        new_values = [(target, value + angle_degrees) for target, value in old_values]
+
+        def apply(values: list[tuple[Artist, float]]) -> None:
+            for target, value in values:
+                self._set_rotation_value(target, value)
+            self.figure.canvas.draw()
+            self.update_extent()
+            self.update_selection_rectangles()
+
+        def undo() -> None:
+            apply(old_values)
+
+        def redo() -> None:
+            apply(new_values)
+
+        redo()
+        self.figure.change_tracker.addEdit([undo, redo, "Rotate"])
+        self.figure.signals.figure_selection_property_changed.emit()
+        self.figure.signals.figure_selection_moved.emit()
+        return True
+
     def delete_targets(self):
         """Delete all selected targets."""
         if len(self.targets) == 0:
@@ -499,7 +894,7 @@ class GrabbableRectangleSelection(GrabFunctions):
         else:
             for index, target in enumerate(self.targets):
                 new_points = np.array(
-                    target.get_positions(use_previous_offset, update_offset=True)
+                    target.get_positions(use_previous_offset)
                 )
                 if new_points.shape[0] == 3:
                     x0, y0, x1, y1 = (
@@ -607,38 +1002,44 @@ class GrabbableRectangleSelection(GrabFunctions):
         """transform a point"""
         return self.transform(pos)
 
-    def get_save_point(self) -> callable:
+    def get_save_point(self, targets: Iterable[TargetWrapper] = None) -> callable:
         """gather the current positions in a restore point for the undo function"""
-        targets = [target.target for target in self.targets]
-        positions = [target.get_positions() for target in self.targets]
+        selected_targets = [target.target for target in self.targets]
+        wrapped_targets = self._unique_wrappers(targets or self.targets)
+        restore_targets = [target.target for target in wrapped_targets]
+        positions = [target.get_positions() for target in wrapped_targets]
 
         def undo():
             self.clear_targets()
-            for target, pos in zip(targets, positions):
+            for target, pos in zip(restore_targets, positions):
                 target = TargetWrapper(target)
                 target.set_positions(pos)
-                self.add_target(target.target)
+            for target in selected_targets:
+                self.add_target(target)
 
         return undo
 
-    def start_move(self):
+    def start_move(self, save_targets: Iterable[TargetWrapper] = None):
         """start to move a grabber"""
         self.start_p1 = self.p1.copy()
         self.start_p2 = self.p2.copy()
         self.hide_grabber()
         self.has_moved = False
+        self.save_targets = self._unique_wrappers(save_targets or self.targets)
+        for target in self._unique_wrappers(list(self.targets) + self.save_targets):
+            target.refresh_offset()
 
-        self.store_start = self.get_save_point()
+        self.store_start = self.get_save_point(self.save_targets)
 
-    def end_move(self):
+    def end_move(self, edit_name: str = "Move"):
         """a grabber move stopped"""
         self.update_grabber()
 
-        self.store_end = self.get_save_point()
+        self.store_end = self.get_save_point(self.save_targets)
         if self.has_moved is True:
             self.figure.signals.figure_selection_moved.emit()
             self.figure.change_tracker.addEdit(
-                [self.store_start, self.store_end, "Move"]
+                [self.store_start, self.store_end, edit_name]
             )
 
     def addOffset(self, pos: Sequence, dir: int, keep_aspect_ratio: bool = True):
@@ -693,7 +1094,7 @@ class GrabbableRectangleSelection(GrabFunctions):
         for target in self.targets:
             self.transform_target(transform, target)
 
-        self.update_selection_rectangles()
+        self.update_selection_rectangles(use_previous_offset=True)
         # for rect in self.targets_rects:
         #    self.transform_target(transform, TargetWrapper(rect))
 

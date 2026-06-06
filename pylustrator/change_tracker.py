@@ -573,10 +573,10 @@ class ChangeTracker:
 
             # compose text
             if getattr(element, "is_new_text", False) and exclude_default:
-                text = kwargs["text"]
-                del kwargs["text"]
-                position = kwargs["position"]
-                del kwargs["position"]
+                text = element.get_text()
+                position = pos
+                kwargs.pop("text", None)
+                kwargs.pop("position", None)
                 kwargs = kwargs_to_string(kwargs)
                 return (
                     element.axes or element.figure,
@@ -606,9 +606,17 @@ class ChangeTracker:
                 ("title_fontsize", lambda x: x.get_title().get_fontsize()),
             ]
 
+            parent = element.figure if element.axes is None else element.axes
+            if element.axes is not None and element.axes.get_legend() is element:
+                handles = CodeReference(
+                    getReference(parent) + ".get_legend_handles_labels()[0]"
+                )
+            else:
+                handles = CodeReference(getReference(element) + ".legend_handles")
+
             # get current property values
             kwargs = {
-                "handles": CodeReference(getReference(element) + ".legend_handles"),
+                "handles": handles,
                 "labels": [text.get_text() for text in element.get_texts()],
                 "loc": element._loc,
             }
@@ -634,7 +642,6 @@ class ChangeTracker:
                     continue
                 if value != default or not exclude_default:
                     kwargs[prop] = value
-            parent = element.figure if element.axes is None else element.axes
             if element.axes is None or (element.axes is not None and element.axes.get_legend() is not element):
                 legend_kwargs = dict(kwargs)
                 legend_kwargs.pop("handles", None)
@@ -1055,10 +1062,10 @@ class ChangeTracker:
                 # if values where saved during the pylustrator saved code
                 for change in getattr(reference_obj, "_pylustrator_old_values", []):
                     if change["stack_position"].lineno == lineno:
-                        old_values = change["old_args"].copy()
-                        old_values.update(
-                            getattr(reference_obj, "_pylustrator_old_args", {})
-                        )
+                        old_values = getattr(
+                            reference_obj, "_pylustrator_old_args", {}
+                        ).copy()
+                        old_values.update(change["old_args"])
                         reference_obj._pylustrator_old_args = old_values
 
                 # if the reference object is just a dummy, we ignore it

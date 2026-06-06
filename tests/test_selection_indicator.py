@@ -465,6 +465,7 @@ def test_multi_selection_drag_keeps_legend_child_rectangles_aligned() -> None:
     manager.select_elements_in_bbox(bbox.x0, bbox.y0, bbox.x1, bbox.y1)
     manager.selection.start_move()
     manager.selection.addOffset((12, -7), DIR_X0 | DIR_X1 | DIR_Y0 | DIR_Y1)
+    fig.canvas.draw()
 
     for target_extent, rect_extent in zip(
         selection_target_extents(manager.selection),

@@ -227,17 +227,25 @@ class TargetWrapper(object):
                         )
                     )
                 )
-            points[-2:] = self.transform_inverted_points(points[-2:])
-            if use_previous_offset is True:
-                points[2] = (
-                    points[0] + self.target._pylustrator_offset + points[2] - points[1]
+                points[-2:] = self.transform_inverted_points(points[-2:])
+            elif len(points) == 1:
+                renderer = self.figure.canvas.get_renderer()
+                bbox = self.target.get_window_extent(renderer)
+                points.extend(
+                    self.transform_inverted_points(
+                        [(bbox.x0, bbox.y0), (bbox.x1, bbox.y1)]
+                    )
                 )
-                points[1] = points[0] + self.target._pylustrator_offset
+            if use_previous_offset is True:
+                offset = getattr(self.target, "_pylustrator_offset", None)
+                if offset is None:
+                    raise AttributeError("Text has no stored pylustrator offset")
+                points[2] = (
+                    points[0] + offset + points[2] - points[1]
+                )
+                points[1] = points[0] + offset
             else:
-                if (
-                    getattr(self.target, "_pylustrator_offset", None) is None
-                    or update_offset
-                ):
+                if update_offset:
                     self.target._pylustrator_offset = np.array(points[1]) - np.array(
                         points[0]
                     )
@@ -257,21 +265,26 @@ class TargetWrapper(object):
             points.append([bbox.x0, bbox.y0])
             points.append([bbox.x1, bbox.y1])
             if use_previous_offset is True:
+                offset = getattr(self.target, "_pylustrator_offset", None)
+                if offset is None:
+                    raise AttributeError("Legend has no stored pylustrator offset")
                 points[2] = (
-                    points[0] + self.target._pylustrator_offset + points[2] - points[1]
+                    points[0] + offset + points[2] - points[1]
                 )
-                points[1] = points[0] + self.target._pylustrator_offset
+                points[1] = points[0] + offset
             else:
-                if (
-                    getattr(self.target, "_pylustrator_offset", None) is None
-                    or update_offset
-                ):
+                if update_offset:
                     self.target._pylustrator_offset = points[1] - points[0]
         elif isinstance(self.target, Line2D):
             bbox = self.target.get_window_extent(self.figure.canvas.get_renderer())
             points.append([bbox.x0, bbox.y0])
             points.append([bbox.x1, bbox.y1])
         return self.transform_points(points)
+
+    def refresh_offset(self):
+        """Store the current display bbox offset for drag-time rectangle updates."""
+        if isinstance(self.target, (Text, Legend)):
+            self.get_positions(update_offset=True)
 
     def set_positions(self, points: (int, int)):
         """set the position of the target Artist"""
@@ -313,6 +326,27 @@ class TargetWrapper(object):
             change_tracker.addChange(
                 self.target,
                 ".set_positions(%s, %s)" % (tuple(points[0]), tuple(points[1])),
+            )
+        elif isinstance(self.target, Line2D):
+            bbox = self.target.get_window_extent(self.figure.canvas.get_renderer())
+            dx = points[0][0] - bbox.x0
+            dy = points[0][1] - bbox.y0
+            xy = np.column_stack(
+                [
+                    self.target.get_xdata(orig=False),
+                    self.target.get_ydata(orig=False),
+                ]
+            )
+            moved_xy = self.target.get_transform().transform(xy) + [dx, dy]
+            new_xy = self.target.get_transform().inverted().transform(moved_xy)
+            self.target.set_data(new_xy[:, 0], new_xy[:, 1])
+            change_tracker.addChange(
+                self.target,
+                ".set_data(%s, %s)"
+                % (
+                    [float(value) for value in new_xy[:, 0]],
+                    [float(value) for value in new_xy[:, 1]],
+                ),
             )
         elif isinstance(self.target, Text):
             if checkXLabel(self.target):
