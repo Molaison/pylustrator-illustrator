@@ -35,6 +35,10 @@ class FigureCanvas:
         self.draw_count += 1
 
 
+class ChangeTracker:
+    saved = True
+
+
 def make_colors(count: int) -> list[str]:
     return [
         f"#{(index * 37) % 255:02x}{(index * 71) % 255:02x}{(index * 109) % 255:02x}"
@@ -44,6 +48,14 @@ def make_colors(count: int) -> list[str]:
 
 def shown_colors(widget: ColorChooserWidget) -> list[str]:
     return [button.getColor() for button in widget.color_buttons_list]
+
+
+def canvas_top_left(window: PlotWindow) -> tuple[int, int]:
+    point = window.plot_layout.canvas_canvas.mapTo(
+        window,
+        window.plot_layout.canvas_canvas.rect().topLeft(),
+    )
+    return point.x(), point.y()
 
 
 def test_color_panel_refresh_replaces_old_qt_widgets() -> None:
@@ -99,13 +111,41 @@ def test_plot_window_color_pane_is_resizable() -> None:
 def test_plot_window_minimum_width_is_not_locked_by_tools_panel() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     window = PlotWindow(1)
-    tools = window.layout_main.widget(0)
+    tools = window.tools_scroll
 
     assert tools.minimumSizeHint().width() < 600
     assert window.input_size.minimumSizeHint().width() < 600
     assert window.minimumSizeHint().width() < 800
 
     window.close()
+    assert app is not None
+
+
+def test_plot_window_selection_does_not_resize_or_move_canvas() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    fig.change_tracker = ChangeTracker()
+    line = ax.plot([0, 1], [0, 1], color="#112233", marker="o")[0]
+    text = ax.text(0.5, 0.5, "label")
+    window = PlotWindow(1)
+    window.setFigure(fig)
+    window.show()
+    app.processEvents()
+    window.layout_main.setSizes([266, 384, 180])
+    app.processEvents()
+
+    initial_size = window.size()
+    initial_splitter_sizes = window.layout_main.sizes()
+    initial_canvas_pos = canvas_top_left(window)
+    for artist in (line, text, ax, fig, line):
+        window.signals.figure_element_selected.emit(artist)
+        app.processEvents()
+        assert window.size() == initial_size
+        assert window.layout_main.sizes() == initial_splitter_sizes
+        assert canvas_top_left(window) == initial_canvas_pos
+
+    window.close()
+    plt.close(fig)
     assert app is not None
 
 

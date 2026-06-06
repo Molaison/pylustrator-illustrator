@@ -523,11 +523,18 @@ class PlotWindow(QtWidgets.QWidget):
         widget = QtWidgets.QWidget()
         self.layout_tools = QtWidgets.QVBoxLayout(widget)
         widget.setSizePolicy(
-            QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Preferred
+            QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed
         )
-        # widget.setMaximumWidth(350)
-        # widget.setMinimumWidth(350)
-        self.layout_main.addWidget(widget)
+        tools_scroll = QtWidgets.QScrollArea()
+        tools_scroll.setWidgetResizable(True)
+        tools_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        tools_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        tools_scroll.setSizePolicy(
+            QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Expanding
+        )
+        tools_scroll.setWidget(widget)
+        self.layout_main.addWidget(tools_scroll)
+        self.tools_scroll = tools_scroll
 
         if 0:
             layout_rasterize_buttons = QtWidgets.QHBoxLayout()
