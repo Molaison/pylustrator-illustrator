@@ -113,6 +113,7 @@ class MyRect(QtWidgets.QGraphicsRectItem):
 
 
 class Canvas(QtWidgets.QWidget):
+    canvas_margin = 30
     fitted_to_view = False
     footer_label = None
     footer_label2 = None
@@ -175,13 +176,37 @@ class Canvas(QtWidgets.QWidget):
     def updateCanvasAreaSize(self):
         if self.canvas is None:
             return
+        self._syncFigureCanvasSize()
         w, h = self.canvas.get_width_height()
         viewport = self.canvas_scroll.viewport().size()
-        area_w = max(int(w + 30), viewport.width())
-        area_h = max(int(h + 30), viewport.height())
+        area_w = max(int(w + self.canvas_margin), viewport.width())
+        area_h = max(int(h + self.canvas_margin), viewport.height())
         self.canvas_canvas.setMinimumSize(area_w, area_h)
         self.canvas_canvas.setMaximumSize(area_w, area_h)
         self.canvas_canvas.resize(area_w, area_h)
+
+    def _syncFigureCanvasSize(self):
+        """Keep the Qt widgets at the same pixel size as the Matplotlib canvas."""
+        w, h = self.canvas.get_width_height()
+        for widget in (self.canvas, self.canvas_container):
+            widget.setMinimumSize(w, h)
+            widget.setMaximumSize(w, h)
+            widget.resize(w, h)
+        self.canvas.updateGeometry()
+
+    def _centerFigureCanvas(self):
+        w, h = self.canvas.get_width_height()
+        self.canvas_container.move(
+            max(int((self.canvas_canvas.width() - w) / 2), 0),
+            max(int((self.canvas_canvas.height() - h) / 2), 0),
+        )
+
+    def _fitTargetSize(self) -> tuple[int, int]:
+        viewport = self.canvas_scroll.viewport().size()
+        return (
+            max(viewport.width() - self.canvas_margin, 1),
+            max(viewport.height() - self.canvas_margin, 1),
+        )
 
     def setFigure(self, figure):
         if self.canvas is not None:
@@ -194,7 +219,6 @@ class Canvas(QtWidgets.QWidget):
 
         self.selections_view.canvas_canvas = self.canvas
 
-        self.canvas_wrapper_layout.addWidget(self.canvas)
         self.fig = self.canvas.figure
         self.fig.widget = self.canvas
 
@@ -212,6 +236,7 @@ class Canvas(QtWidgets.QWidget):
 
         self.signals.canvas_changed.emit(self.canvas)
         self.updateCanvasAreaSize()
+        self._centerFigureCanvas()
 
         figure._pyl_scene = self.selections_scene_origin
 
@@ -376,38 +401,26 @@ class Canvas(QtWidgets.QWidget):
         """fit the figure to the view"""
         if self.canvas is None or getattr(self, "fig", None) is None:
             return
-        self.fitted_to_view = True
         if change_dpi:
-            w, h = self.canvas.get_width_height()
-            factor = min(
-                (self.canvas_canvas.width() - 30) / w,
-                (self.canvas_canvas.height() - 30) / h,
+            self.fitted_to_view = True
+            target_w, target_h = self._fitTargetSize()
+            size_inches = self.fig.get_size_inches()
+            device_pixel_ratio = canvas_device_pixel_ratio(self.canvas)
+            new_dpi = min(
+                target_w * device_pixel_ratio / size_inches[0],
+                target_h * device_pixel_ratio / size_inches[1],
             )
-            self.fig.set_dpi(self.fig.get_dpi() * factor)
-            # self.fig.canvas.draw()
-
-            self.canvas.updateGeometry()
-            w, h = self.canvas.get_width_height()
-            self.canvas_container.setMinimumSize(w, h)
-            self.canvas_container.setMaximumSize(w, h)
-
-            self.canvas_container.move(
-                int((self.canvas_canvas.width() - w) / 2 + 10),
-                int((self.canvas_canvas.height() - h) / 2 + 10),
-            )
-
+            if new_dpi > 0:
+                self.fig.set_dpi(new_dpi)
+                self.fig.canvas.draw()
+            self.updateCanvasAreaSize()
+            self._centerFigureCanvas()
             self.updateRuler()
-            # self.fig.canvas.draw()
 
         else:
             self.fitted_to_view = False
             self.updateCanvasAreaSize()
-            w, h = self.canvas.get_width_height()
-
-            self.canvas_container.move(
-                int((self.canvas_canvas.width() - w) / 2 + 5),
-                int((self.canvas_canvas.height() - h) / 2 + 5),
-            )
+            self._centerFigureCanvas()
             self.updateRuler()
 
     def canvas_key_press(self, event: QtCore.QEvent):
@@ -430,9 +443,10 @@ class Canvas(QtWidgets.QWidget):
     def scroll_event(self, event: QtCore.QEvent):
         """when the mouse wheel is used to zoom the figure"""
         if self.control_modifier:
+            self.fitted_to_view = False
             new_dpi = self.fig.get_dpi() + 10 * event.step
             # prevent zoom to be too far out
-            if new_dpi < 0:
+            if new_dpi <= 0:
                 return
 
             self.fig.figure_dragger.select_element(None)
@@ -443,10 +457,7 @@ class Canvas(QtWidgets.QWidget):
             self.fig.set_dpi(new_dpi)
             self.fig.canvas.draw()
 
-            self.canvas.updateGeometry()
-            w, h = self.canvas.get_width_height()
-            self.canvas_container.setMinimumSize(w, h)
-            self.canvas_container.setMaximumSize(w, h)
+            self.updateCanvasAreaSize()
 
             pos2 = self.fig.transFigure.transform(pos)
             diff = np.array([event.x, event.y]) - pos2
@@ -467,8 +478,7 @@ class Canvas(QtWidgets.QWidget):
 
     def showEvent(self, event: QtCore.QEvent):
         """when the window is shown"""
-        self.fitToView(False)
-        self.updateRuler()
+        self.fitToView(True)
 
     def button_press_event(self, event: QtCore.QEvent):
         """when a mouse button is pressed"""
@@ -524,10 +534,8 @@ class Canvas(QtWidgets.QWidget):
 
     def updateFigureSize(self):
         """update the size of the figure"""
-        w, h = self.canvas.get_width_height()
-        self.canvas_container.setMinimumSize(w, h)
-        self.canvas_container.setMaximumSize(w, h)
         self.updateCanvasAreaSize()
+        self._centerFigureCanvas()
 
     def changedFigureSize(self, size: tuple):
         """change the size of the figure"""
