@@ -379,8 +379,6 @@ class Canvas(QtWidgets.QWidget):
 
         else:
             w, h = self.canvas.get_width_height()
-            self.canvas_canvas.setMinimumWidth(w + 30)
-            self.canvas_canvas.setMinimumHeight(h + 30)
 
             self.canvas_container.move(
                 int((self.canvas_canvas.width() - w) / 2 + 5),
@@ -615,7 +613,7 @@ class PlotLayout(QtWidgets.QWidget):
 
     def __init__(self, signals):
         super().__init__()
-        self.setMinimumSize(600, 500)
+        self.setMinimumSize(300, 250)
 
         signals.figure_changed.connect(self.setFigure)
         signals.canvas_changed.connect(self.setCanvas)

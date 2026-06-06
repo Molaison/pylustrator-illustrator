@@ -415,7 +415,7 @@ class ColorChooserWidget(QtWidgets.QWidget):
 
         self.removeColoredButtons()
 
-        for color in self.color_artists[:20]:
+        for color in self.color_artists:
             self.addColorButton(color, color)
 
         self.trigger_no_update = True
@@ -428,7 +428,7 @@ class ColorChooserWidget(QtWidgets.QWidget):
                     return color
 
             self.colors_text_widget.setText(
-                "\n".join([colorToText(color) for color in self.color_artists[:10]])
+                "\n".join([colorToText(color) for color in self.color_artists])
             )
         finally:
             self.trigger_no_update = False
@@ -472,8 +472,14 @@ class ColorChooserWidget(QtWidgets.QWidget):
         self.canvas.draw()
 
     def removeColoredButtons(self):
-        while self.layout_colors.takeAt(0):
-            pass
+        while True:
+            item = self.layout_colors.takeAt(0)
+            if item is None:
+                break
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
         self.color_buttons_list = []
 
 

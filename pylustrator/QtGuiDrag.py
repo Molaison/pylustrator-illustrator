@@ -560,7 +560,9 @@ class PlotWindow(QtWidgets.QWidget):
         from .QtGui import ColorChooserWidget
 
         self.colorWidget = ColorChooserWidget(self, None, self.signals)
-        self.colorWidget.setMaximumWidth(150)
+        self.colorWidget.setSizePolicy(
+            QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Expanding
+        )
         self.layout_main.addWidget(self.colorWidget)
 
         self.layout_main.setStretchFactor(0, 0)
