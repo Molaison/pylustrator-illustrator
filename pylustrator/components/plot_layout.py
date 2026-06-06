@@ -133,10 +133,15 @@ class Canvas(QtWidgets.QWidget):
         self.layout = QtWidgets.QHBoxLayout(self)
         self.layout.setContentsMargins(0, 0, 0, 0)
 
-        self.canvas_canvas = QtWidgets.QWidget(self)
-        self.layout.addWidget(self.canvas_canvas)
+        self.canvas_scroll = QtWidgets.QScrollArea(self)
+        self.canvas_scroll.setWidgetResizable(False)
+        self.canvas_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self.layout.addWidget(self.canvas_scroll)
+
+        self.canvas_canvas = QtWidgets.QWidget()
+        self.canvas_scroll.setWidget(self.canvas_canvas)
         self.canvas_canvas.setSizePolicy(
-            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding
+            QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed
         )
         self.canvas_canvas.setStyleSheet("background:#d1d1d1")
         self.canvas_canvas.setFocusPolicy(QtCore.Qt.StrongFocus)
@@ -167,6 +172,17 @@ class Canvas(QtWidgets.QWidget):
         self.selections_view.setAttribute(QtCore.Qt.WA_NoSystemBackground)
         self.selections_view.canvas_canvas = self.canvas_canvas
 
+    def updateCanvasAreaSize(self):
+        if self.canvas is None:
+            return
+        w, h = self.canvas.get_width_height()
+        viewport = self.canvas_scroll.viewport().size()
+        area_w = max(int(w + 30), viewport.width())
+        area_h = max(int(h + 30), viewport.height())
+        self.canvas_canvas.setMinimumSize(area_w, area_h)
+        self.canvas_canvas.setMaximumSize(area_w, area_h)
+        self.canvas_canvas.resize(area_w, area_h)
+
     def setFigure(self, figure):
         if self.canvas is not None:
             self.canvas_wrapper_layout.removeWidget(self.canvas)
@@ -195,6 +211,7 @@ class Canvas(QtWidgets.QWidget):
         self.drag = None
 
         self.signals.canvas_changed.emit(self.canvas)
+        self.updateCanvasAreaSize()
 
         figure._pyl_scene = self.selections_scene_origin
 
@@ -206,6 +223,7 @@ class Canvas(QtWidgets.QWidget):
         """update the ruler around the figure to show the dimensions"""
         if self.canvas is None or getattr(self, "fig", None) is None:
             return
+        self.updateCanvasAreaSize()
         trans = (
             transforms.Affine2D().scale(1.0 / 2.54, 1.0 / 2.54)
             + self.fig.dpi_scale_trans
@@ -382,6 +400,8 @@ class Canvas(QtWidgets.QWidget):
             # self.fig.canvas.draw()
 
         else:
+            self.fitted_to_view = False
+            self.updateCanvasAreaSize()
             w, h = self.canvas.get_width_height()
 
             self.canvas_container.move(
@@ -442,11 +462,12 @@ class Canvas(QtWidgets.QWidget):
         if self.fitted_to_view:
             self.fitToView(True)
         else:
+            self.updateCanvasAreaSize()
             self.updateRuler()
 
     def showEvent(self, event: QtCore.QEvent):
         """when the window is shown"""
-        self.fitToView(True)
+        self.fitToView(False)
         self.updateRuler()
 
     def button_press_event(self, event: QtCore.QEvent):
@@ -506,6 +527,7 @@ class Canvas(QtWidgets.QWidget):
         w, h = self.canvas.get_width_height()
         self.canvas_container.setMinimumSize(w, h)
         self.canvas_container.setMaximumSize(w, h)
+        self.updateCanvasAreaSize()
 
     def changedFigureSize(self, size: tuple):
         """change the size of the figure"""

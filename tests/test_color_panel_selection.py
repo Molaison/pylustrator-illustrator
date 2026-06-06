@@ -10,6 +10,8 @@ from qtpy import QtCore, QtWidgets
 from pylustrator.QtGui import ColorChooserWidget
 from pylustrator.QtGuiDrag import PlotWindow
 from pylustrator.QtShortCuts import QDragableColor
+from pylustrator.change_tracker import init_figure
+from pylustrator.drag_helper import DragManager
 from pylustrator.components.plot_layout import Canvas as PlotCanvas
 
 
@@ -164,7 +166,7 @@ def test_plot_window_can_be_resized_narrower_than_initial_hint() -> None:
     assert app is not None
 
 
-def test_canvas_fit_without_dpi_change_does_not_lock_window_to_figure_size() -> None:
+def test_canvas_fit_without_dpi_change_keeps_figure_size_in_scroll_area() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     signals = SignalBundle()
     fig = plt.figure(figsize=(12, 8), dpi=100)
@@ -174,8 +176,61 @@ def test_canvas_fit_without_dpi_change_does_not_lock_window_to_figure_size() -> 
 
     canvas.fitToView(False)
 
-    assert canvas.canvas_canvas.minimumWidth() < figure_width
-    assert canvas.canvas_canvas.minimumHeight() < figure_height
+    assert canvas.canvas_canvas.minimumWidth() >= figure_width
+    assert canvas.canvas_canvas.minimumHeight() >= figure_height
+    assert fig.canvas.get_width_height() == (figure_width, figure_height)
 
+    plt.close(fig)
+    assert app is not None
+
+
+def test_plot_canvas_scrolls_large_figure_without_resizing_window() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    signals = SignalBundle()
+    fig = plt.figure(figsize=(12, 8), dpi=100)
+    canvas = PlotCanvas(signals)
+    canvas.resize(360, 260)
+    canvas.setFigure(fig)
+    canvas.show()
+    app.processEvents()
+
+    canvas.fitToView(False)
+    app.processEvents()
+
+    assert canvas.canvas_scroll.horizontalScrollBar().maximum() > 0
+    assert canvas.canvas_scroll.verticalScrollBar().maximum() > 0
+    assert fig.canvas.get_width_height() == (1200, 800)
+
+    plt.close(fig)
+    assert app is not None
+
+
+def test_plot_window_click_selects_text_after_scrollable_layout() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    text = ax.text(0.5, 0.5, "pick me", picker=True)
+    window = PlotWindow(1)
+    window.setFigure(fig)
+    DragManager(fig, True)
+    init_figure(fig)
+    window.update()
+    window.show()
+    app.processEvents()
+    fig.canvas.draw()
+    app.processEvents()
+
+    bbox = text.get_window_extent(fig.canvas.get_renderer())
+    event = matplotlib.backend_bases.MouseEvent(
+        "button_press_event",
+        fig.canvas,
+        (bbox.x0 + bbox.x1) / 2,
+        (bbox.y0 + bbox.y1) / 2,
+        button=1,
+    )
+    fig.figure_dragger.button_press_event0(event)
+
+    assert fig.figure_dragger.selected_element is text
+
+    window.close()
     plt.close(fig)
     assert app is not None
