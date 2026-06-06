@@ -224,6 +224,8 @@ def test_plot_canvas_refits_figure_when_fit_view_is_resized() -> None:
 
     canvas.resize(320, 240)
     app.processEvents()
+    QtCore.QThread.msleep(40)
+    app.processEvents()
 
     assert canvas.fitted_to_view is True
     assert_figure_fits_viewport(canvas)

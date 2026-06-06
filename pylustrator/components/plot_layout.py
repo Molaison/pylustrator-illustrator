@@ -130,6 +130,12 @@ class Canvas(QtWidgets.QWidget):
             lambda: (self.updateFigureSize(), self.updateRuler())
         )
         self.signals = signals
+        self.fitted_to_view = False
+        self._last_ruler_state = None
+        self._resize_fit_timer = QtCore.QTimer(self)
+        self._resize_fit_timer.setSingleShot(True)
+        self._resize_fit_timer.setInterval(25)
+        self._resize_fit_timer.timeout.connect(self._applyScheduledFitToView)
 
         self.layout = QtWidgets.QHBoxLayout(self)
         self.layout.setContentsMargins(0, 0, 0, 0)
@@ -148,6 +154,7 @@ class Canvas(QtWidgets.QWidget):
         self.canvas_canvas.setFocusPolicy(QtCore.Qt.StrongFocus)
 
         self.shadow = QtWidgets.QLabel(self.canvas_canvas)
+        self.shadow.setGraphicsEffect(QtWidgets.QGraphicsBlurEffect(self.shadow))
         self.canvas_border = QtWidgets.QLabel(self.canvas_canvas)
 
         self.canvas_container = QtWidgets.QWidget(self.canvas_canvas)
@@ -181,25 +188,40 @@ class Canvas(QtWidgets.QWidget):
         viewport = self.canvas_scroll.viewport().size()
         area_w = max(int(w + self.canvas_margin), viewport.width())
         area_h = max(int(h + self.canvas_margin), viewport.height())
-        self.canvas_canvas.setMinimumSize(area_w, area_h)
-        self.canvas_canvas.setMaximumSize(area_w, area_h)
-        self.canvas_canvas.resize(area_w, area_h)
+        target_size = QtCore.QSize(area_w, area_h)
+        if self.canvas_canvas.minimumSize() != target_size:
+            self.canvas_canvas.setMinimumSize(area_w, area_h)
+        if self.canvas_canvas.maximumSize() != target_size:
+            self.canvas_canvas.setMaximumSize(area_w, area_h)
+        if self.canvas_canvas.size() != target_size:
+            self.canvas_canvas.resize(area_w, area_h)
 
     def _syncFigureCanvasSize(self):
         """Keep the Qt widgets at the same pixel size as the Matplotlib canvas."""
-        w, h = self.canvas.get_width_height()
+        w, h = (int(value) for value in self.canvas.get_width_height())
+        target_size = QtCore.QSize(w, h)
+        changed = False
         for widget in (self.canvas, self.canvas_container):
-            widget.setMinimumSize(w, h)
-            widget.setMaximumSize(w, h)
-            widget.resize(w, h)
-        self.canvas.updateGeometry()
+            if widget.minimumSize() != target_size:
+                widget.setMinimumSize(w, h)
+                changed = True
+            if widget.maximumSize() != target_size:
+                widget.setMaximumSize(w, h)
+                changed = True
+            if widget.size() != target_size:
+                widget.resize(w, h)
+                changed = True
+        if changed:
+            self.canvas.updateGeometry()
 
     def _centerFigureCanvas(self):
         w, h = self.canvas.get_width_height()
-        self.canvas_container.move(
+        target_pos = QtCore.QPoint(
             max(int((self.canvas_canvas.width() - w) / 2), 0),
             max(int((self.canvas_canvas.height() - h) / 2), 0),
         )
+        if self.canvas_container.pos() != target_pos:
+            self.canvas_container.move(target_pos)
 
     def _fitTargetSize(self) -> tuple[int, int]:
         viewport = self.canvas_scroll.viewport().size()
@@ -237,6 +259,7 @@ class Canvas(QtWidgets.QWidget):
         self.signals.canvas_changed.emit(self.canvas)
         self.updateCanvasAreaSize()
         self._centerFigureCanvas()
+        self._last_ruler_state = None
 
         figure._pyl_scene = self.selections_scene_origin
 
@@ -249,17 +272,6 @@ class Canvas(QtWidgets.QWidget):
         if self.canvas is None or getattr(self, "fig", None) is None:
             return
         self.updateCanvasAreaSize()
-        trans = (
-            transforms.Affine2D().scale(1.0 / 2.54, 1.0 / 2.54)
-            + self.fig.dpi_scale_trans
-        )
-        l0 = 20
-        l1 = 20
-        l2 = 10
-        l3 = 5
-
-        ##
-
         w = self.canvas.width()
         h = self.canvas.height()
         device_pixel_ratio = canvas_device_pixel_ratio(self.canvas)
@@ -274,6 +286,31 @@ class Canvas(QtWidgets.QWidget):
         self.selections_scene_origin.setTransform(selection_scene_transform(device_pixel_ratio, h))
 
         self.selections_view.h = h
+
+        p = self.canvas_container.pos()
+        ruler_state = (
+            self.canvas_canvas.width(),
+            self.canvas_canvas.height(),
+            self.canvas.width(),
+            self.canvas.height(),
+            p.x(),
+            p.y(),
+            round(float(self.fig.dpi), 6),
+            round(device_pixel_ratio, 6),
+            self.fontMetrics().height(),
+        )
+        if ruler_state == self._last_ruler_state:
+            return
+        self._last_ruler_state = ruler_state
+
+        trans = (
+            transforms.Affine2D().scale(1.0 / 2.54, 1.0 / 2.54)
+            + self.fig.dpi_scale_trans
+        )
+        l0 = 20
+        l1 = 20
+        l2 = 10
+        l3 = 5
 
         ##
         w = self.canvas_canvas.width()
@@ -326,6 +363,7 @@ class Canvas(QtWidgets.QWidget):
         painterX.drawLine(0, l0 - 2, w, l0 - 2)
         painterX.setPen(QtGui.QPen(QtGui.QColor("white"), 1))
         painterX.drawLine(0, l0 - 1, w, l0 - 1)
+        painterX.end()
         self.x_scale.setPixmap(self.pixmapX)
         self.x_scale.setMinimumSize(w, l0)
         self.x_scale.setMaximumSize(w, l0)
@@ -371,6 +409,7 @@ class Canvas(QtWidgets.QWidget):
         painterY.setPen(QtGui.QPen(QtGui.QColor("#f0f0f0"), 0))
         painterY.setBrush(QtGui.QBrush(QtGui.QColor("#f0f0f0")))
         painterY.drawRect(0, 0, int(l0), int(l0))
+        painterY.end()
         self.y_scale.setPixmap(self.pixmapY)
         self.y_scale.setMinimumSize(l0, h)
         self.y_scale.setMaximumSize(l0, h)
@@ -386,7 +425,6 @@ class Canvas(QtWidgets.QWidget):
         self.shadow.move(p.x() + 2, p.y() + 2)
         self.shadow.setMinimumSize(w, h)
         self.shadow.setMaximumSize(w, h)
-        self.shadow.setGraphicsEffect(QtWidgets.QGraphicsBlurEffect())
 
         self.pixmap2 = QtGui.QPixmap(w + 2, h + 2)
         self.pixmap2.fill(QtGui.QColor("#666666"))
@@ -410,9 +448,9 @@ class Canvas(QtWidgets.QWidget):
                 target_w * device_pixel_ratio / size_inches[0],
                 target_h * device_pixel_ratio / size_inches[1],
             )
-            if new_dpi > 0:
+            if new_dpi > 0 and abs(new_dpi - self.fig.get_dpi()) > 1e-6:
                 self.fig.set_dpi(new_dpi)
-                self.fig.canvas.draw()
+                self.fig.canvas.draw_idle()
             self.updateCanvasAreaSize()
             self._centerFigureCanvas()
             self.updateRuler()
@@ -455,7 +493,7 @@ class Canvas(QtWidgets.QWidget):
             pos_ax = self.fig.transFigure.transform(self.fig.axes[0].get_position())[0]
 
             self.fig.set_dpi(new_dpi)
-            self.fig.canvas.draw()
+            self.fig.canvas.draw_idle()
 
             self.updateCanvasAreaSize()
 
@@ -471,10 +509,14 @@ class Canvas(QtWidgets.QWidget):
     def resizeEvent(self, event: QtCore.QEvent):
         """when the window is resized"""
         if self.fitted_to_view:
-            self.fitToView(True)
+            self._resize_fit_timer.start()
         else:
             self.updateCanvasAreaSize()
             self.updateRuler()
+
+    def _applyScheduledFitToView(self):
+        if self.fitted_to_view and self.canvas is not None:
+            self.fitToView(True)
 
     def showEvent(self, event: QtCore.QEvent):
         """when the window is shown"""
