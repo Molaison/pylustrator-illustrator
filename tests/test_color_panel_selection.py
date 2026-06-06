@@ -96,6 +96,34 @@ def test_plot_window_color_pane_is_resizable() -> None:
     assert app is not None
 
 
+def test_plot_window_minimum_width_is_not_locked_by_tools_panel() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    window = PlotWindow(1)
+    tools = window.layout_main.widget(0)
+
+    assert tools.minimumSizeHint().width() < 600
+    assert window.input_size.minimumSizeHint().width() < 600
+    assert window.minimumSizeHint().width() < 800
+
+    window.close()
+    assert app is not None
+
+
+def test_plot_window_can_be_resized_narrower_than_initial_hint() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    window = PlotWindow(1)
+
+    window.show()
+    app.processEvents()
+    window.resize(700, 360)
+    app.processEvents()
+
+    assert window.size().width() <= 720
+
+    window.close()
+    assert app is not None
+
+
 def test_canvas_fit_without_dpi_change_does_not_lock_window_to_figure_size() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     signals = SignalBundle()

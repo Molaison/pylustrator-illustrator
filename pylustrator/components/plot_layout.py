@@ -204,6 +204,8 @@ class Canvas(QtWidgets.QWidget):
 
     def updateRuler(self):
         """update the ruler around the figure to show the dimensions"""
+        if self.canvas is None or getattr(self, "fig", None) is None:
+            return
         trans = (
             transforms.Affine2D().scale(1.0 / 2.54, 1.0 / 2.54)
             + self.fig.dpi_scale_trans
@@ -354,6 +356,8 @@ class Canvas(QtWidgets.QWidget):
 
     def fitToView(self, change_dpi: bool = False):
         """fit the figure to the view"""
+        if self.canvas is None or getattr(self, "fig", None) is None:
+            return
         self.fitted_to_view = True
         if change_dpi:
             w, h = self.canvas.get_width_height()

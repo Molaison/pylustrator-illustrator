@@ -657,6 +657,8 @@ class PlotWindow(QtWidgets.QWidget):
 
     def closeEvent(self, event: QtCore.QEvent):
         """when the window is closed, ask the user to save"""
+        if self.fig is None:
+            return
         if not self.fig.change_tracker.saved and not no_save_allowed:
             reply = QtWidgets.QMessageBox.question(
                 self,

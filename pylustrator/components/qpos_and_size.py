@@ -37,25 +37,29 @@ class QPosAndSize(QtWidgets.QWidget):
         self.signals = signals
 
         layout.addWidget(self)
-        self.layout = QtWidgets.QHBoxLayout(self)
+        self.layout = QtWidgets.QGridLayout(self)
         self.layout.setContentsMargins(10, 0, 10, 0)
 
         self.input_position = DimensionsWidget(self.layout, "X:", "Y:", "cm")
+        self.layout.addWidget(self.input_position, 0, 0)
         self.input_position.valueChangedX.connect(lambda x: self.changePos(x, None))
         self.input_position.valueChangedY.connect(lambda y: self.changePos(None, y))
 
         self.input_shape = DimensionsWidget(self.layout, "W:", "H:", "cm")
+        self.layout.addWidget(self.input_shape, 0, 1)
         self.input_shape.valueChanged.connect(self.changeSize)
 
         self.input_transform = ComboWidget(self.layout, "", ["cm", "in", "px", "none"])
+        self.layout.addWidget(self.input_transform, 1, 0)
         self.input_transform.editingFinished.connect(self.changeTransform)
 
         self.input_shape_transform = ComboWidget(
             self.layout, "", ["scale", "bottom right", "top left"]
         )
+        self.layout.addWidget(self.input_shape_transform, 1, 1)
         self.input_shape_transform.editingFinished.connect(self.changeTransform2)
 
-        self.layout.addStretch()
+        self.layout.setColumnStretch(2, 1)
 
     def setFigure(self, figure):
         self.fig = figure

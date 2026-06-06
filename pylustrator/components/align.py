@@ -16,7 +16,7 @@ class Align(QtWidgets.QWidget):
 
         signals.figure_changed.connect(self.setFigure)
 
-        self.layout_main = QtWidgets.QHBoxLayout(self)
+        self.layout_main = QtWidgets.QGridLayout(self)
         self.layout_main.setContentsMargins(0, 0, 0, 0)
 
         actions = [
@@ -64,6 +64,7 @@ class Align(QtWidgets.QWidget):
             "rotate_left": "rotate selected objects 15 degrees counterclockwise",
             "rotate_right": "rotate selected objects 15 degrees clockwise",
         }
+        columns = 4
         self.buttons = []
         align_group = QtWidgets.QButtonGroup(self)
         for index, act in enumerate(actions):
@@ -78,17 +79,14 @@ class Align(QtWidgets.QWidget):
                 icon,
                 "",
             )
+            button.setSizePolicy(
+                QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed
+            )
             button.setToolTip(tooltips.get(act, act.replace("_", " ")))
-            self.layout_main.addWidget(button)
+            self.layout_main.addWidget(button, index // columns, index % columns)
             button.clicked.connect(lambda x, act=act: self.execute_action(act))
             self.buttons.append(button)
             align_group.addButton(button)
-            if index == 3 or index == 7 or index == 8 or index == 11:
-                line = QtWidgets.QFrame()
-                line.setFrameShape(QtWidgets.QFrame.VLine)
-                line.setFrameShadow(QtWidgets.QFrame.Sunken)
-                self.layout_main.addWidget(line)
-        self.layout_main.addStretch()
 
     def execute_action(self, act: str):
         """execute an alignment action"""
