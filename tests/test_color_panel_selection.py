@@ -131,6 +131,34 @@ def test_plot_window_minimum_width_is_not_locked_by_tools_panel() -> None:
     assert app is not None
 
 
+def test_plot_window_opens_with_comfortable_canvas_and_visible_side_panes() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig = plt.figure(figsize=(12, 8), dpi=100)
+    fig.change_tracker = ChangeTracker()
+    window = PlotWindow(1)
+    window.setFigure(fig)
+
+    window.show()
+    app.processEvents()
+    app.processEvents()
+
+    sizes = window.layout_main.sizes()
+    viewport = window.plot_layout.canvas_canvas.canvas_scroll.viewport().size()
+    available = window.screen().availableGeometry()
+
+    if available.width() >= 900:
+        assert sizes[0] >= 220
+        assert sizes[2] >= 180
+    assert window.height() >= min(650, int(available.height() * 0.75))
+    assert viewport.width() >= min(650, int(available.width() * 0.45))
+    assert viewport.height() >= min(450, int(available.height() * 0.45))
+    assert_figure_fits_viewport(window.plot_layout.canvas_canvas)
+
+    window.close()
+    plt.close(fig)
+    assert app is not None
+
+
 def test_plot_window_selection_does_not_resize_or_move_canvas() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     fig, ax = plt.subplots(figsize=(5, 4), dpi=100)

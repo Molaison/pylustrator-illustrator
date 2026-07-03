@@ -363,6 +363,8 @@ class PlotWindow(QtWidgets.QWidget):
         self.fig = figure
         self.fig.window = self
         self.fig.signals = self.signals
+        if getattr(figure, "_pylustrator_initial_dpi", None) is None:
+            figure._pylustrator_initial_dpi = figure.get_dpi()
         self.signals.figure_changed.emit(figure)
 
     def setCanvas(self, canvas):
@@ -450,6 +452,7 @@ class PlotWindow(QtWidgets.QWidget):
         super().__init__()
 
         self.figures = []
+        self._initial_layout_applied = False
 
         self.signals = Signals()
         self.signals.canvas_changed.connect(self.setCanvas)
@@ -576,6 +579,77 @@ class PlotWindow(QtWidgets.QWidget):
         self.layout_main.setStretchFactor(1, 1)
         self.layout_main.setStretchFactor(2, 0)
 
+    def _available_geometry(self) -> QtCore.QRect:
+        screen = self.screen() or QtWidgets.QApplication.primaryScreen()
+        if screen is None:
+            return QtCore.QRect(0, 0, 1440, 900)
+        return screen.availableGeometry()
+
+    def _figure_design_pixels(self) -> tuple[float, float]:
+        if self.fig is None:
+            return 800.0, 600.0
+        width, height = self.fig.get_size_inches()
+        dpi = getattr(self.fig, "_pylustrator_initial_dpi", self.fig.get_dpi())
+        return float(width * dpi), float(height * dpi)
+
+    def _initial_side_widths(self, max_width: int) -> tuple[int, int]:
+        tools_width = 280
+        color_width = 220
+        min_canvas_width = 420
+        if max_width < tools_width + color_width + min_canvas_width + 40:
+            tools_width = 220
+            color_width = 180
+        if max_width < tools_width + color_width + min_canvas_width + 40:
+            tools_width = max(160, int(max_width * 0.25))
+            color_width = max(140, int(max_width * 0.20))
+        return tools_width, color_width
+
+    def _apply_initial_layout(self):
+        if self.fig is None:
+            return
+        available = self._available_geometry()
+        max_width = max(700, int(available.width() * 0.92))
+        max_height = max(520, int(available.height() * 0.88))
+        tools_width, color_width = self._initial_side_widths(max_width)
+
+        top_chrome = self.height() - self.layout_main.height()
+        if top_chrome <= 0:
+            top_chrome = (
+                self.menuBar.sizeHint().height()
+                + self.input_size.sizeHint().height()
+                + 12
+            )
+        plot_chrome = (
+            self.plot_layout.height() - self.plot_layout.canvas_canvas.height()
+        )
+        if plot_chrome <= 0:
+            plot_chrome = 72
+
+        figure_width, figure_height = self._figure_design_pixels()
+        available_canvas_width = max(max_width - tools_width - color_width - 40, 300)
+        available_canvas_height = max(max_height - top_chrome - plot_chrome, 260)
+
+        canvas_width = int(
+            min(max(figure_width, min(720, available_canvas_width)), available_canvas_width)
+        )
+        canvas_height = int(
+            min(max(figure_height, min(520, available_canvas_height)), available_canvas_height)
+        )
+        window_width = min(max_width, tools_width + canvas_width + color_width + 40)
+        window_height = min(max_height, canvas_height + top_chrome + plot_chrome)
+
+        x = available.x() + max((available.width() - window_width) // 2, 0)
+        y = available.y() + max((available.height() - window_height) // 2, 0)
+        self.setGeometry(x, y, int(window_width), int(window_height))
+        self.layout_main.setSizes(
+            [
+                int(tools_width),
+                max(int(window_width - tools_width - color_width), 300),
+                int(color_width),
+            ]
+        )
+        self.plot_layout.canvas_canvas.fitToView(True)
+
     def rasterize(self, rasterize: bool):
         """convert the figur elements to an image"""
         if len(self.fig.selection.targets):
@@ -623,7 +697,14 @@ class PlotWindow(QtWidgets.QWidget):
 
     def showEvent(self, event: QtCore.QEvent):
         """when the window is shown"""
+        super().showEvent(event)
         self.colorWidget.updateColorsText()
+        if not self._initial_layout_applied:
+            self._initial_layout_applied = True
+            self._apply_initial_layout()
+            QtCore.QTimer.singleShot(
+                0, lambda: self.plot_layout.canvas_canvas.fitToView(True)
+            )
 
     def update(self):
         """update the tree view"""
