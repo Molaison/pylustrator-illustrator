@@ -169,7 +169,7 @@ class TargetWrapper(object):
                 if getattr(self.target, "pad_offset", None) is None:
                     self.target.pad_offset = (
                         self.target.get_position()[1]
-                        - checkXLabel(self.target).xaxis.labelpad * self.label_factor
+                        + checkXLabel(self.target).xaxis.labelpad * self.label_factor
                     )
                 self.label_y = self.target.get_position()[1]
             elif checkYLabel(self.target):
@@ -177,7 +177,7 @@ class TargetWrapper(object):
                 if getattr(self.target, "pad_offset", None) is None:
                     self.target.pad_offset = (
                         self.target.get_position()[0]
-                        - checkYLabel(self.target).yaxis.labelpad * self.label_factor
+                        + checkYLabel(self.target).yaxis.labelpad * self.label_factor
                     )
                 self.label_x = self.target.get_position()[0]
             self.get_transform = self.target.get_transform
@@ -226,23 +226,19 @@ class TargetWrapper(object):
                 points[0] = (self.label_x, points[0][1])
             if getattr(self.target, "xy", None) is not None:
                 points.append(self.target.xy)
-            bbox = self.target.get_bbox_patch()
-            if bbox:
-                points.append(
-                    bbox.get_transform().transform((bbox.get_x(), bbox.get_y()))
-                )
-                points.append(
-                    bbox.get_transform().transform(
-                        (
-                            bbox.get_x() + bbox.get_width(),
-                            bbox.get_y() + bbox.get_height(),
-                        )
-                    )
-                )
-                points[-2:] = self.transform_inverted_points(points[-2:])
-            elif len(points) == 1:
+            if len(points) == 1:
                 renderer = self.figure.canvas.get_renderer()
-                bbox = self.target.get_window_extent(renderer)
+                bbox_patch = self.target.get_bbox_patch()
+                has_visible_bbox = False
+                if bbox_patch:
+                    face_alpha = bbox_patch.get_facecolor()[-1]
+                    edge_alpha = bbox_patch.get_edgecolor()[-1]
+                    has_visible_bbox = face_alpha > 0 or edge_alpha > 0
+                if has_visible_bbox:
+                    self.target.update_bbox_position_size(renderer)
+                    bbox = bbox_patch.get_window_extent(renderer)
+                else:
+                    bbox = self.target.get_window_extent(renderer)
                 points.extend(
                     self.transform_inverted_points(
                         [(bbox.x0, bbox.y0), (bbox.x1, bbox.y1)]
@@ -424,7 +420,7 @@ class TargetWrapper(object):
             if checkXLabel(self.target):
                 axes = checkXLabel(self.target)
                 axes.xaxis.labelpad = (
-                    -(points[0][1] - self.target.pad_offset) / self.label_factor
+                    (self.target.pad_offset - points[0][1]) / self.label_factor
                 )
                 change_tracker.addChange(
                     axes, ".xaxis.labelpad = %f" % axes.xaxis.labelpad
@@ -435,7 +431,7 @@ class TargetWrapper(object):
             elif checkYLabel(self.target):
                 axes = checkYLabel(self.target)
                 axes.yaxis.labelpad = (
-                    -(points[0][0] - self.target.pad_offset) / self.label_factor
+                    (self.target.pad_offset - points[0][0]) / self.label_factor
                 )
                 change_tracker.addChange(
                     axes, ".yaxis.labelpad = %f" % axes.yaxis.labelpad

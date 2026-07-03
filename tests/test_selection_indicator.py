@@ -386,6 +386,42 @@ def test_legend_child_drag_moves_parent_legend_without_internal_offset() -> None
     assert app is not None
 
 
+def test_yaxis_label_drag_keeps_selection_box_and_text_together() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    ax.set_ylabel("Y label")
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.selection.defer_artist_updates = True
+    label = ax.yaxis.label
+    renderer = fig.canvas.get_renderer()
+    manager.selection.add_target(label)
+    text_before = label.get_window_extent(renderer).frozen()
+    rect_before = selection_rect_extents(manager.selection)[0]
+
+    manager.selection.start_move()
+    manager.selection.addOffset((-20, 0), DIR_X0 | DIR_X1 | DIR_Y0 | DIR_Y1)
+    preview_rect = selection_rect_extents(manager.selection)[0]
+    assert abs((preview_rect[0] - rect_before[0]) + 20) < 1e-9
+    assert abs(preview_rect[1] - rect_before[1]) < 1e-9
+    assert label.get_window_extent(renderer).bounds == text_before.bounds
+
+    manager.selection.has_moved = True
+    manager.selection.end_move()
+    fig.canvas.draw()
+    manager.selection.update_selection_rectangles()
+
+    text_after = label.get_window_extent(renderer)
+    rect_after = selection_rect_extents(manager.selection)[0]
+    assert abs((text_after.x0 - text_before.x0) + 20) < 1e-9
+    assert abs(text_after.y0 - text_before.y0) < 1e-9
+    assert abs((rect_after[0] - rect_before[0]) + 20) < 1e-9
+    assert abs(rect_after[1] - rect_before[1]) < 1e-9
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
 def test_shift_drag_constrains_selection_to_cardinal_direction() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     fig, ax = plt.subplots(figsize=(4, 2), dpi=100)
@@ -671,6 +707,24 @@ def test_drag_rectangle_selects_intersecting_artists_without_background_axes() -
     assert ax not in selected
     assert text in [target.target for target in manager.selection.targets]
     assert ax not in [target.target for target in manager.selection.targets]
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_drag_rectangle_selects_empty_plot_area_axes() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    bbox = ax.get_window_extent(fig.canvas.get_renderer())
+    cx = (bbox.x0 + bbox.x1) / 2
+    cy = (bbox.y0 + bbox.y1) / 2
+
+    selected = manager.select_elements_in_bbox(cx - 10, cy - 10, cx + 10, cy + 10)
+
+    assert selected == [ax]
+    assert [target.target for target in manager.selection.targets] == [ax]
     manager.selection.clear_targets()
     plt.close(fig)
     assert app is not None

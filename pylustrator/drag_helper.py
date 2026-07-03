@@ -1599,24 +1599,77 @@ class DragManager:
     def _artist_intersects_bbox(
         self, artist: Artist, x0: float, y0: float, x1: float, y1: float
     ) -> bool:
-        points = np.array(TargetWrapper(artist).get_positions())
-        if len(points) == 0:
+        bounds = self._artist_display_bounds(artist)
+        if bounds is None:
             return False
-        ax0, ay0 = np.min(points[:, 0]), np.min(points[:, 1])
-        ax1, ay1 = np.max(points[:, 0]), np.max(points[:, 1])
+        ax0, ay0, ax1, ay1 = bounds
         if isinstance(artist, (Axes, Legend)):
             return ax0 >= x0 and ax1 <= x1 and ay0 >= y0 and ay1 <= y1
+        return self._bounds_intersect(ax0, ay0, ax1, ay1, x0, y0, x1, y1)
+
+    def _artist_overlaps_bbox(
+        self, artist: Artist, x0: float, y0: float, x1: float, y1: float
+    ) -> bool:
+        bounds = self._artist_display_bounds(artist)
+        if bounds is None:
+            return False
+        return self._bounds_intersect(*bounds, x0, y0, x1, y1)
+
+    @staticmethod
+    def _bounds_intersect(
+        ax0: float,
+        ay0: float,
+        ax1: float,
+        ay1: float,
+        x0: float,
+        y0: float,
+        x1: float,
+        y1: float,
+    ) -> bool:
         return ax1 >= x0 and ax0 <= x1 and ay1 >= y0 and ay0 <= y1
+
+    @staticmethod
+    def _artist_display_bounds(artist: Artist) -> tuple[float, float, float, float] | None:
+        points = np.array(TargetWrapper(artist).get_positions())
+        if len(points) == 0:
+            return None
+        ax0, ay0 = np.min(points[:, 0]), np.min(points[:, 1])
+        ax1, ay1 = np.max(points[:, 0]), np.max(points[:, 1])
+        return float(ax0), float(ay0), float(ax1), float(ay1)
 
     def select_elements_in_bbox(
         self, x0: float, y0: float, x1: float, y1: float, additive: bool = False
     ) -> list[Artist]:
         x0, x1 = sorted((float(x0), float(x1)))
         y0, y1 = sorted((float(y0), float(y1)))
+        artists = list(self.iter_selectable_artists())
+        non_axes = [
+            artist
+            for artist in artists
+            if not isinstance(artist, Axes)
+            and self._artist_intersects_bbox(artist, x0, y0, x1, y1)
+        ]
+        non_axes_ids = {id(artist) for artist in non_axes}
+        full_axes_ids = {
+            id(artist)
+            for artist in artists
+            if isinstance(artist, Axes)
+            and self._artist_intersects_bbox(artist, x0, y0, x1, y1)
+        }
+        overlap_axes_ids = set()
+        if not non_axes:
+            overlap_axes_ids = {
+                id(artist)
+                for artist in artists
+                if isinstance(artist, Axes)
+                and self._artist_overlaps_bbox(artist, x0, y0, x1, y1)
+            }
         elements = [
             artist
-            for artist in self.iter_selectable_artists()
-            if self._artist_intersects_bbox(artist, x0, y0, x1, y1)
+            for artist in artists
+            if id(artist) in non_axes_ids
+            or id(artist) in full_axes_ids
+            or id(artist) in overlap_axes_ids
         ]
         if elements or not additive:
             self.select_elements(elements, additive=additive)
