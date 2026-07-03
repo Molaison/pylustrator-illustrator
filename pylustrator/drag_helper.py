@@ -1455,7 +1455,49 @@ class DragManager:
             return False
         if event is not None and not child.contains(event)[0]:
             return False
-        return True
+        if isinstance(child, GrabberGeneric):
+            return True
+        if event is None:
+            return self._artist_has_selection_geometry(child)
+        return self._resolve_selectable_artist(child) is not None
+
+    @staticmethod
+    def _artist_has_selection_geometry(artist: Artist) -> bool:
+        try:
+            points = np.array(TargetWrapper(artist).get_positions(), dtype=float)
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            return False
+        return (
+            points.ndim == 2
+            and points.shape[0] > 0
+            and points.shape[1] >= 2
+            and np.all(np.isfinite(points[:, :2]))
+        )
+
+    def _resolve_selectable_artist(self, artist: Artist) -> Artist | None:
+        if artist is None:
+            return None
+        if self._artist_has_selection_geometry(artist):
+            return artist
+        axes = getattr(artist, "axes", None)
+        if (
+            axes is not None
+            and axes is not artist
+            and self._artist_has_selection_geometry(axes)
+        ):
+            return axes
+        return None
+
+    def _resolve_selectable_elements(
+        self, elements: Iterable[Artist], primary: Artist = None
+    ) -> tuple[list[Artist], Artist]:
+        resolved = []
+        for element in elements:
+            selectable = self._resolve_selectable_artist(element)
+            if selectable is not None:
+                resolved.append(selectable)
+        primary = self._resolve_selectable_artist(primary)
+        return resolved, primary
 
     def _artist_contains_descendant(self, parent: Artist, descendant: Artist) -> bool:
         for child, _explicit in iter_artist_children(parent):
@@ -1540,11 +1582,18 @@ class DragManager:
             # if child.contains(event)[0] and ((getattr(child, "_draggable", None) and getattr(child, "_draggable",
             #                                                                               None).connected) or isinstance(child, GrabberGeneric) or isinstance(child, GrabbableRectangleSelection)):
             if self._is_pick_candidate(child, event, explicit):
+                selectable_child = (
+                    child
+                    if isinstance(child, GrabberGeneric)
+                    else self._resolve_selectable_artist(child)
+                )
+                if selectable_child is None:
+                    continue
                 # if the element is the last selected, finish the search
-                if child == last_selected:
+                if selectable_child == last_selected:
                     return picked_element, True
                 # use this element as the current best matching element
-                picked_element = child
+                picked_element = selectable_child
             # iterate over the children's children
             picked_element, finished = self.get_picked_element(
                 event, child, picked_element, last_selected=last_selected
@@ -1742,6 +1791,7 @@ class DragManager:
             elements = [target.target for target in self.selection.targets] + list(
                 elements
             )
+        elements, primary = self._resolve_selectable_elements(elements, primary)
         elements, primary = self._normalize_selection(
             elements,
             primary,

@@ -6,7 +6,7 @@ matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
 from matplotlib.backend_bases import KeyEvent, MouseEvent
-from matplotlib.patches import Patch
+from matplotlib.patches import Patch, RegularPolygon
 from qtpy import QtCore, QtGui, QtWidgets
 
 from pylustrator.components.plot_layout import scene_point_to_canvas_pixels, selection_scene_transform
@@ -821,6 +821,73 @@ def test_canvas_drag_rectangle_starts_on_axes_and_selects_after_release() -> Non
 
     assert text in [target.target for target in manager.selection.targets]
     assert ax in [target.target for target in manager.selection.targets]
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_transparent_figure_level_inset_axes_click_selects_axes() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig = plt.figure(figsize=(7.35, 8.8), dpi=150)
+    fig.add_axes([0.1067, 0.1104, 0.525, 0.2646], label="panel_g")
+    inset = fig.add_axes(
+        [0.140742, 0.225633, 0.080784, 0.067473],
+        label="panel_g_inset_1",
+    )
+    inset.imshow([[0, 1], [1, 0]], extent=(0.10, 0.90, 0.10, 0.90))
+    fill_hex = RegularPolygon(
+        (0.5, 0.5),
+        numVertices=6,
+        radius=0.492,
+        orientation=0,
+        transform=inset.transAxes,
+        facecolor="white",
+        edgecolor="none",
+        zorder=1,
+    )
+    outline = RegularPolygon(
+        (0.5, 0.5),
+        numVertices=6,
+        radius=0.492,
+        orientation=0,
+        transform=inset.transAxes,
+        facecolor="none",
+        edgecolor="#6F6F6F",
+        linewidth=0.6,
+        zorder=3,
+    )
+    inset.add_patch(fill_hex)
+    inset.add_patch(outline)
+    inset.set_xlim(0, 1)
+    inset.set_ylim(0, 1)
+    inset.set_xticks([])
+    inset.set_yticks([])
+    inset.set_facecolor("none")
+    inset.patch.set_alpha(0.0)
+    for spine in inset.spines.values():
+        spine.set_visible(False)
+
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_element(fill_hex)
+    assert manager.selected_element is inset
+    assert [target.target for target in manager.selection.targets] == [inset]
+    manager.selection.clear_targets()
+    manager.selected_element = None
+
+    bbox = inset.get_window_extent(fig.canvas.get_renderer())
+    x = (bbox.x0 + bbox.x1) / 2
+    y = (bbox.y0 + bbox.y1) / 2
+    press = MouseEvent("button_press_event", fig.canvas, x, y, button=1)
+    release = MouseEvent("button_release_event", fig.canvas, x, y, button=1)
+
+    picked, _finished = manager.get_picked_element(press)
+    manager.button_press_event0(press)
+    manager.button_release_event0(release)
+
+    assert picked is inset
+    assert manager.selected_element is inset
+    assert [target.target for target in manager.selection.targets] == [inset]
     manager.selection.clear_targets()
     plt.close(fig)
     assert app is not None
