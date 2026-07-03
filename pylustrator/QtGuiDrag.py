@@ -368,6 +368,11 @@ class PlotWindow(QtWidgets.QWidget):
         selection = getattr(figure, "selection", None)
         if selection is not None:
             selection.defer_artist_updates = self.fast_drag_preview
+        dragger = getattr(figure, "figure_dragger", None)
+        if dragger is not None:
+            dragger.marquee_select_containers_only = (
+                self.marquee_select_containers_only
+            )
         self.signals.figure_changed.emit(figure)
 
     def setCanvas(self, canvas):
@@ -457,6 +462,7 @@ class PlotWindow(QtWidgets.QWidget):
         self.figures = []
         self._initial_layout_applied = False
         self.fast_drag_preview = True
+        self.marquee_select_containers_only = False
 
         self.signals = Signals()
         self.signals.canvas_changed.connect(self.setCanvas)
@@ -517,6 +523,19 @@ class PlotWindow(QtWidgets.QWidget):
         self.button_fast_drag.setToolTip("Fast drag preview")
         self.button_fast_drag.clicked.connect(self.setFastDragPreview)
         layout_top_bar.addWidget(self.button_fast_drag)
+
+        self.button_marquee_containers = QtWidgets.QPushButton(
+            qta.icon("fa5s.layer-group"), ""
+        )
+        self.button_marquee_containers.setCheckable(True)
+        self.button_marquee_containers.setChecked(
+            self.marquee_select_containers_only
+        )
+        self.button_marquee_containers.setToolTip("Box select containers only")
+        self.button_marquee_containers.clicked.connect(
+            self.setMarqueeSelectContainersOnly
+        )
+        layout_top_bar.addWidget(self.button_marquee_containers)
 
         self.input_size = QPosAndSize(layout_top_bar, self.signals)
 
@@ -665,6 +684,16 @@ class PlotWindow(QtWidgets.QWidget):
         self.fast_drag_preview = bool(enabled)
         if self.fig is not None and getattr(self.fig, "selection", None) is not None:
             self.fig.selection.defer_artist_updates = self.fast_drag_preview
+
+    def setMarqueeSelectContainersOnly(self, enabled: bool):
+        self.marquee_select_containers_only = bool(enabled)
+        if (
+            self.fig is not None
+            and getattr(self.fig, "figure_dragger", None) is not None
+        ):
+            self.fig.figure_dragger.marquee_select_containers_only = (
+                self.marquee_select_containers_only
+            )
 
     def rasterize(self, rasterize: bool):
         """convert the figur elements to an image"""

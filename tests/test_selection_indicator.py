@@ -712,6 +712,44 @@ def test_drag_rectangle_selects_intersecting_artists_and_axes_consistently() -> 
     assert app is not None
 
 
+def test_drag_rectangle_container_only_mode_keeps_parent_axes() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    text = ax.text(0.5, 0.5, "inside")
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.marquee_select_containers_only = True
+    bbox = text.get_window_extent(fig.canvas.get_renderer()).expanded(1.2, 1.4)
+
+    selected = manager.select_elements_in_bbox(bbox.x0, bbox.y0, bbox.x1, bbox.y1)
+
+    assert selected == [ax]
+    assert [target.target for target in manager.selection.targets] == [ax]
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_drag_rectangle_container_only_mode_replaces_selected_children() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    text = ax.text(0.5, 0.5, "inside")
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.marquee_select_containers_only = True
+    manager.select_element(text)
+    bbox = text.get_window_extent(fig.canvas.get_renderer()).expanded(1.2, 1.4)
+
+    manager.select_elements_in_bbox(
+        bbox.x0, bbox.y0, bbox.x1, bbox.y1, additive=True
+    )
+
+    assert [target.target for target in manager.selection.targets] == [ax]
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
 def test_drag_rectangle_selects_empty_plot_area_axes() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
@@ -857,6 +895,28 @@ def test_tree_view_ctrl_click_uses_additive_row_selection_command() -> None:
     manager.selection.clear_targets()
     plt.close(fig)
     container.deleteLater()
+    assert app is not None
+
+
+def test_plot_window_marquee_container_toggle_updates_drag_manager() -> None:
+    from pylustrator.QtGuiDrag import PlotWindow
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    window = PlotWindow(1)
+    fig, _ax = plt.subplots(figsize=(4, 3), dpi=100)
+    manager = attach_drag_manager(fig)
+
+    window.setFigure(fig)
+    assert manager.marquee_select_containers_only is False
+
+    window.setMarqueeSelectContainersOnly(True)
+    assert manager.marquee_select_containers_only is True
+
+    window.setMarqueeSelectContainersOnly(False)
+    assert manager.marquee_select_containers_only is False
+    manager.selection.clear_targets()
+    plt.close(fig)
+    window.deleteLater()
     assert app is not None
 
 

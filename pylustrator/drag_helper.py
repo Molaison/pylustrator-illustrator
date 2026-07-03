@@ -1334,6 +1334,7 @@ class DragManager:
     def __init__(self, figure: Figure, no_save):
         self.figure = figure
         self.figure.figure_dragger = self
+        self.marquee_select_containers_only = False
         self.marquee_start = None
         self.marquee_rect = None
         self.marquee_active = False
@@ -1469,6 +1470,7 @@ class DragManager:
         elements: Iterable[Artist],
         primary: Artist = None,
         preserve_axes: bool = False,
+        prefer_containers: bool = False,
     ) -> tuple[list[Artist], Artist]:
         unique = []
         for element in elements:
@@ -1484,10 +1486,20 @@ class DragManager:
                     (
                         _container_yields_to_children(element)
                         and not (preserve_axes and isinstance(element, Axes))
+                        and not (
+                            prefer_containers
+                            and _container_yields_to_children(element)
+                        )
                         and self._artist_contains_descendant(element, other)
                     )
                     or (
-                        _container_keeps_children(other)
+                        (
+                            _container_keeps_children(other)
+                            or (
+                                prefer_containers
+                                and _container_yields_to_children(other)
+                            )
+                        )
                         and self._artist_contains_descendant(other, element)
                     )
                 )
@@ -1641,9 +1653,20 @@ class DragManager:
             for artist in artists
             if self._artist_intersects_bbox(artist, x0, y0, x1, y1)
         ]
+        prefer_containers = bool(
+            getattr(self, "marquee_select_containers_only", False)
+        )
+        selected_elements, _ = self._normalize_selection(
+            elements, preserve_axes=True, prefer_containers=prefer_containers
+        )
         if elements or not additive:
-            self.select_elements(elements, additive=additive, preserve_axes=True)
-        return elements
+            self.select_elements(
+                elements,
+                additive=additive,
+                preserve_axes=True,
+                prefer_containers=prefer_containers,
+            )
+        return selected_elements
 
     def button_release_event0(self, event: MouseEvent):
         """when the mouse button is released"""
@@ -1712,12 +1735,18 @@ class DragManager:
         additive: bool = False,
         primary: Artist = None,
         preserve_axes: bool = False,
+        prefer_containers: bool = False,
     ):
         """Select one or more artists through the same model used by the canvas."""
         if additive:
-            elements = [target.target for target in self.selection.targets] + list(elements)
+            elements = [target.target for target in self.selection.targets] + list(
+                elements
+            )
         elements, primary = self._normalize_selection(
-            elements, primary, preserve_axes=preserve_axes
+            elements,
+            primary,
+            preserve_axes=preserve_axes,
+            prefer_containers=prefer_containers,
         )
 
         current = [target.target for target in self.selection.targets]
