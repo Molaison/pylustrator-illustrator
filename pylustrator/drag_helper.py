@@ -1465,7 +1465,10 @@ class DragManager:
         return False
 
     def _normalize_selection(
-        self, elements: Iterable[Artist], primary: Artist = None
+        self,
+        elements: Iterable[Artist],
+        primary: Artist = None,
+        preserve_axes: bool = False,
     ) -> tuple[list[Artist], Artist]:
         unique = []
         for element in elements:
@@ -1480,6 +1483,7 @@ class DragManager:
                 and (
                     (
                         _container_yields_to_children(element)
+                        and not (preserve_axes and isinstance(element, Axes))
                         and self._artist_contains_descendant(element, other)
                     )
                     or (
@@ -1602,17 +1606,6 @@ class DragManager:
         bounds = self._artist_display_bounds(artist)
         if bounds is None:
             return False
-        ax0, ay0, ax1, ay1 = bounds
-        if isinstance(artist, (Axes, Legend)):
-            return ax0 >= x0 and ax1 <= x1 and ay0 >= y0 and ay1 <= y1
-        return self._bounds_intersect(ax0, ay0, ax1, ay1, x0, y0, x1, y1)
-
-    def _artist_overlaps_bbox(
-        self, artist: Artist, x0: float, y0: float, x1: float, y1: float
-    ) -> bool:
-        bounds = self._artist_display_bounds(artist)
-        if bounds is None:
-            return False
         return self._bounds_intersect(*bounds, x0, y0, x1, y1)
 
     @staticmethod
@@ -1643,36 +1636,13 @@ class DragManager:
         x0, x1 = sorted((float(x0), float(x1)))
         y0, y1 = sorted((float(y0), float(y1)))
         artists = list(self.iter_selectable_artists())
-        non_axes = [
-            artist
-            for artist in artists
-            if not isinstance(artist, Axes)
-            and self._artist_intersects_bbox(artist, x0, y0, x1, y1)
-        ]
-        non_axes_ids = {id(artist) for artist in non_axes}
-        full_axes_ids = {
-            id(artist)
-            for artist in artists
-            if isinstance(artist, Axes)
-            and self._artist_intersects_bbox(artist, x0, y0, x1, y1)
-        }
-        overlap_axes_ids = set()
-        if not non_axes:
-            overlap_axes_ids = {
-                id(artist)
-                for artist in artists
-                if isinstance(artist, Axes)
-                and self._artist_overlaps_bbox(artist, x0, y0, x1, y1)
-            }
         elements = [
             artist
             for artist in artists
-            if id(artist) in non_axes_ids
-            or id(artist) in full_axes_ids
-            or id(artist) in overlap_axes_ids
+            if self._artist_intersects_bbox(artist, x0, y0, x1, y1)
         ]
         if elements or not additive:
-            self.select_elements(elements, additive=additive)
+            self.select_elements(elements, additive=additive, preserve_axes=True)
         return elements
 
     def button_release_event0(self, event: MouseEvent):
@@ -1741,11 +1711,14 @@ class DragManager:
         event: MouseEvent = None,
         additive: bool = False,
         primary: Artist = None,
+        preserve_axes: bool = False,
     ):
         """Select one or more artists through the same model used by the canvas."""
         if additive:
             elements = [target.target for target in self.selection.targets] + list(elements)
-        elements, primary = self._normalize_selection(elements, primary)
+        elements, primary = self._normalize_selection(
+            elements, primary, preserve_axes=preserve_axes
+        )
 
         current = [target.target for target in self.selection.targets]
         if primary == self.selected_element and current == elements:
