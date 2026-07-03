@@ -75,14 +75,13 @@ class MatplotlibWidget(FigureCanvas):
         self.manager._cidgcf = self.figure
 
         self.timer = QtCore.QTimer()
-        self.timer.setInterval(300)
+        self.timer.setSingleShot(True)
+        self.timer.setInterval(16)
         self.timer.timeout.connect(self.draw)
 
     timer = None
 
     def schedule_draw(self):
-        if self.quick_draw is True:
-            return super().draw()
         if not self.timer.isActive():
             self.timer.start()
 
@@ -96,8 +95,10 @@ class MatplotlibWidget(FigureCanvas):
         # if drawing is slow delay the drawing a bit to create a more smooth experience
         if duration > 0.1:
             self.quick_draw = False
+            self.timer.setInterval(min(300, max(50, int(duration * 1000 * 1.5))))
         else:
             self.quick_draw = True
+            self.timer.setInterval(16)
 
     def show(self):
         self.draw()

@@ -1,5 +1,6 @@
 from typing import Optional
 from qtpy import QtWidgets
+import qtawesome as qta
 
 import matplotlib as mpl
 import matplotlib.transforms as transforms
@@ -47,7 +48,12 @@ class QPosAndSize(QtWidgets.QWidget):
 
         self.input_shape = DimensionsWidget(self.layout, "W:", "H:", "cm")
         self.layout.addWidget(self.input_shape, 0, 1)
-        self.input_shape.valueChanged.connect(self.changeSize)
+        self.input_shape.valueChangedX.connect(
+            lambda _x: self.changeSize(self.input_shape.value(), changed_axis=0)
+        )
+        self.input_shape.valueChangedY.connect(
+            lambda _y: self.changeSize(self.input_shape.value(), changed_axis=1)
+        )
 
         self.input_transform = ComboWidget(self.layout, "", ["cm", "in", "px", "none"])
         self.layout.addWidget(self.input_transform, 1, 0)
@@ -59,10 +65,22 @@ class QPosAndSize(QtWidgets.QWidget):
         self.layout.addWidget(self.input_shape_transform, 1, 1)
         self.input_shape_transform.editingFinished.connect(self.changeTransform2)
 
-        self.layout.setColumnStretch(2, 1)
+        self.input_lock_aspect = QtWidgets.QPushButton(qta.icon("fa5s.lock"), "")
+        self.input_lock_aspect.setCheckable(True)
+        self.input_lock_aspect.setToolTip("Lock aspect ratio")
+        self.input_lock_aspect.setFixedWidth(28)
+        self.layout.addWidget(self.input_lock_aspect, 1, 2)
+        self.input_lock_aspect.toggled.connect(self.changeLockAspect)
+
+        self.layout.setColumnStretch(3, 1)
 
     def setFigure(self, figure):
         self.fig = figure
+        selection = getattr(figure, "selection", None)
+        if selection is not None:
+            self.input_lock_aspect.setChecked(
+                bool(getattr(selection, "lock_aspect_ratio", False))
+            )
 
     def select_element(self, element):
         """select an element"""
@@ -89,6 +107,84 @@ class QPosAndSize(QtWidgets.QWidget):
         name = self.input_shape_transform.text()
         self.scale_type = ["scale", "bottom right", "top left"].index(name)
         # self.scale_type = state
+
+    def changeLockAspect(self, state: bool):
+        selection = getattr(getattr(self, "fig", None), "selection", None)
+        if selection is not None:
+            selection.lock_aspect_ratio = bool(state)
+
+    def _lock_aspect_enabled(self) -> bool:
+        selection = getattr(getattr(self, "fig", None), "selection", None)
+        return bool(
+            self.input_lock_aspect.isChecked()
+            or getattr(selection, "lock_aspect_ratio", False)
+        )
+
+    @staticmethod
+    def _locked_size(
+        value: list | tuple,
+        current_size: tuple[float, float],
+        changed_axis: int | None,
+    ) -> list[float]:
+        new_size = [float(value[0]), float(value[1])]
+        current_width, current_height = current_size
+        if (
+            changed_axis is None
+            or current_width == 0
+            or current_height == 0
+        ):
+            return new_size
+        if changed_axis == 0:
+            new_size[1] = new_size[0] * current_height / current_width
+        else:
+            new_size[0] = new_size[1] * current_width / current_height
+        return new_size
+
+    @staticmethod
+    def _axes_position(element: Axes) -> list[float]:
+        pos = element.get_position()
+        return [pos.x0, pos.y0, pos.width, pos.height]
+
+    def _record_figure_state(self, state, include_layout: bool = True):
+        size, axes_positions, text_positions = state
+        self.fig.change_tracker.addChange(
+            self.fig,
+            ".set_size_inches(%f/2.54, %f/2.54, forward=True)"
+            % (size[0] * 2.54, size[1] * 2.54),
+        )
+        if not include_layout:
+            return
+        for axes, pos in zip(self.fig.axes, axes_positions):
+            self.fig.change_tracker.addChange(
+                axes,
+                ".set_position([%f, %f, %f, %f])" % tuple(pos),
+            )
+        for text, pos in zip(self.fig.texts, text_positions):
+            self.fig.change_tracker.addChange(
+                text, ".set_position([%f, %f])" % tuple(pos)
+            )
+
+    def _figure_state(self):
+        return (
+            tuple(float(v) for v in self.fig.get_size_inches()),
+            [self._axes_position(axes) for axes in self.fig.axes],
+            [tuple(text.get_position()) for text in self.fig.texts],
+        )
+
+    def _apply_figure_state(self, state, include_layout: bool = True):
+        size, axes_positions, text_positions = state
+        self.fig.set_size_inches(size, forward=True)
+        for axes, pos in zip(self.fig.axes, axes_positions):
+            axes.set_position(pos)
+        for text, pos in zip(self.fig.texts, text_positions):
+            text.set_position(pos)
+        self._record_figure_state(state, include_layout)
+        self.fig.selection.update_selection_rectangles()
+        self.fig.canvas.draw()
+        widget = getattr(self.fig, "widget", None)
+        if widget is not None:
+            widget.updateGeometry()
+        self.signals.figure_size_changed.emit()
 
     def changePos(self, value_x: float, value_y: float):
         """change the position of an axes"""
@@ -157,17 +253,18 @@ class QPosAndSize(QtWidgets.QWidget):
         self.fig.signals.figure_selection_property_changed.emit()
         self.fig.canvas.draw()
 
-    def changeSize(self, value: list):
+    def changeSize(self, value: list, changed_axis: int | None = None):
         """change the size of an axes or figure"""
         if isinstance(self.element, Figure):
+            if self._lock_aspect_enabled():
+                current_size = tuple(float(v) for v in self.fig.get_size_inches())
+                value = self._locked_size(value, current_size, changed_axis)
+            old_state = self._figure_state()
             if self.scale_type == 0:
+                include_layout = False
                 self.fig.set_size_inches(value)
-                self.fig.change_tracker.addChange(
-                    self.element,
-                    ".set_size_inches(%f/2.54, %f/2.54, forward=True)"
-                    % (value[0] * 2.54, value[1] * 2.54),
-                )
             else:
+                include_layout = True
                 if self.scale_type == 1:
                     changeFigureSize(value[0], value[1], fig=self.fig)
                 elif self.scale_type == 2:
@@ -178,29 +275,22 @@ class QPosAndSize(QtWidgets.QWidget):
                         cut_from_left=True,
                         fig=self.fig,
                     )
-                self.fig.change_tracker.addChange(
-                    self.element,
-                    ".set_size_inches(%f/2.54, %f/2.54, forward=True)"
-                    % (value[0] * 2.54, value[1] * 2.54),
-                )
-                for axes in self.fig.axes:
-                    pos = axes.get_position()
-                    self.fig.change_tracker.addChange(
-                        axes,
-                        ".set_position([%f, %f, %f, %f])"
-                        % (pos.x0, pos.y0, pos.width, pos.height),
-                    )
-                for text in self.fig.texts:
-                    pos = text.get_position()
-                    self.fig.change_tracker.addChange(
-                        text, ".set_position([%f, %f])" % (pos[0], pos[1])
-                    )
+            new_state = self._figure_state()
 
+            def undo():
+                self._apply_figure_state(old_state, include_layout)
+
+            def redo():
+                self._apply_figure_state(new_state, include_layout)
+
+            self._record_figure_state(new_state, include_layout)
+            self.fig.change_tracker.addEdit([undo, redo, "Change figure size"])
             self.fig.selection.update_selection_rectangles()
             self.fig.canvas.draw()
-            self.fig.widget.updateGeometry()
-
-            # emit a signal that the figure size has changed
+            widget = getattr(self.fig, "widget", None)
+            if widget is not None:
+                widget.updateGeometry()
+            self.setElement(self.element)
             self.signals.figure_size_changed.emit()
         else:
             elements = [self.element]
@@ -214,16 +304,21 @@ class QPosAndSize(QtWidgets.QWidget):
             new_positions = []
             for element in elements:
                 pos = element.get_position()
-                old_positions.append(pos)
+                old_positions.append([pos.x0, pos.y0, pos.width, pos.height])
                 pos = [pos.x0, pos.y0, pos.width, pos.height]
-                pos[2] = value[0]
-                pos[3] = value[1]
+                size = list(value)
+                if self._lock_aspect_enabled():
+                    size = self._locked_size(
+                        size, (pos[2], pos[3]), changed_axis
+                    )
+                pos[2] = size[0]
+                pos[3] = size[1]
                 new_positions.append(pos)
 
             fig = self.fig
 
-            def redo():
-                for element, pos in zip(elements, new_positions):
+            def apply_positions(positions):
+                for element, pos in zip(elements, positions):
                     element.set_position(pos)
                     if isinstance(element, Axes):
                         fig.change_tracker.addNewAxesChange(element)
@@ -232,18 +327,15 @@ class QPosAndSize(QtWidgets.QWidget):
                             element, ".set_position([%f, %f, %f, %f])" % tuple(pos)
                         )
 
+            def redo():
+                apply_positions(new_positions)
+
             def undo():
-                for element, pos in zip(elements, new_positions):
-                    element.set_position(pos)
-                    if isinstance(element, Axes):
-                        fig.change_tracker.addNewAxesChange(element)
-                    else:
-                        fig.change_tracker.addChange(
-                            element, ".set_position([%f, %f, %f, %f])" % tuple(pos)
-                        )
+                apply_positions(old_positions)
 
             redo()
             self.fig.change_tracker.addEdit([undo, redo, "Change size"])
+            self.setElement(self.element)
             self.fig.signals.figure_selection_property_changed.emit()
             self.fig.canvas.draw()
 
@@ -287,6 +379,7 @@ class QPosAndSize(QtWidgets.QWidget):
 
         self.input_shape_transform.setDisabled(True)
         self.input_transform.setDisabled(True)
+        self.input_lock_aspect.setEnabled(True)
 
         if isinstance(element, Figure):
             pos = element.get_size_inches()

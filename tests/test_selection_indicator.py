@@ -10,6 +10,7 @@ from matplotlib.patches import Patch
 from qtpy import QtCore, QtGui, QtWidgets
 
 from pylustrator.components.plot_layout import scene_point_to_canvas_pixels, selection_scene_transform
+from pylustrator.components.qpos_and_size import QPosAndSize
 from pylustrator.components.tree_view import MyTreeView
 from pylustrator.drag_helper import (
     DIR_X0,
@@ -84,6 +85,15 @@ class Signal:
             callback(*args)
 
 
+class WidgetSignals:
+    def __init__(self):
+        self.figure_changed = Signal()
+        self.figure_element_selected = Signal()
+        self.figure_selection_moved = Signal()
+        self.figure_selection_property_changed = Signal()
+        self.figure_size_changed = Signal()
+
+
 class TreeSignals:
     def __init__(self):
         self.figure_changed = Signal()
@@ -120,6 +130,14 @@ def attach_drag_manager(fig):
     fig.selection = manager.selection
     fig.figure_dragger = manager
     return manager
+
+
+class EmptySelection:
+    lock_aspect_ratio = False
+    targets = []
+
+    def update_selection_rectangles(self):
+        pass
 
 
 def selection_target_extents(selection):
@@ -240,6 +258,99 @@ def test_multi_selection_aligns_to_selection_bounds() -> None:
     assert abs(axes[0].get_position().x0 - 0.2) < 1e-9
     assert abs(axes[1].get_position().x0 - 0.2) < 1e-9
     manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_restore_point_uses_artist_local_coordinates_after_parent_moves() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    text = ax.text(0.5, 0.5, "label")
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.selection.add_target(text)
+
+    restore = manager.selection.get_save_point()
+    ax.set_position([0.1, 0.1, 0.8, 0.8])
+    text.set_position((0.2, 0.2))
+    restore()
+
+    assert abs(text.get_position()[0] - 0.5) < 1e-9
+    assert abs(text.get_position()[1] - 0.5) < 1e-9
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_match_width_can_preserve_aspect_ratio() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, axes = plt.subplots(1, 2, figsize=(4, 2), dpi=100)
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    axes[0].set_position([0.1, 0.2, 0.4, 0.2])
+    axes[1].set_position([0.6, 0.2, 0.2, 0.3])
+    manager.selection.add_target(axes[0])
+    manager.selection.add_target(axes[1])
+    manager.selection.lock_aspect_ratio = True
+
+    manager.selection.match_size("width")
+
+    pos = axes[1].get_position()
+    assert abs(pos.width - 0.4) < 1e-9
+    assert abs(pos.height - 0.6) < 1e-9
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_size_widget_undo_restores_axes_position() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    container = QtWidgets.QWidget()
+    layout = QtWidgets.QVBoxLayout(container)
+    signals = WidgetSignals()
+    fig, ax = plt.subplots(figsize=(4, 2), dpi=100)
+    fig.signals = signals
+    fig.selection = EmptySelection()
+    fig.change_tracker = ChangeTracker()
+    widget = QPosAndSize(layout, signals)
+    widget.setFigure(fig)
+    widget.setElement(ax)
+    original = ax.get_position().frozen()
+
+    widget.changeSize((0.4, 0.5))
+    fig.change_tracker.edit[0]()
+
+    restored = ax.get_position()
+    assert abs(restored.x0 - original.x0) < 1e-9
+    assert abs(restored.y0 - original.y0) < 1e-9
+    assert abs(restored.width - original.width) < 1e-9
+    assert abs(restored.height - original.height) < 1e-9
+    container.deleteLater()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_size_widget_lock_aspect_resizes_from_changed_axis() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    container = QtWidgets.QWidget()
+    layout = QtWidgets.QVBoxLayout(container)
+    signals = WidgetSignals()
+    fig, ax = plt.subplots(figsize=(4, 2), dpi=100)
+    fig.signals = signals
+    fig.selection = EmptySelection()
+    fig.change_tracker = ChangeTracker()
+    widget = QPosAndSize(layout, signals)
+    widget.setFigure(fig)
+    widget.setElement(ax)
+    ax.set_position([0.1, 0.2, 0.2, 0.4])
+    widget.input_lock_aspect.setChecked(True)
+
+    widget.changeSize((0.4, 0.1), changed_axis=0)
+
+    pos = ax.get_position()
+    assert abs(pos.width - 0.4) < 1e-9
+    assert abs(pos.height - 0.8) < 1e-9
+    container.deleteLater()
     plt.close(fig)
     assert app is not None
 

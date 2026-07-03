@@ -197,12 +197,11 @@ class GrabFunctions(object):
         dx = event.x - self.mouse_xy[0]
         dy = event.y - self.mouse_xy[1]
 
-        keep_aspect = (
-            "control" in event.key.split("+") if event.key is not None else False
-        )
-        ignore_snaps = (
-            "shift" in event.key.split("+") if event.key is not None else False
-        )
+        control_toggles_aspect = _event_has_modifier(event, "control")
+        keep_aspect = bool(
+            getattr(self.parent, "lock_aspect_ratio", False)
+        ) ^ control_toggles_aspect
+        ignore_snaps = _event_has_modifier(event, "shift")
 
         self.parent.move(
             [dx, dy],
@@ -265,6 +264,7 @@ class GrabbableRectangleSelection(GrabFunctions):
 
         self.targets = []
         self.targets_rects = []
+        self.lock_aspect_ratio = False
 
         self.hide_grabber()
 
@@ -701,7 +701,7 @@ class GrabbableRectangleSelection(GrabFunctions):
             dtype=float,
         )
 
-    def match_size(self, mode: str) -> bool:
+    def match_size(self, mode: str, keep_aspect_ratio: bool = None) -> bool:
         """Resize selected targets to the first selected target's width/height."""
         modes = {
             "width": (True, False),
@@ -712,6 +712,8 @@ class GrabbableRectangleSelection(GrabFunctions):
             raise ValueError(f"Unknown size matching mode: {mode}")
         if len(self.targets) < 2:
             raise ValueError("Select at least two objects to match size.")
+        if keep_aspect_ratio is None:
+            keep_aspect_ratio = self.lock_aspect_ratio
 
         match_width, match_height = modes[mode]
         reference_points = np.array(self.targets[0].get_positions(), dtype=float)
@@ -747,6 +749,14 @@ class GrabbableRectangleSelection(GrabFunctions):
             current_height = bounds[3] - bounds[1]
             scale_x = reference_width / current_width if match_width else 1.0
             scale_y = reference_height / current_height if match_height else 1.0
+            if keep_aspect_ratio:
+                if match_width and match_height:
+                    scale = min(scale_x, scale_y)
+                    scale_x = scale_y = scale
+                elif match_width:
+                    scale_y = scale_x
+                elif match_height:
+                    scale_x = scale_y
             if np.isclose(scale_x, 1.0) and np.isclose(scale_y, 1.0):
                 continue
             center_x = (bounds[0] + bounds[2]) / 2
@@ -1007,13 +1017,13 @@ class GrabbableRectangleSelection(GrabFunctions):
         selected_targets = [target.target for target in self.targets]
         wrapped_targets = self._unique_wrappers(targets or self.targets)
         restore_targets = [target.target for target in wrapped_targets]
-        positions = [target.get_positions() for target in wrapped_targets]
+        positions = [target.get_local_positions() for target in wrapped_targets]
 
         def undo():
             self.clear_targets()
             for target, pos in zip(restore_targets, positions):
                 target = TargetWrapper(target)
-                target.set_positions(pos)
+                target.set_local_positions(pos)
             for target in selected_targets:
                 self.add_target(target)
 

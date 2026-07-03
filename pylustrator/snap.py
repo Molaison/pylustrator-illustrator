@@ -286,6 +286,26 @@ class TargetWrapper(object):
         if isinstance(self.target, (Text, Legend)):
             self.get_positions(update_offset=True)
 
+    def get_local_positions(
+        self, use_previous_offset=False, update_offset=False
+    ) -> list[np.ndarray]:
+        """Return positions in the artist's own coordinate system.
+
+        Dragging happens in display coordinates, but undo/redo restore points must
+        survive later changes to a parent axes or figure transform.
+        """
+        points = self.get_positions(
+            use_previous_offset=use_previous_offset, update_offset=update_offset
+        )
+        return [
+            np.array(point, dtype=float).copy()
+            for point in self.transform_inverted_points(points)
+        ]
+
+    def set_local_positions(self, points: list[np.ndarray]):
+        """Restore positions captured with get_local_positions."""
+        self.set_positions(self.transform_points(points))
+
     def set_positions(self, points: (int, int)):
         """set the position of the target Artist"""
         points = self.transform_inverted_points(points)
