@@ -693,7 +693,7 @@ def test_drag_manager_select_elements_uses_single_multi_selection_model() -> Non
     assert app is not None
 
 
-def test_drag_rectangle_selects_intersecting_artists_and_axes_consistently() -> None:
+def test_drag_rectangle_omits_containing_axes_by_default() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
     text = ax.text(0.5, 0.5, "inside")
@@ -703,10 +703,9 @@ def test_drag_rectangle_selects_intersecting_artists_and_axes_consistently() -> 
 
     selected = manager.select_elements_in_bbox(bbox.x0, bbox.y0, bbox.x1, bbox.y1)
 
-    assert text in selected
-    assert ax in selected
+    assert selected == [text]
     assert text in [target.target for target in manager.selection.targets]
-    assert ax in [target.target for target in manager.selection.targets]
+    assert ax not in [target.target for target in manager.selection.targets]
     manager.selection.clear_targets()
     plt.close(fig)
     assert app is not None
@@ -794,9 +793,8 @@ def test_drag_rectangle_prefers_specific_children_over_containing_axes() -> None
 
     selected = manager.select_elements_in_bbox(bbox.x0, bbox.y0, bbox.x1, bbox.y1)
 
-    assert ax in selected
-    assert text in selected
-    assert [target.target for target in manager.selection.targets] == [ax, text]
+    assert selected == [text]
+    assert [target.target for target in manager.selection.targets] == [text]
     assert manager.selected_element is text
     manager.selection.clear_targets()
     plt.close(fig)
@@ -820,7 +818,7 @@ def test_canvas_drag_rectangle_starts_on_axes_and_selects_after_release() -> Non
     manager.button_release_event0(release)
 
     assert text in [target.target for target in manager.selection.targets]
-    assert ax in [target.target for target in manager.selection.targets]
+    assert ax not in [target.target for target in manager.selection.targets]
     manager.selection.clear_targets()
     plt.close(fig)
     assert app is not None

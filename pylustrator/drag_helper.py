@@ -1706,13 +1706,15 @@ class DragManager:
             getattr(self, "marquee_select_containers_only", False)
         )
         selected_elements, _ = self._normalize_selection(
-            elements, preserve_axes=True, prefer_containers=prefer_containers
+            elements,
+            preserve_axes=prefer_containers,
+            prefer_containers=prefer_containers,
         )
         if elements or not additive:
             self.select_elements(
                 elements,
                 additive=additive,
-                preserve_axes=True,
+                preserve_axes=prefer_containers,
                 prefer_containers=prefer_containers,
             )
         return selected_elements
