@@ -20,7 +20,7 @@ from pylustrator.drag_helper import (
     DragManager,
     GrabbableRectangleSelection,
 )
-from pylustrator.snap import TargetWrapper
+from pylustrator.snap import SnapSamePos, TargetWrapper
 
 
 class SelectionView:
@@ -30,6 +30,11 @@ class SelectionView:
 
 
 class ChangeTracker:
+    def __init__(self):
+        self.axes_change_count = 0
+        self.text_change_count = 0
+        self.change_count = 0
+
     def addEdit(self, edit):
         self.edit = edit
 
@@ -37,12 +42,15 @@ class ChangeTracker:
         self.legend = target
 
     def addNewTextChange(self, target):
+        self.text_change_count += 1
         self.text = target
 
     def addNewAxesChange(self, target):
+        self.axes_change_count += 1
         self.axes = target
 
     def addChange(self, target, command):
+        self.change_count += 1
         self.change = (target, command)
 
     def removeElement(self, target):
@@ -331,6 +339,106 @@ def test_drag_motion_uses_original_display_geometry_for_legend_text() -> None:
     after = text.get_window_extent(fig.canvas.get_renderer())
     assert abs((after.x0 - before.x0) - 12) < 1e-9
     assert abs((after.y0 - before.y0) + 7) < 1e-9
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_deferred_drag_updates_overlay_before_artist_and_commits_once() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 2), dpi=100)
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.selection.defer_artist_updates = True
+    ax.set_position([0.2, 0.2, 0.3, 0.4])
+    manager.selection.add_target(ax)
+    original = ax.get_position().frozen()
+
+    manager.selection.start_move()
+    manager.selection.addOffset((20, -10), DIR_X0 | DIR_X1 | DIR_Y0 | DIR_Y1)
+
+    assert ax.get_position().bounds == original.bounds
+    assert fig.change_tracker.axes_change_count == 0
+    preview_rect = manager.selection.targets_rects[0].rect()
+    preview_x = manager.selection.move_current_positions[id(ax)][0, 0]
+    assert abs(preview_rect.x() - preview_x) < 1e-9
+
+    manager.selection.has_moved = True
+    manager.selection.end_move()
+
+    assert ax.get_position().bounds != original.bounds
+    assert fig.change_tracker.axes_change_count == 1
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_deferred_drag_invalidates_preview_extent_cache() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 2), dpi=100)
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.selection.defer_artist_updates = True
+    ax.set_position([0.2, 0.2, 0.3, 0.4])
+    manager.selection.add_target(ax)
+    original_extent = TargetWrapper(ax).get_extent()
+
+    manager.selection.start_move()
+    manager.selection.addOffset((20, -10), DIR_X0 | DIR_X1 | DIR_Y0 | DIR_Y1)
+
+    preview_extent = TargetWrapper(ax).get_extent()
+    assert abs((preview_extent[0] - original_extent[0]) - 20) < 1e-9
+
+    manager.selection.end_move()
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_deferred_text_snap_position_uses_preview_geometry() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 2), dpi=100)
+    text = ax.text(0.2, 0.5, "source")
+    other = ax.text(0.8, 0.5, "other")
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.selection.defer_artist_updates = True
+    manager.selection.add_target(text)
+    original_anchor = TargetWrapper(text).get_positions()[0]
+
+    manager.selection.start_move()
+    manager.selection.addOffset((25, 5), DIR_X0 | DIR_X1 | DIR_Y0 | DIR_Y1)
+
+    preview_anchor = TargetWrapper(text).get_positions()[0]
+    actual_anchor = text.get_transform().transform(text.get_position())
+    snap = SnapSamePos(text, other, 0)
+    try:
+        assert abs(actual_anchor[0] - original_anchor[0]) < 1e-9
+        assert abs((preview_anchor[0] - original_anchor[0]) - 25) < 1e-9
+        assert abs(snap.getPosition(snap.ax_source)[0] - preview_anchor[0]) < 1e-9
+    finally:
+        snap.remove()
+        manager.selection.end_move()
+        manager.selection.clear_targets()
+        plt.close(fig)
+    assert app is not None
+
+
+def test_immediate_drag_mode_still_updates_artist_during_motion() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 2), dpi=100)
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.selection.defer_artist_updates = False
+    ax.set_position([0.2, 0.2, 0.3, 0.4])
+    manager.selection.add_target(ax)
+    original = ax.get_position().frozen()
+
+    manager.selection.start_move()
+    manager.selection.addOffset((20, -10), DIR_X0 | DIR_X1 | DIR_Y0 | DIR_Y1)
+
+    assert ax.get_position().bounds != original.bounds
+    assert fig.change_tracker.axes_change_count == 1
     manager.selection.clear_targets()
     plt.close(fig)
     assert app is not None

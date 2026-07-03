@@ -365,6 +365,9 @@ class PlotWindow(QtWidgets.QWidget):
         self.fig.signals = self.signals
         if getattr(figure, "_pylustrator_initial_dpi", None) is None:
             figure._pylustrator_initial_dpi = figure.get_dpi()
+        selection = getattr(figure, "selection", None)
+        if selection is not None:
+            selection.defer_artist_updates = self.fast_drag_preview
         self.signals.figure_changed.emit(figure)
 
     def setCanvas(self, canvas):
@@ -453,6 +456,7 @@ class PlotWindow(QtWidgets.QWidget):
 
         self.figures = []
         self._initial_layout_applied = False
+        self.fast_drag_preview = True
 
         self.signals = Signals()
         self.signals.canvas_changed.connect(self.setCanvas)
@@ -506,6 +510,13 @@ class PlotWindow(QtWidgets.QWidget):
                 button_redo.setToolTip("Redo")
 
         self.update_changes_signal.connect(updateChangesSignal)
+
+        self.button_fast_drag = QtWidgets.QPushButton(qta.icon("fa5s.bolt"), "")
+        self.button_fast_drag.setCheckable(True)
+        self.button_fast_drag.setChecked(self.fast_drag_preview)
+        self.button_fast_drag.setToolTip("Fast drag preview")
+        self.button_fast_drag.clicked.connect(self.setFastDragPreview)
+        layout_top_bar.addWidget(self.button_fast_drag)
 
         self.input_size = QPosAndSize(layout_top_bar, self.signals)
 
@@ -649,6 +660,11 @@ class PlotWindow(QtWidgets.QWidget):
             ]
         )
         self.plot_layout.canvas_canvas.fitToView(True)
+
+    def setFastDragPreview(self, enabled: bool):
+        self.fast_drag_preview = bool(enabled)
+        if self.fig is not None and getattr(self.fig, "selection", None) is not None:
+            self.fig.selection.defer_artist_updates = self.fast_drag_preview
 
     def rasterize(self, rasterize: bool):
         """convert the figur elements to an image"""

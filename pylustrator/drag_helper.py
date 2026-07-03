@@ -221,7 +221,8 @@ class GrabFunctions(object):
             # flush any pending GUI events, re-painting the screen if needed
             fig.canvas.flush_events()
         else:
-            self.figure.canvas.schedule_draw()
+            if not getattr(self.parent, "defer_current_move", False):
+                self.figure.canvas.schedule_draw()
 
 
 class GrabbableRectangleSelection(GrabFunctions):
@@ -265,6 +266,7 @@ class GrabbableRectangleSelection(GrabFunctions):
         self.targets = []
         self.targets_rects = []
         self.lock_aspect_ratio = False
+        self.defer_artist_updates = True
 
         self.hide_grabber()
 
@@ -937,6 +939,7 @@ class GrabbableRectangleSelection(GrabFunctions):
         if target not in targets_non_wrapped:
             return
         index = targets_non_wrapped.index(target)
+        self._clear_preview(self.targets[index])
         self.targets.pop(index)
         rect1 = self.targets_rects.pop(index * 2)
         rect2 = self.targets_rects.pop(index * 2)
@@ -964,6 +967,7 @@ class GrabbableRectangleSelection(GrabFunctions):
 
     def clear_targets(self):
         """remove all elements from the selection"""
+        self.clear_move_previews()
         for rect in self.targets_rects:
             self.graphics_scene.scene().removeItem(rect)
             # self.figure.patches.remove(rect)
@@ -1042,6 +1046,7 @@ class GrabbableRectangleSelection(GrabFunctions):
         self.start_inv_transform = self.get_inv_trans_matrix()
         self.hide_grabber()
         self.has_moved = False
+        self.defer_current_move = bool(self.defer_artist_updates)
         self.save_targets = self._unique_wrappers(save_targets or self.targets)
         for target in self._unique_wrappers(list(self.targets) + self.save_targets):
             target.refresh_offset()
@@ -1053,8 +1058,40 @@ class GrabbableRectangleSelection(GrabFunctions):
 
         self.store_start = self.get_save_point(self.save_targets)
 
+    @staticmethod
+    def _clear_preview(target: TargetWrapper):
+        try:
+            delattr(target.target, "_pylustrator_preview_positions")
+        except AttributeError:
+            pass
+        setattr(target.target, "_pylustrator_cached_get_extend", None)
+
+    def clear_move_previews(self):
+        for target in getattr(self, "targets", []):
+            self._clear_preview(target)
+
+    def _set_preview_positions(self, target: TargetWrapper, points: np.ndarray):
+        target.target._pylustrator_preview_positions = [
+            np.array(point, dtype=float).copy() for point in points
+        ]
+        setattr(target.target, "_pylustrator_cached_get_extend", None)
+
+    def _commit_deferred_positions(self):
+        if not getattr(self, "defer_current_move", False):
+            return
+        for target in self.targets:
+            points = self.move_current_positions.get(id(target.target))
+            if points is None:
+                continue
+            self._clear_preview(target)
+            target.set_positions(points)
+
     def end_move(self, edit_name: str = "Move"):
         """a grabber move stopped"""
+        if self.has_moved is True:
+            self._commit_deferred_positions()
+        else:
+            self.clear_move_previews()
         self.update_grabber()
 
         self.store_end = self.get_save_point(self.save_targets)
@@ -1063,8 +1100,15 @@ class GrabbableRectangleSelection(GrabFunctions):
             self.figure.change_tracker.addEdit(
                 [self.store_start, self.store_end, edit_name]
             )
+            if getattr(self, "defer_current_move", False):
+                canvas = getattr(self.figure, "canvas", None)
+                if hasattr(canvas, "schedule_draw"):
+                    canvas.schedule_draw()
+                elif hasattr(canvas, "draw_idle"):
+                    canvas.draw_idle()
         self.move_start_positions = {}
         self.move_current_positions = {}
+        self.defer_current_move = False
 
     def addOffset(self, pos: Sequence, dir: int, keep_aspect_ratio: bool = True):
         """move the whole selection (e.g. for the use of the arrow keys)"""
@@ -1124,7 +1168,10 @@ class GrabbableRectangleSelection(GrabFunctions):
                 points = np.array(target.get_positions(), dtype=float)
             points = self.apply_transform(transform, points)
             self.move_current_positions[id(target.target)] = points
-            target.set_positions(points)
+            if getattr(self, "defer_current_move", False):
+                self._set_preview_positions(target, points)
+            else:
+                target.set_positions(points)
 
         self.update_selection_rectangles(use_previous_offset=True)
         # for rect in self.targets_rects:

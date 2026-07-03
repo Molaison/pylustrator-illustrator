@@ -196,6 +196,10 @@ class TargetWrapper(object):
         self, use_previous_offset=False, update_offset=False
     ) -> (int, int, int, int):
         """get the current position of the target Artist"""
+        preview = getattr(self.target, "_pylustrator_preview_positions", None)
+        if preview is not None:
+            return [np.array(point, dtype=float).copy() for point in preview]
+
         points = []
         if isinstance(self.target, Rectangle):
             points.append(self.target.get_xy())
@@ -509,6 +513,13 @@ class TargetWrapper(object):
         return [transform.inverted().transform(p) for p in points]
 
 
+def _text_display_position(text: TargetWrapper) -> np.ndarray:
+    preview = getattr(text.target, "_pylustrator_preview_positions", None)
+    if preview is not None:
+        return np.array(preview[0], dtype=float)
+    return np.array(text.get_transform().transform(text.target.get_position()))
+
+
 class SnapBase:
     """The base class to implement snaps."""
 
@@ -690,7 +701,7 @@ class SnapSamePos(SnapBase):
 
     def getPosition(self, text: TargetWrapper) -> (int, int):
         # get the position of an object
-        return np.array(text.get_transform().transform(text.target.get_position()))
+        return _text_display_position(text)
 
     def getDistance(self, index: int) -> int:
         """Calculate the distance of the snap to its target"""
@@ -802,7 +813,7 @@ class SnapCenterWith(SnapBase):
 
     def getPosition(self, text: TargetWrapper) -> (int, int):
         """get the position of the first object"""
-        return np.array(text.get_transform().transform(text.target.get_position()))
+        return _text_display_position(text)
 
     def getPosition2(self, axes: TargetWrapper) -> int:
         """get the position of the second object"""
