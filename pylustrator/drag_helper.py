@@ -116,6 +116,18 @@ def _event_has_modifier(event, modifier: str) -> bool:
     )
 
 
+def _constrain_to_cardinal_direction(pos: Sequence[float], dir: int) -> list[float]:
+    """Constrain full-object drags to horizontal or vertical movement."""
+    pos = [float(pos[0]), float(pos[1])]
+    if dir != (DIR_X0 | DIR_X1 | DIR_Y0 | DIR_Y1):
+        return pos
+    if abs(pos[0]) >= abs(pos[1]):
+        pos[1] = 0.0
+    else:
+        pos[0] = 0.0
+    return pos
+
+
 class GrabFunctions(object):
     """basic functionality used by all grabbers"""
 
@@ -201,7 +213,10 @@ class GrabFunctions(object):
         keep_aspect = bool(
             getattr(self.parent, "lock_aspect_ratio", False)
         ) ^ control_toggles_aspect
-        ignore_snaps = _event_has_modifier(event, "shift")
+        constrain_direction = _event_has_modifier(event, "shift")
+        ignore_snaps = _event_has_modifier(event, "alt") or _event_has_modifier(
+            event, "option"
+        )
 
         self.parent.move(
             [dx, dy],
@@ -209,6 +224,7 @@ class GrabFunctions(object):
             self.snaps,
             keep_aspect_ratio=keep_aspect,
             ignore_snaps=ignore_snaps,
+            constrain_direction=constrain_direction,
         )
 
         if blit is True:
@@ -1231,14 +1247,20 @@ class GrabbableRectangleSelection(GrabFunctions):
         snaps: Sequence[SnapBase],
         keep_aspect_ratio: bool = False,
         ignore_snaps: bool = False,
+        constrain_direction: bool = False,
     ):
         """called from a grabber to move the selection."""
+        if constrain_direction:
+            pos = _constrain_to_cardinal_direction(pos, dir)
         self.addOffset(pos, dir, keep_aspect_ratio)
         self.has_moved = True
 
         if not ignore_snaps:
             offx, offy = checkSnaps(snaps)
-            self.addOffset((pos[0] - offx, pos[1] - offy), dir, keep_aspect_ratio)
+            adjusted_pos = (pos[0] - offx, pos[1] - offy)
+            if constrain_direction:
+                adjusted_pos = _constrain_to_cardinal_direction(adjusted_pos, dir)
+            self.addOffset(adjusted_pos, dir, keep_aspect_ratio)
 
             offx, offy = checkSnaps(self.snaps)
 

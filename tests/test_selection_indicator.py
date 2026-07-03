@@ -386,6 +386,38 @@ def test_legend_child_drag_moves_parent_legend_without_internal_offset() -> None
     assert app is not None
 
 
+def test_shift_drag_constrains_selection_to_cardinal_direction() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 2), dpi=100)
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.selection.defer_artist_updates = True
+    ax.set_position([0.2, 0.2, 0.3, 0.4])
+    manager.selection.add_target(ax)
+    original = TargetWrapper(ax).get_positions()
+
+    manager.selection.mouse_xy = (0, 0)
+    manager.selection.start_move()
+    event = MouseEvent(
+        "motion_notify_event",
+        fig.canvas,
+        30,
+        10,
+        button=1,
+        key="shift",
+    )
+    manager.selection.movedEvent(event)
+
+    preview = manager.selection.move_current_positions[id(ax)]
+    assert abs((preview[0][0] - original[0][0]) - 30) < 1e-9
+    assert abs(preview[0][1] - original[0][1]) < 1e-9
+
+    manager.selection.end_move()
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
 def test_number_widget_ignores_non_scalar_linked_values() -> None:
     from pylustrator.QLinkableWidgets import NumberWidget
 
