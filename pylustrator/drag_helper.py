@@ -468,6 +468,13 @@ class GrabbableRectangleSelection(GrabFunctions):
             unique.append(wrapper)
         return unique
 
+    def _drag_wrapper(self, target: TargetWrapper) -> TargetWrapper:
+        """Return the artist that should receive drag transforms."""
+        parent = self._artist_parent(target.target)
+        if isinstance(parent, Legend) and target.target is not parent:
+            return TargetWrapper(parent)
+        return target
+
     def _resolve_alignment_items(self) -> list[tuple[TargetWrapper, TargetWrapper]]:
         """Return pairs of selected measurement wrapper and same-layer move wrapper."""
         if len(self.targets) <= 1:
@@ -1047,14 +1054,27 @@ class GrabbableRectangleSelection(GrabFunctions):
         self.hide_grabber()
         self.has_moved = False
         self.defer_current_move = bool(self.defer_artist_updates)
-        self.save_targets = self._unique_wrappers(save_targets or self.targets)
-        for target in self._unique_wrappers(list(self.targets) + self.save_targets):
+        self.move_drag_targets = {
+            id(target.target): self._drag_wrapper(target) for target in self.targets
+        }
+        drag_targets = self._unique_wrappers(self.move_drag_targets.values())
+        self.save_targets = self._unique_wrappers(
+            list(save_targets or self.targets) + drag_targets
+        )
+        for target in self._unique_wrappers(
+            list(self.targets) + drag_targets + self.save_targets
+        ):
             target.refresh_offset()
         self.move_start_positions = {
             id(target.target): np.array(target.get_positions(), dtype=float)
             for target in self.targets
         }
+        self.move_drag_start_positions = {
+            id(target.target): np.array(target.get_positions(), dtype=float)
+            for target in drag_targets
+        }
         self.move_current_positions = {}
+        self.move_drag_current_positions = {}
 
         self.store_start = self.get_save_point(self.save_targets)
 
@@ -1067,7 +1087,10 @@ class GrabbableRectangleSelection(GrabFunctions):
         setattr(target.target, "_pylustrator_cached_get_extend", None)
 
     def clear_move_previews(self):
-        for target in getattr(self, "targets", []):
+        targets = list(getattr(self, "targets", [])) + list(
+            getattr(self, "move_drag_targets", {}).values()
+        )
+        for target in self._unique_wrappers(targets):
             self._clear_preview(target)
 
     def _set_preview_positions(self, target: TargetWrapper, points: np.ndarray):
@@ -1079,8 +1102,10 @@ class GrabbableRectangleSelection(GrabFunctions):
     def _commit_deferred_positions(self):
         if not getattr(self, "defer_current_move", False):
             return
-        for target in self.targets:
-            points = self.move_current_positions.get(id(target.target))
+        for target in self._unique_wrappers(
+            getattr(self, "move_drag_targets", {}).values()
+        ):
+            points = self.move_drag_current_positions.get(id(target.target))
             if points is None:
                 continue
             self._clear_preview(target)
@@ -1107,7 +1132,10 @@ class GrabbableRectangleSelection(GrabFunctions):
                 elif hasattr(canvas, "draw_idle"):
                     canvas.draw_idle()
         self.move_start_positions = {}
+        self.move_drag_start_positions = {}
         self.move_current_positions = {}
+        self.move_drag_current_positions = {}
+        self.move_drag_targets = {}
         self.defer_current_move = False
 
     def addOffset(self, pos: Sequence, dir: int, keep_aspect_ratio: bool = True):
@@ -1161,7 +1189,9 @@ class GrabbableRectangleSelection(GrabFunctions):
         )
         transform = np.dot(self.get_trans_matrix(), start_inv_transform)
         start_positions = getattr(self, "move_start_positions", {})
+        drag_start_positions = getattr(self, "move_drag_start_positions", {})
         self.move_current_positions = {}
+        self.move_drag_current_positions = {}
         for target in self.targets:
             points = start_positions.get(id(target.target))
             if points is None:
@@ -1170,6 +1200,23 @@ class GrabbableRectangleSelection(GrabFunctions):
             self.move_current_positions[id(target.target)] = points
             if getattr(self, "defer_current_move", False):
                 self._set_preview_positions(target, points)
+
+        drag_targets = self._unique_wrappers(
+            getattr(self, "move_drag_targets", {}).values()
+        )
+        if not drag_targets:
+            drag_targets = self.targets
+        for target in drag_targets:
+            points = drag_start_positions.get(id(target.target))
+            if points is None:
+                points = start_positions.get(id(target.target))
+            if points is None:
+                points = np.array(target.get_positions(), dtype=float)
+            points = self.apply_transform(transform, points)
+            self.move_drag_current_positions[id(target.target)] = points
+            if getattr(self, "defer_current_move", False):
+                if target.target in [selected.target for selected in self.targets]:
+                    self._set_preview_positions(target, points)
             else:
                 target.set_positions(points)
 

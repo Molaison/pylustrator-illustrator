@@ -32,6 +32,7 @@ class SelectionView:
 class ChangeTracker:
     def __init__(self):
         self.axes_change_count = 0
+        self.legend_change_count = 0
         self.text_change_count = 0
         self.change_count = 0
 
@@ -39,6 +40,7 @@ class ChangeTracker:
         self.edit = edit
 
     def addNewLegendChange(self, target):
+        self.legend_change_count += 1
         self.legend = target
 
     def addNewTextChange(self, target):
@@ -340,6 +342,68 @@ def test_drag_motion_uses_original_display_geometry_for_legend_text() -> None:
     assert abs((after.x0 - before.x0) - 12) < 1e-9
     assert abs((after.y0 - before.y0) + 7) < 1e-9
     manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_legend_child_drag_moves_parent_legend_without_internal_offset() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    legend = fig.legend(handles=[Patch(label="A"), Patch(label="B")])
+    fig.canvas.draw()
+    text = legend.get_texts()[0]
+    renderer = fig.canvas.get_renderer()
+    text_before = text.get_window_extent(renderer).frozen()
+    legend_before = legend.get_window_extent(renderer).frozen()
+    text_position = text.get_position()
+    manager.selection.defer_artist_updates = True
+    manager.selection.add_target(text)
+
+    manager.selection.start_move()
+    manager.selection.move(
+        (12, -7),
+        DIR_X0 | DIR_X1 | DIR_Y0 | DIR_Y1,
+        [],
+        ignore_snaps=True,
+    )
+    manager.selection.end_move()
+    fig.canvas.draw()
+
+    text_after = text.get_window_extent(renderer)
+    legend_after = legend.get_window_extent(renderer)
+    assert text.get_position() == text_position
+    assert abs((text_after.x0 - text_before.x0) - 12) < 1e-9
+    assert abs((text_after.y0 - text_before.y0) + 7) < 1e-9
+    assert abs((legend_after.x0 - legend_before.x0) - 12) < 1e-9
+    assert abs((legend_after.y0 - legend_before.y0) + 7) < 1e-9
+    assert fig.change_tracker.legend is legend
+    assert fig.change_tracker.legend_change_count == 1
+    assert fig.change_tracker.text_change_count == 0
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_number_widget_ignores_non_scalar_linked_values() -> None:
+    from pylustrator.QLinkableWidgets import NumberWidget
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    container = QtWidgets.QWidget()
+    layout = QtWidgets.QHBoxLayout(container)
+    signal = Signal()
+    widget = NumberWidget(layout, "Linewidth:")
+    widget.link("linewidth", signal)
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    ax.scatter([0, 1], [0, 1], linewidths=[0.5, 1.0], label="points")
+    legend = ax.legend()
+    fig.canvas.draw()
+
+    signal.emit(legend.legend_handles[0])
+
+    widget.deleteLater()
+    container.deleteLater()
     plt.close(fig)
     assert app is not None
 

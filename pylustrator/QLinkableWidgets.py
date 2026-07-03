@@ -202,7 +202,7 @@ class Linkable:
         try:
             self.set(self.getLinkedProperty())
             self.setEnabled(self.condition(element))
-        except AttributeError:
+        except (AttributeError, TypeError, ValueError):
             self.hide()
         else:
             self.show()
@@ -593,6 +593,11 @@ class NumberWidget(QtWidgets.QWidget, Linkable):
 
     def setValue(self, text: float, signal=False):
         """set the value of the spin box"""
+        if isinstance(text, (list, tuple, np.ndarray)):
+            values = np.asarray(text, dtype=float).ravel()
+            if values.size != 1:
+                raise TypeError("NumberWidget can only display scalar values")
+            text = float(values[0])
         self.noSignal = True
         self.input1.setValue(text)
         self.noSignal = False
