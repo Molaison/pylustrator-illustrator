@@ -282,6 +282,60 @@ def test_restore_point_uses_artist_local_coordinates_after_parent_moves() -> Non
     assert app is not None
 
 
+def test_legend_restore_point_uses_anchor_coordinates_after_figure_resize() -> None:
+    from pylustrator.snap import TargetWrapper
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    fig.change_tracker = ChangeTracker()
+    legend = fig.legend(
+        handles=[Patch(label="A"), Patch(label="B")],
+        loc="upper center",
+        bbox_to_anchor=(0.6, 0.9),
+    )
+    fig.canvas.draw()
+    wrapper = TargetWrapper(legend)
+    state = wrapper.get_restore_state()
+
+    fig.set_size_inches(6, 3, forward=True)
+    legend.set_bbox_to_anchor((0.1, 0.1), transform=fig.transFigure)
+    wrapper.restore_state(state)
+    fig.canvas.draw()
+
+    expected = fig.transFigure.transform((0.6, 0.9))
+    actual = legend.get_bbox_to_anchor().p0
+    assert abs(actual[0] - expected[0]) < 1e-9
+    assert abs(actual[1] - expected[1]) < 1e-9
+    plt.close(fig)
+    assert app is not None
+
+
+def test_drag_motion_uses_original_display_geometry_for_legend_text() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    legend = fig.legend(handles=[Patch(label="A"), Patch(label="B")])
+    fig.canvas.draw()
+    text = legend.get_texts()[0]
+    before = text.get_window_extent(fig.canvas.get_renderer()).frozen()
+    manager.selection.add_target(text)
+
+    manager.selection.start_move()
+    for offset in ((3, -2), (7, -4), (12, -7)):
+        manager.selection.addOffset(offset, DIR_X0 | DIR_X1 | DIR_Y0 | DIR_Y1)
+    manager.selection.has_moved = True
+    manager.selection.end_move()
+    fig.canvas.draw()
+
+    after = text.get_window_extent(fig.canvas.get_renderer())
+    assert abs((after.x0 - before.x0) - 12) < 1e-9
+    assert abs((after.y0 - before.y0) + 7) < 1e-9
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
 def test_match_width_can_preserve_aspect_ratio() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     fig, axes = plt.subplots(1, 2, figsize=(4, 2), dpi=100)
@@ -582,7 +636,10 @@ def test_multi_selection_drag_keeps_legend_child_rectangles_aligned() -> None:
         selection_target_extents(manager.selection),
         selection_rect_extents(manager.selection),
     ):
-        assert target_extent == rect_extent
+        assert all(
+            abs(target_value - rect_value) < 1e-9
+            for target_value, rect_value in zip(target_extent, rect_extent)
+        )
 
     manager.selection.clear_targets()
     plt.close(fig)

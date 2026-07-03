@@ -90,6 +90,14 @@ def legend_loc_transform(legend: Legend):
     return BboxTransformFrom(legend.get_bbox_to_anchor())
 
 
+def legend_anchor_transform(legend: Legend):
+    return getattr(
+        legend.get_bbox_to_anchor(),
+        "_transform",
+        BboxTransformTo(legend.parent.bbox),
+    )
+
+
 def legend_anchor_is_point(legend: Legend):
     bbox = legend.get_bbox_to_anchor()
     return bbox.width == 0 and bbox.height == 0
@@ -305,6 +313,46 @@ class TargetWrapper(object):
     def set_local_positions(self, points: list[np.ndarray]):
         """Restore positions captured with get_local_positions."""
         self.set_positions(self.transform_points(points))
+
+    def get_restore_state(self):
+        """Return a transform-independent state for undo/redo restore points."""
+        if isinstance(self.target, Legend):
+            bbox = self.target.get_bbox_to_anchor()
+            transform = legend_anchor_transform(self.target)
+            inverted = transform.inverted()
+            p0 = inverted.transform(bbox.p0)
+            p1 = inverted.transform(bbox.p1)
+            return {
+                "type": "legend",
+                "is_point": legend_anchor_is_point(self.target),
+                "anchor": (
+                    float(p0[0]),
+                    float(p0[1]),
+                    float(p1[0] - p0[0]),
+                    float(p1[1] - p0[1]),
+                ),
+                "transform": transform,
+                "loc": self.target._loc,
+            }
+        return {"type": "positions", "positions": self.get_local_positions()}
+
+    def restore_state(self, state):
+        """Restore a state captured with get_restore_state."""
+        if state["type"] == "legend":
+            anchor = state["anchor"]
+            if state["is_point"]:
+                self.target.set_bbox_to_anchor(anchor[:2], transform=state["transform"])
+            else:
+                self.target.set_bbox_to_anchor(anchor, transform=state["transform"])
+            self.target._loc = state["loc"]
+            change_tracker = (
+                self.figure.figure.change_tracker
+                if self.figure.figure is not None
+                else self.figure.change_tracker
+            )
+            change_tracker.addNewLegendChange(self.target)
+            return
+        self.set_local_positions(state["positions"])
 
     def set_positions(self, points: (int, int)):
         """set the position of the target Artist"""

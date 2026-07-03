@@ -903,9 +903,15 @@ class GrabbableRectangleSelection(GrabFunctions):
                     rect.set_height(new_points[1][1] - new_points[0][1])
         else:
             for index, target in enumerate(self.targets):
-                new_points = np.array(
-                    target.get_positions(use_previous_offset)
-                )
+                new_points = None
+                if use_previous_offset:
+                    new_points = getattr(self, "move_current_positions", {}).get(
+                        id(target.target)
+                    )
+                if new_points is None:
+                    new_points = np.array(
+                        target.get_positions(use_previous_offset)
+                    )
                 if new_points.shape[0] == 3:
                     x0, y0, x1, y1 = (
                         np.min(new_points[1:, 0]),
@@ -1017,13 +1023,13 @@ class GrabbableRectangleSelection(GrabFunctions):
         selected_targets = [target.target for target in self.targets]
         wrapped_targets = self._unique_wrappers(targets or self.targets)
         restore_targets = [target.target for target in wrapped_targets]
-        positions = [target.get_local_positions() for target in wrapped_targets]
+        states = [target.get_restore_state() for target in wrapped_targets]
 
         def undo():
             self.clear_targets()
-            for target, pos in zip(restore_targets, positions):
+            for target, state in zip(restore_targets, states):
                 target = TargetWrapper(target)
-                target.set_local_positions(pos)
+                target.restore_state(state)
             for target in selected_targets:
                 self.add_target(target)
 
@@ -1033,11 +1039,17 @@ class GrabbableRectangleSelection(GrabFunctions):
         """start to move a grabber"""
         self.start_p1 = self.p1.copy()
         self.start_p2 = self.p2.copy()
+        self.start_inv_transform = self.get_inv_trans_matrix()
         self.hide_grabber()
         self.has_moved = False
         self.save_targets = self._unique_wrappers(save_targets or self.targets)
         for target in self._unique_wrappers(list(self.targets) + self.save_targets):
             target.refresh_offset()
+        self.move_start_positions = {
+            id(target.target): np.array(target.get_positions(), dtype=float)
+            for target in self.targets
+        }
+        self.move_current_positions = {}
 
         self.store_start = self.get_save_point(self.save_targets)
 
@@ -1051,12 +1063,12 @@ class GrabbableRectangleSelection(GrabFunctions):
             self.figure.change_tracker.addEdit(
                 [self.store_start, self.store_end, edit_name]
             )
+        self.move_start_positions = {}
+        self.move_current_positions = {}
 
     def addOffset(self, pos: Sequence, dir: int, keep_aspect_ratio: bool = True):
         """move the whole selection (e.g. for the use of the arrow keys)"""
         pos = list(pos)
-        self.old_inv_transform = self.get_inv_trans_matrix()
-
         if (keep_aspect_ratio or self.do_change_aspect_ratio()) and not (
             dir & DIR_X0 and dir & DIR_X1 and dir & DIR_Y0 and dir & DIR_Y1
         ):
@@ -1100,9 +1112,19 @@ class GrabbableRectangleSelection(GrabFunctions):
         if dir & DIR_Y1:
             self.p2[1] = self.start_p2[1] + pos[1]
 
-        transform = np.dot(self.get_trans_matrix(), self.old_inv_transform)
+        start_inv_transform = getattr(
+            self, "start_inv_transform", self.get_inv_trans_matrix()
+        )
+        transform = np.dot(self.get_trans_matrix(), start_inv_transform)
+        start_positions = getattr(self, "move_start_positions", {})
+        self.move_current_positions = {}
         for target in self.targets:
-            self.transform_target(transform, target)
+            points = start_positions.get(id(target.target))
+            if points is None:
+                points = np.array(target.get_positions(), dtype=float)
+            points = self.apply_transform(transform, points)
+            self.move_current_positions[id(target.target)] = points
+            target.set_positions(points)
 
         self.update_selection_rectangles(use_previous_offset=True)
         # for rect in self.targets_rects:
