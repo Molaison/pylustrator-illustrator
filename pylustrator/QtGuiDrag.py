@@ -603,7 +603,12 @@ class PlotWindow(QtWidgets.QWidget):
         self.colorWidget.setSizePolicy(
             QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Expanding
         )
-        self.layout_main.addWidget(self.colorWidget)
+        self.color_scroll = QtWidgets.QScrollArea()
+        self.color_scroll.setWidgetResizable(True)
+        self.color_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self.color_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.color_scroll.setWidget(self.colorWidget)
+        self.layout_main.addWidget(self.color_scroll)
 
         self.layout_main.setStretchFactor(0, 0)
         self.layout_main.setStretchFactor(1, 1)

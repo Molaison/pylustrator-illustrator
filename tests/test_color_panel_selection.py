@@ -159,6 +159,37 @@ def test_plot_window_opens_with_comfortable_canvas_and_visible_side_panes() -> N
     assert app is not None
 
 
+def test_many_colors_do_not_push_adjustment_controls_off_screen() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    colors = make_colors(120)
+    fig, ax = plt.subplots(figsize=(7.2, 8.8), dpi=100)
+    for index, color in enumerate(colors):
+        ax.plot([0, 1], [index, index + 1], color=color)
+    fig.change_tracker = ChangeTracker()
+    window = PlotWindow(1)
+    window.setFigure(fig)
+
+    window.show()
+    app.processEvents()
+    app.processEvents()
+
+    available = window.screen().availableGeometry()
+    input_top_left = window.input_size.mapTo(window, window.input_size.rect().topLeft())
+    input_bottom_right = window.input_size.mapTo(
+        window, window.input_size.rect().bottomRight()
+    )
+
+    assert shown_colors(window.colorWidget) == colors
+    assert window.height() <= available.height()
+    assert input_top_left.y() >= 0
+    assert input_bottom_right.y() < window.height()
+    assert window.color_scroll.verticalScrollBar().maximum() > 0
+
+    window.close()
+    plt.close(fig)
+    assert app is not None
+
+
 def test_plot_window_selection_does_not_resize_or_move_canvas() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
