@@ -208,12 +208,14 @@ def install_legacy_legend_replay_compatibility(figure) -> None:
 
 @dataclass(frozen=True)
 class InteractionState:
-    """Selection tool, selected locators, primary object, and isolation scopes."""
+    """Selection, tool scope, and non-document alignment UI state."""
 
     mode: str
     selected: tuple[ObjectLocator, ...]
     primary: Optional[ObjectLocator]
     scopes: tuple[ObjectLocator, ...]
+    alignment_reference_mode: str = "selection"
+    alignment_key: Optional[ObjectLocator] = None
 
 
 __all__ = [

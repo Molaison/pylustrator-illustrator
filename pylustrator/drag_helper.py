@@ -292,6 +292,8 @@ class GrabbableRectangleSelection(GrabFunctions):
         self.targets_rects = []
         self.lock_aspect_ratio = False
         self.reference_point = (0.5, 0.5)
+        self.alignment_reference_mode = "selection"
+        self.alignment_key = None
         self.defer_artist_updates = True
 
         self.hide_grabber()
@@ -503,131 +505,200 @@ class GrabbableRectangleSelection(GrabFunctions):
     def _measure_size(points: np.ndarray, y: int, direct_target: bool) -> float:
         return np.max(points[:, y]) - np.min(points[:, y])
 
-    def align_points(self, mode: str):
-        """a function to apply the alignment options, e.g. align all selected elements at the top or with equal spacing."""
+    def align_points(self, mode: str, *, spacing: float = None) -> bool:
+        """Align visible bounds in display space using the active reference.
+
+        The complete delta plan is measured and preflighted before any artist
+        mutates. Selection alignment uses the selected objects' envelope,
+        key-object alignment keeps the explicit key fixed, and artboard
+        alignment uses the figure canvas bounds.
+        """
+
+        alignment_modes = {
+            "left_x": (0, np.min),
+            "center_x": (0, np.mean),
+            "right_x": (0, np.max),
+            "bottom_y": (1, np.min),
+            "center_y": (1, np.mean),
+            "top_y": (1, np.max),
+        }
+        distribution_modes = {"distribute_x": 0, "distribute_y": 1}
+        if mode not in {*alignment_modes, *distribution_modes, "group"}:
+            raise ValueError(f"Unknown alignment mode: {mode}")
         if len(self.targets) == 0:
-            return
+            return False
+        if spacing is not None:
+            spacing = float(spacing)
+            if not np.isfinite(spacing):
+                raise ValueError("Distribution spacing must be finite")
+            if mode not in distribution_modes:
+                raise ValueError("Numeric spacing only applies to distribution")
+            if self.alignment_reference_mode != "key_object":
+                raise ValueError("Numeric spacing requires key-object alignment")
 
         if mode == "group":
             from pylustrator.helper_functions import axes_to_grid
 
             # return axes_to_grid([target.target for target in self.targets], track_changes=True)
-            with UndoRedo(
-                [
-                    target.target
-                    for target in self.targets
-                    if isinstance(target.target, Axes)
-                ],
-                "Grid Align",
-            ):
+            axes = [
+                target.target
+                for target in self.targets
+                if isinstance(target.target, Axes)
+            ]
+            if not axes:
+                return False
+            with UndoRedo(axes, "Grid Align"):
                 axes_to_grid(
-                    [
-                        target.target
-                        for target in self.targets
-                        if isinstance(target.target, Axes)
-                    ],
+                    axes,
                     track_changes=False,
                 )
+            return True
 
-        def reference_bounds(points_list: list[np.ndarray]):
-            if len(points_list) == 1:
-                bbox = self.figure.bbox
-                return np.array([bbox.x0, bbox.y0, bbox.x1, bbox.y1])
-            return self._bounds_from_points(points_list)
+        key_wrapper = None
+        if self.alignment_reference_mode == "key_object":
+            if len(self.targets) < 2:
+                raise ValueError(
+                    "Select at least two objects for key-object alignment"
+                )
+            key_wrapper = self.alignment_key_wrapper()
 
-        def execute_translation_plan(plan, axis: int, edit_name: str) -> None:
+        with selection_geometry_snapshot():
+            items = self._resolve_alignment_items()
+            measure_points = [
+                self._measure_points(measure_target, move_target)
+                for measure_target, move_target in items
+            ]
+
+            if mode in alignment_modes:
+                axis, function = alignment_modes[mode]
+                if self.alignment_reference_mode == "artboard":
+                    bbox = self.figure.bbox
+                    reference = np.array(
+                        [bbox.x0, bbox.y0, bbox.x1, bbox.y1], dtype=float
+                    )
+                elif key_wrapper is not None:
+                    key_index = next(
+                        index
+                        for index, (_measure, move) in enumerate(items)
+                        if move.target is key_wrapper.target
+                    )
+                    reference = self._bounds_from_points(
+                        [measure_points[key_index]]
+                    )
+                else:
+                    reference = self._bounds_from_points(measure_points)
+                current = [function(points[:, axis]) for points in measure_points]
+                destination = function(reference[axis::2])
+                deltas = [destination - value for value in current]
+                edit_name = "Align"
+            else:
+                axis = distribution_modes[mode]
+                if len(items) < 2:
+                    raise ValueError("Select at least two objects to distribute")
+                sizes = np.asarray(
+                    [
+                        self._measure_size(
+                            points,
+                            axis,
+                            measure_target.target is move_target.target,
+                        )
+                        for points, (measure_target, move_target) in zip(
+                            measure_points, items
+                        )
+                    ],
+                    dtype=float,
+                )
+                positions = np.asarray(
+                    [np.min(points[:, axis]) for points in measure_points],
+                    dtype=float,
+                )
+                order = np.argsort(positions, kind="stable").tolist()
+                deltas = [0.0] * len(items)
+
+                if key_wrapper is not None:
+                    key_index = next(
+                        index
+                        for index, (_measure, move) in enumerate(items)
+                        if move.target is key_wrapper.target
+                    )
+                    key_rank = order.index(key_index)
+                    if spacing is None:
+                        current_gaps = [
+                            positions[right]
+                            - (positions[left] + sizes[left])
+                            for left, right in zip(order, order[1:])
+                        ]
+                        gap = float(np.mean(current_gaps))
+                    else:
+                        gap = spacing
+
+                    cursor = positions[key_index]
+                    for index in reversed(order[:key_rank]):
+                        cursor -= gap + sizes[index]
+                        deltas[index] = cursor - positions[index]
+                    cursor = positions[key_index] + sizes[key_index]
+                    for index in order[key_rank + 1 :]:
+                        cursor += gap
+                        deltas[index] = cursor - positions[index]
+                        cursor += sizes[index]
+                else:
+                    if self.alignment_reference_mode == "artboard":
+                        bbox = self.figure.bbox
+                        layout_low = (bbox.x0, bbox.y0)[axis]
+                        layout_high = (bbox.x1, bbox.y1)[axis]
+                    else:
+                        if len(items) == 2:
+                            # Two objects have no interior position to solve;
+                            # preserve both exactly instead of inventing motion.
+                            layout_low = positions[order[0]]
+                            layout_high = (
+                                positions[order[1]] + sizes[order[1]]
+                            )
+                        else:
+                            layout_bounds = self._bounds_from_points(
+                                measure_points
+                            )
+                            layout_low = layout_bounds[axis]
+                            layout_high = layout_bounds[axis + 2]
+                    gap = (
+                        layout_high - layout_low - float(np.sum(sizes))
+                    ) / (len(items) - 1)
+                    cursor = layout_low
+                    for index in order:
+                        deltas[index] = cursor - positions[index]
+                        cursor += sizes[index] + gap
+                edit_name = "Distribute"
+
+            plan = self._delta_plan(items, deltas)
             vectors = []
             for target, delta in plan:
+                if (
+                    key_wrapper is not None
+                    and target.target is key_wrapper.target
+                ) or np.isclose(delta, 0.0, atol=1e-12):
+                    continue
                 display_delta = np.zeros(2, dtype=float)
                 display_delta[axis] = delta
                 target.preflight_rigid_visible_translation(display_delta)
                 vectors.append((target, display_delta))
-            self.start_move(save_targets=[target for target, _delta in vectors])
-            try:
-                for target, display_delta in vectors:
-                    target.translate(display_delta)
-                self.update_extent()
-                self.has_moved = True
-                self.end_move(edit_name)
-            except Exception:
-                self._restore_move_start()
-                self.has_moved = False
-                self.end_move(edit_name)
-                raise
 
-        def align(y: int, func: callable):
-            items = self._resolve_alignment_items()
-            measure_points = [
-                self._measure_points(measure_target, move_target)
-                for measure_target, move_target in items
-            ]
-            centers = []
-            for points in measure_points:
-                centers.append(func(points[:, y]))
-            new_center = func(reference_bounds(measure_points)[y::2])
-            deltas = [new_center - center for center in centers]
-            plan = self._delta_plan(items, deltas)
-            execute_translation_plan(plan, y, "Align")
-
-            self.figure.canvas.draw()
-            self.update_selection_rectangles()
-
-        def distribute(y: int):
-            items = self._resolve_alignment_items()
-            sizes = []
-            positions = []
-            measure_points = [
-                self._measure_points(measure_target, move_target)
-                for measure_target, move_target in items
-            ]
-            for points, (measure_target, move_target) in zip(measure_points, items):
-                sizes.append(
-                    self._measure_size(
-                        points, y, measure_target.target is move_target.target
-                    )
-                )
-                positions.append(np.min(points[:, y]))
-            order = np.argsort(positions)
-            bounds = self._bounds_from_points(measure_points)
-            spaces = np.diff(bounds[y::2])[0] - np.sum(sizes)
-            spaces /= max([(len(items) - 1), 1])
-            pos = np.min(bounds[y::2])
-            deltas = [0.0] * len(items)
-            for index in order:
-                points = measure_points[index]
-                deltas[index] = pos - np.min(points[:, y])
-                pos += sizes[index] + spaces
-            plan = self._delta_plan(items, deltas)
-            execute_translation_plan(plan, y, "Distribute")
-
-            self.figure.canvas.draw()
-            self.update_selection_rectangles()
-
-        if mode == "center_x":
-            align(0, np.mean)
-
-        if mode == "left_x":
-            align(0, np.min)
-
-        if mode == "right_x":
-            align(0, np.max)
-
-        if mode == "center_y":
-            align(1, np.mean)
-
-        if mode == "bottom_y":
-            align(1, np.min)
-
-        if mode == "top_y":
-            align(1, np.max)
-
-        if mode == "distribute_x":
-            distribute(0)
-
-        if mode == "distribute_y":
-            distribute(1)
-
-        self.figure.signals.figure_selection_moved.emit()
+        if not vectors:
+            return False
+        self.start_move(save_targets=[target for target, _delta in vectors])
+        try:
+            for target, display_delta in vectors:
+                target.translate(display_delta)
+            self.update_extent()
+            self.has_moved = True
+            self.end_move(edit_name)
+        except Exception:
+            self._restore_move_start()
+            self.has_moved = False
+            self.end_move(edit_name)
+            raise
+        self.figure.canvas.draw()
+        self.update_selection_rectangles()
+        return True
 
     @staticmethod
     def _points_bounds(points: np.ndarray) -> np.ndarray:
@@ -643,7 +714,7 @@ class GrabbableRectangleSelection(GrabFunctions):
         )
 
     def match_size(self, mode: str, keep_aspect_ratio: bool = None) -> bool:
-        """Resize selected targets to the first selected target's width/height."""
+        """Match visible size to the key object, or the first selected object."""
         modes = {
             "width": (True, False),
             "height": (False, True),
@@ -657,66 +728,70 @@ class GrabbableRectangleSelection(GrabFunctions):
             keep_aspect_ratio = self.lock_aspect_ratio
 
         match_width, match_height = modes[mode]
-        reference_points = np.array(self.targets[0].get_selection_points(), dtype=float)
-        reference_bounds = self._points_bounds(reference_points)
-        reference_width = reference_bounds[2] - reference_bounds[0]
-        reference_height = reference_bounds[3] - reference_bounds[1]
-        if match_width and reference_width <= 0:
-            raise ValueError("Reference object has no width.")
-        if match_height and reference_height <= 0:
-            raise ValueError("Reference object has no height.")
-
-        unsupported = [
-            (target.target, target.operation_support(TransformOperation.RESIZE_GEOMETRY))
-            for target in self.targets[1:]
-            if not target.supports_operation(TransformOperation.RESIZE_GEOMETRY)
+        reference = (
+            self.alignment_key_wrapper()
+            if self.alignment_reference_mode == "key_object"
+            else self.targets[0]
+        )
+        resize_targets = [
+            target for target in self.targets if target.target is not reference.target
         ]
-        if unsupported:
-            reasons = "; ".join(
-                f"{type(target).__name__}: {support.reason}"
-                for target, support in unsupported
-            )
-            raise ValueError(reasons)
 
         planned: list[tuple[TargetWrapper, np.ndarray]] = []
-        for target in self.targets[1:]:
-            bounds = self._points_bounds(
-                np.array(target.get_selection_points(), dtype=float)
+        with selection_geometry_snapshot():
+            reference_points = np.array(
+                reference.get_selection_points(), dtype=float
             )
-            current_width = bounds[2] - bounds[0]
-            current_height = bounds[3] - bounds[1]
-            if match_width and current_width <= 0:
-                raise ValueError("Selected object has no width.")
-            if match_height and current_height <= 0:
-                raise ValueError("Selected object has no height.")
-            scale_x = reference_width / current_width if match_width else 1.0
-            scale_y = reference_height / current_height if match_height else 1.0
-            if keep_aspect_ratio:
-                if match_width and match_height:
-                    scale = min(scale_x, scale_y)
-                    scale_x = scale_y = scale
-                elif match_width:
-                    scale_y = scale_x
-                elif match_height:
-                    scale_x = scale_y
-            if np.isclose(scale_x, 1.0) and np.isclose(scale_y, 1.0):
-                continue
-            center_x = (bounds[0] + bounds[2]) / 2
-            center_y = (bounds[1] + bounds[3]) / 2
-            transform = np.array(
-                [
-                    [scale_x, 0.0, center_x * (1.0 - scale_x)],
-                    [0.0, scale_y, center_y * (1.0 - scale_y)],
-                    [0.0, 0.0, 1.0],
-                ],
-                dtype=float,
-            )
-            target.preflight_rigid_visible_resize(transform)
-            planned.append((target, transform))
+            reference_bounds = self._points_bounds(reference_points)
+            reference_width = reference_bounds[2] - reference_bounds[0]
+            reference_height = reference_bounds[3] - reference_bounds[1]
+            if match_width and reference_width <= 0:
+                raise ValueError("Reference object has no width.")
+            if match_height and reference_height <= 0:
+                raise ValueError("Reference object has no height.")
+
+            for target in resize_targets:
+                bounds = self._points_bounds(
+                    np.array(target.get_selection_points(), dtype=float)
+                )
+                current_width = bounds[2] - bounds[0]
+                current_height = bounds[3] - bounds[1]
+                if match_width and current_width <= 0:
+                    raise ValueError("Selected object has no width.")
+                if match_height and current_height <= 0:
+                    raise ValueError("Selected object has no height.")
+                scale_x = (
+                    reference_width / current_width if match_width else 1.0
+                )
+                scale_y = (
+                    reference_height / current_height if match_height else 1.0
+                )
+                if keep_aspect_ratio:
+                    if match_width and match_height:
+                        scale = min(scale_x, scale_y)
+                        scale_x = scale_y = scale
+                    elif match_width:
+                        scale_y = scale_x
+                    elif match_height:
+                        scale_x = scale_y
+                if np.isclose(scale_x, 1.0) and np.isclose(scale_y, 1.0):
+                    continue
+                center_x = (bounds[0] + bounds[2]) / 2
+                center_y = (bounds[1] + bounds[3]) / 2
+                transform = np.array(
+                    [
+                        [scale_x, 0.0, center_x * (1.0 - scale_x)],
+                        [0.0, scale_y, center_y * (1.0 - scale_y)],
+                        [0.0, 0.0, 1.0],
+                    ],
+                    dtype=float,
+                )
+                target.preflight_rigid_visible_resize(transform)
+                planned.append((target, transform))
 
         if not planned:
             return False
-        self.start_move()
+        self.start_move(save_targets=[target for target, _transform in planned])
         try:
             for target, transform in planned:
                 target.resize(transform)
@@ -987,6 +1062,26 @@ class GrabbableRectangleSelection(GrabFunctions):
                 for i in range(2):
                     rect = self.targets_rects[index * 2 + i]
                     rect.setRect(x0, y0, w0, h0)
+        self._update_alignment_key_style()
+
+    def _update_alignment_key_style(self) -> None:
+        """Draw the active key object with Illustrator-style emphasis."""
+
+        key = (
+            self.alignment_key
+            if self.alignment_reference_mode == "key_object"
+            else None
+        )
+        for index, target in enumerate(self.targets):
+            rect_index = index * 2
+            if rect_index >= len(self.targets_rects):
+                continue
+            is_key = target.target is key
+            pen = QtGui.QPen(QtGui.QColor("#0D47A1" if is_key else "#1E88E5"))
+            pen.setWidth(5 if is_key else 3)
+            rect = self.targets_rects[rect_index]
+            rect.setPen(pen)
+            rect.setZValue(905 if is_key else 900)
 
     def remove_target(self, target: Artist):
         """remove an artist from the current selection"""
@@ -1005,7 +1100,11 @@ class GrabbableRectangleSelection(GrabFunctions):
         if len(self.targets) == 0:
             self.clear_targets()
         else:
+            if self.alignment_key is target:
+                self.alignment_key = None
             self.update_extent()
+            self.update_selection_rectangles()
+        self._notify_alignment_state_changed()
 
     def update_grabber(self):
         """update the position of the grabber elements"""
@@ -1034,6 +1133,7 @@ class GrabbableRectangleSelection(GrabFunctions):
             # self.figure.patches.remove(rect)
         self.targets_rects = []
         self.targets = []
+        self.alignment_key = None
 
         self.hide_grabber()
 
@@ -1071,6 +1171,85 @@ class GrabbableRectangleSelection(GrabFunctions):
         if not point_sets:
             raise ValueError("No selected object has finite visible geometry")
         return self._bounds_from_points(point_sets)
+
+    def _notify_alignment_state_changed(self) -> None:
+        signals = getattr(self.figure, "signals", None)
+        signal = getattr(signals, "figure_selection_update", None)
+        if signal is not None:
+            signal.emit()
+
+    def _restore_alignment_reference_state(
+        self, mode: str, key: Artist | None
+    ) -> None:
+        """Restore reference UI state without creating a document edit."""
+
+        if mode not in {"selection", "key_object", "artboard"}:
+            mode = "selection"
+        selected = [target.target for target in self.targets]
+        self.alignment_reference_mode = mode
+        self.alignment_key = (
+            key
+            if mode == "key_object"
+            and any(target is key for target in selected)
+            else None
+        )
+        self._update_alignment_key_style()
+        self._notify_alignment_state_changed()
+
+    def set_alignment_reference(
+        self, mode: str, *, key: Artist | None = None
+    ) -> str:
+        """Choose selection, key-object, or artboard alignment semantics."""
+
+        mode = str(mode).lower()
+        if mode not in {"selection", "key_object", "artboard"}:
+            raise ValueError(f"Unknown alignment reference mode: {mode!r}")
+        if mode == "key_object":
+            if len(self.targets) < 2:
+                raise ValueError(
+                    "Select at least two objects before choosing key-object alignment"
+                )
+            if key is None:
+                primary = getattr(
+                    getattr(self.figure, "figure_dragger", None),
+                    "selected_element",
+                    None,
+                )
+                if any(target.target is primary for target in self.targets):
+                    key = primary
+                else:
+                    key = self.targets[-1].target
+            if isinstance(key, TargetWrapper):
+                key = key.target
+            if not any(target.target is key for target in self.targets):
+                raise ValueError("The key object must be part of the current selection")
+            new_key = key
+        else:
+            new_key = None
+        self._restore_alignment_reference_state(mode, new_key)
+        return mode
+
+    def set_alignment_key(self, artist: Artist) -> Artist:
+        """Designate one already-selected object without mutating the figure."""
+
+        if len(self.targets) < 2:
+            raise ValueError("Select at least two objects before choosing a key object")
+        if isinstance(artist, TargetWrapper):
+            artist = artist.target
+        if not any(target.target is artist for target in self.targets):
+            raise ValueError("The key object must be part of the current selection")
+        self.alignment_key = artist
+        self._update_alignment_key_style()
+        self._notify_alignment_state_changed()
+        return artist
+
+    def alignment_key_wrapper(self) -> TargetWrapper:
+        if self.alignment_reference_mode != "key_object":
+            raise ValueError("Key-object alignment is not active")
+        for target in self.targets:
+            if target.target is self.alignment_key:
+                return target
+        raise ValueError("Choose a selected key object before aligning")
 
     def set_reference_point(self, point: Sequence[float]) -> tuple[float, float]:
         """Set the normalized transform-panel anchor without mutating the figure."""
@@ -1247,6 +1426,10 @@ class GrabbableRectangleSelection(GrabFunctions):
     def get_save_point(self, targets: Iterable[TargetWrapper] = None) -> callable:
         """gather the current positions in a restore point for the undo function"""
         selected_targets = [target.target for target in self.targets]
+        alignment_reference_mode = self.alignment_reference_mode
+        alignment_key = self.alignment_key
+        dragger = getattr(self.figure, "figure_dragger", None)
+        selected_primary = getattr(dragger, "selected_element", None)
         wrapped_targets = self._unique_wrappers(targets or self.targets)
         restore_targets = [target.target for target in wrapped_targets]
         states = [target.get_restore_state() for target in wrapped_targets]
@@ -1268,6 +1451,15 @@ class GrabbableRectangleSelection(GrabFunctions):
                 self.add_target(target, update=False)
             if self.targets:
                 self.update_extent()
+            if dragger is not None:
+                dragger.selected_element = (
+                    selected_primary
+                    if any(target is selected_primary for target in selected_targets)
+                    else None
+                )
+            self._restore_alignment_reference_state(
+                alignment_reference_mode, alignment_key
+            )
 
         return undo
 
@@ -1837,8 +2029,18 @@ class DragManager:
             for scope in self._ensure_selection_kernel().scopes
             if (locator := self._object_locator(scope.root)) is not None
         )
+        alignment_key = (
+            self._object_locator(self.selection.alignment_key)
+            if self.selection.alignment_key is not None
+            else None
+        )
         return InteractionState(
-            self.selection_mode.value, selected, primary, scopes
+            self.selection_mode.value,
+            selected,
+            primary,
+            scopes,
+            self.selection.alignment_reference_mode,
+            alignment_key,
         )
 
     def restore_interaction_state(self, state: InteractionState) -> None:
@@ -1857,6 +2059,14 @@ class DragManager:
         ]
         primary = state.primary.resolve(scene) if state.primary is not None else None
         self.select_elements(selected, primary=primary)
+        alignment_key = (
+            state.alignment_key.resolve(scene)
+            if state.alignment_key is not None
+            else None
+        )
+        self.selection._restore_alignment_reference_state(
+            state.alignment_reference_mode, alignment_key
+        )
         self._update_interaction_controls()
 
     def _notify_editor_scene_changed(self, owner: Artist = None) -> None:
@@ -2929,6 +3139,15 @@ class DragManager:
             if kernel.mode is SelectionMode.DIRECT and picked_element is None:
                 picked_element = raw_picked
 
+            if (
+                self.selection.alignment_reference_mode == "key_object"
+                and picked_element
+                in [target.target for target in self.selection.targets]
+                and not click_through
+                and not _event_has_modifier(event, "shift")
+            ):
+                self.selection.set_alignment_key(picked_element)
+
             if event.dblclick and picked_element is not None:
                 if self.enter_isolation(picked_element):
                     inner = kernel.pick(hit_stack)
@@ -3004,6 +3223,7 @@ class DragManager:
         if primary == self.selected_element and current == elements:
             return elements
 
+        previous_alignment_key = self.selection.alignment_key
         self.selection.clear_targets()
 
         for element in elements:
@@ -3021,6 +3241,20 @@ class DragManager:
         self.selected_element = primary
         if self.selection.targets:
             self.selection.update_extent()
+        if self.selection.alignment_reference_mode == "key_object":
+            retained_key = next(
+                (
+                    element
+                    for element in elements
+                    if element is previous_alignment_key
+                ),
+                None,
+            )
+            self.selection._restore_alignment_reference_state(
+                "key_object", retained_key
+            )
+        else:
+            self.selection._notify_alignment_state_changed()
         return elements
 
     def on_deselect(self, event: MouseEvent):

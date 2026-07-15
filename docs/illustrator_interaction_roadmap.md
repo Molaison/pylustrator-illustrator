@@ -196,11 +196,44 @@ native Text angle is not an honest stable-pivot object transform. The exhaustive
 Fig2 audit therefore records 81 representative workflows rather than inflating
 the count to 83; all 6,279 instance checks and all 81 workflows pass.
 
+The Align panel now exposes explicit Selection, Key Object, and Artboard
+references. Selection alignment uses the union of visible bounds and a single
+selected object is a strict no-op; moving one object to the canvas requires the
+explicit Artboard reference. The key object is stored independently from the
+active primary object, receives a heavier outline, can be changed by clicking
+another selected object, and never enters the move or recording plan. Match
+Size uses that same explicit key when key mode is active. Automatic Selection
+distribution preserves the selection envelope (with two-object distribution a
+no-op), while Artboard distribution uses `Figure.bbox`. Key distribution keeps
+the key fixed and either reuses the current mean display-space gap or applies a
+finite signed pixel gap; negative values intentionally overlap objects. Stable
+spatial ordering resolves equal-edge ties.
+
+Every alignment/distribution action measures one immutable visible-geometry
+snapshot, preflights the complete delta plan, and only then commits one atomic
+undo item. A clip-limited target therefore rejects the whole action before any
+Artist, generated record, selection, primary object, reference mode, or key
+mutates. Alignment reference/key state is also part of interaction-state and
+geometry undo/redo restoration. The regression suite covers all six alignment
+directions, positive/zero/negative spacing with the key first/middle/last,
+mixed selection lifecycles, exact no-ops, UI control state, clip rejection, and
+undo/redo; the full suite passes 634 tests with 119 skips.
+
+A read-only real-Fig2 fork probe covers all 19 represented categories. Eighteen
+align to key/artboard references with at most `1.14e-13` px error; AxesImage
+remains the expected typed clip-constraint rejection with zero mutation,
+record, or edit. Twelve automatic/numeric distribution workflows have at most
+`1.71e-13` px gap error, the visible-width match-size case is within `0.0442`
+px, and the real `group_selection` path preserves its key and logical group
+owner through alignment and undo/redo. Every successful action creates one
+undo item, while reference mode, key, and primary survive undo/redo. The formal
+Fig2 remains byte-identical at SHA-256
+`b0cd72abf3962cd6cd2354467ad57aa37ecc213332645d7cb56e6f4af598ad70`.
+
 Remaining feature work:
 
 - Common-pivot multi-object rotation and movable pivots for artist types with a
   complete semantic geometry plan.
-- Key-object/artboard alignment and numeric distribute spacing.
 - Generic smart guides for edges, centers, baselines, anchors, and equal gaps.
 - Direct path/endpoint editing and inline text editing.
 - Content-following cached drag previews and spatial hit/snap indexes.

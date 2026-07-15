@@ -31,6 +31,7 @@ from pylustrator.components.plot_layout import (
     scene_point_to_canvas_pixels,
     selection_scene_transform,
 )
+from pylustrator.components.align import Align
 from pylustrator.components.qpos_and_size import QPosAndSize
 from pylustrator.components.tree_view import MyTreeView
 from pylustrator.drag_helper import (
@@ -94,9 +95,12 @@ class ChangeTracker:
         self.legend_change_count = 0
         self.text_change_count = 0
         self.change_count = 0
+        self.edits = []
+        self.changes = []
 
     def addEdit(self, edit):
         self.edit = edit
+        self.edits.append(edit)
 
     def addNewLegendChange(self, target):
         self.legend_change_count += 1
@@ -113,6 +117,7 @@ class ChangeTracker:
     def addChange(self, target, command):
         self.change_count += 1
         self.change = (target, command)
+        self.changes.append((target, command))
 
     def removeElement(self, target):
         self.removed = target
@@ -123,6 +128,7 @@ class Signals:
     def __init__(self):
         self.selected = []
         self.moved = False
+        self.moved_count = 0
 
         class SelectionMoved:
             def __init__(self, parent):
@@ -130,6 +136,7 @@ class Signals:
 
             def emit(self):
                 self.parent.moved = True
+                self.parent.moved_count += 1
 
         class ElementSelected:
             def __init__(self, parent):
@@ -140,6 +147,8 @@ class Signals:
 
         self.figure_selection_moved = SelectionMoved(self)
         self.figure_element_selected = ElementSelected(self)
+        self.figure_selection_update = Signal()
+        self.figure_selection_property_changed = Signal()
 
 
 class Signal:
@@ -160,6 +169,7 @@ class WidgetSignals:
         self.figure_element_selected = Signal()
         self.figure_selection_moved = Signal()
         self.figure_selection_property_changed = Signal()
+        self.figure_selection_update = Signal()
         self.figure_size_changed = Signal()
 
 
@@ -217,6 +227,41 @@ def selection_target_extents(selection):
         y_values = [point[1] for point in points]
         extents.append((min(x_values), min(y_values), max(x_values), max(y_values)))
     return extents
+
+
+def artist_visible_extent(artist):
+    points = np.asarray(TargetWrapper(artist).get_selection_points(), dtype=float)
+    return (
+        float(np.min(points[:, 0])),
+        float(np.min(points[:, 1])),
+        float(np.max(points[:, 0])),
+        float(np.max(points[:, 1])),
+    )
+
+
+def alignment_coordinate(extent, mode):
+    coordinates = {
+        "left_x": extent[0],
+        "center_x": (extent[0] + extent[2]) / 2,
+        "right_x": extent[2],
+        "bottom_y": extent[1],
+        "center_y": (extent[1] + extent[3]) / 2,
+        "top_y": extent[3],
+    }
+    return coordinates[mode]
+
+
+def add_figure_rectangle(fig, bounds, **kwargs):
+    rectangle = Rectangle(
+        bounds[:2],
+        bounds[2],
+        bounds[3],
+        transform=fig.transFigure,
+        linewidth=0,
+        **kwargs,
+    )
+    fig.add_artist(rectangle)
+    return rectangle
 
 
 def selection_rect_extents(selection):
@@ -698,7 +743,7 @@ def test_axes_selection_indicator_updates_after_axes_move() -> None:
     assert app is not None
 
 
-def test_single_selection_aligns_to_canvas_bounds() -> None:
+def test_single_selection_alignment_is_noop_until_artboard_is_explicit() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     fig, ax = plt.subplots(figsize=(4, 2), dpi=100)
     fig.canvas.draw()
@@ -706,11 +751,52 @@ def test_single_selection_aligns_to_canvas_bounds() -> None:
     ax.set_position([0.2, 0.2, 0.3, 0.3])
     manager.selection.add_target(ax)
 
-    manager.selection.align_points("left_x")
+    before = ax.get_position().frozen()
+    assert manager.selection.align_points("left_x") is False
+    fig.canvas.draw()
+
+    assert ax.get_position().bounds == before.bounds
+    assert not fig.change_tracker.edits
+    assert fig.signals.moved_count == 0
+
+    manager.selection.set_alignment_reference("artboard")
+    assert manager.selection.align_points("left_x") is True
     fig.canvas.draw()
 
     assert abs(ax.get_position().x0) < 1e-9
+    assert len(fig.change_tracker.edits) == 1
     manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_key_reference_is_transactional_and_visually_distinct() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, axes = plt.subplots(1, 3, figsize=(6, 2), dpi=100)
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_elements(axes[:2], primary=axes[1])
+
+    manager.selection.set_alignment_reference("key_object")
+    assert manager.selection.alignment_key is axes[1]
+    manager.selection.set_alignment_key(axes[0])
+
+    assert manager.selected_element is axes[1]
+    assert manager.selection.targets_rects[0].pen().width() == 5
+    assert manager.selection.targets_rects[2].pen().width() == 3
+    assert not fig.change_tracker.edits
+
+    with pytest.raises(ValueError, match="part of the current selection"):
+        manager.selection.set_alignment_reference("key_object", key=axes[2])
+    assert manager.selection.alignment_reference_mode == "key_object"
+    assert manager.selection.alignment_key is axes[0]
+
+    manager.selection.set_alignment_reference("selection")
+    manager.selection.clear_targets()
+    with pytest.raises(ValueError, match="at least two"):
+        manager.selection.set_alignment_reference("key_object")
+    assert manager.selection.alignment_reference_mode == "selection"
+    assert manager.selection.alignment_key is None
     plt.close(fig)
     assert app is not None
 
@@ -732,6 +818,509 @@ def test_multi_selection_aligns_to_selection_bounds() -> None:
     assert abs(axes[1].get_position().x0 - 0.2) < 1e-9
     manager.selection.clear_targets()
     plt.close(fig)
+    assert app is not None
+
+
+@pytest.mark.parametrize(
+    "mode",
+    ["left_x", "center_x", "right_x", "bottom_y", "center_y", "top_y"],
+)
+def test_key_object_alignment_keeps_explicit_key_and_undo_state(mode) -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig = plt.figure(figsize=(4, 3), dpi=100)
+    key = add_figure_rectangle(fig, (0.12, 0.18, 0.24, 0.19))
+    target = add_figure_rectangle(fig, (0.61, 0.58, 0.13, 0.11))
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_elements([key, target], primary=target)
+    manager.selection.set_alignment_reference("key_object", key=key)
+    key_before = artist_visible_extent(key)
+    target_before = artist_visible_extent(target)
+
+    assert manager.selection.align_points(mode) is True
+    fig.canvas.draw()
+    target_after = artist_visible_extent(target)
+
+    assert artist_visible_extent(key) == pytest.approx(key_before, abs=1e-8)
+    assert alignment_coordinate(target_after, mode) == pytest.approx(
+        alignment_coordinate(key_before, mode), abs=1e-8
+    )
+    assert len(fig.change_tracker.edits) == 1
+    assert {artist for artist, _command in fig.change_tracker.changes} == {target}
+    assert fig.signals.moved_count == 1
+    assert manager.selected_element is target
+    assert manager.selection.alignment_key is key
+
+    undo, redo = fig.change_tracker.edit[:2]
+    undo()
+    fig.canvas.draw()
+    assert artist_visible_extent(key) == pytest.approx(key_before, abs=1e-8)
+    assert artist_visible_extent(target) == pytest.approx(target_before, abs=1e-8)
+    assert manager.selected_element is target
+    assert manager.selection.alignment_reference_mode == "key_object"
+    assert manager.selection.alignment_key is key
+
+    redo()
+    fig.canvas.draw()
+    assert alignment_coordinate(artist_visible_extent(target), mode) == pytest.approx(
+        alignment_coordinate(key_before, mode), abs=1e-8
+    )
+    assert manager.selected_element is target
+    assert manager.selection.alignment_key is key
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+@pytest.mark.parametrize(
+    "mode",
+    ["left_x", "center_x", "right_x", "bottom_y", "center_y", "top_y"],
+)
+def test_artboard_alignment_uses_figure_bbox(mode) -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig = plt.figure(figsize=(4, 3), dpi=100)
+    target = add_figure_rectangle(fig, (0.31, 0.42, 0.17, 0.13))
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_element(target)
+    manager.selection.set_alignment_reference("artboard")
+    artboard = tuple(float(value) for value in fig.bbox.extents)
+
+    assert manager.selection.align_points(mode) is True
+    fig.canvas.draw()
+
+    assert alignment_coordinate(artist_visible_extent(target), mode) == pytest.approx(
+        alignment_coordinate(artboard, mode), abs=1e-8
+    )
+    assert len(fig.change_tracker.edits) == 1
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_clicking_selected_object_changes_only_alignment_key() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    first = ax.add_patch(Rectangle((0.12, 0.2), 0.18, 0.2))
+    second = ax.add_patch(Rectangle((0.64, 0.58), 0.16, 0.17))
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_elements([first, second], primary=second)
+    manager.selection.set_alignment_reference("key_object", key=second)
+    selected_before = [target.target for target in manager.selection.targets]
+    x, y = ax.transData.transform((0.21, 0.3))
+    press = MouseEvent("button_press_event", fig.canvas, x, y, button=1)
+    release = MouseEvent("button_release_event", fig.canvas, x, y, button=1)
+
+    manager.button_press_event0(press)
+    manager.button_release_event0(release)
+
+    assert manager.selection.alignment_key is first
+    assert manager.selected_element is second
+    assert [target.target for target in manager.selection.targets] == selected_before
+    assert not fig.change_tracker.edits
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_selection_distribution_keeps_end_objects_and_equalizes_gaps() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig = plt.figure(figsize=(4, 3), dpi=100)
+    rectangles = [
+        add_figure_rectangle(fig, bounds)
+        for bounds in (
+            (0.08, 0.2, 0.12, 0.1),
+            (0.31, 0.2, 0.08, 0.1),
+            (0.52, 0.2, 0.15, 0.1),
+            (0.81, 0.2, 0.07, 0.1),
+        )
+    ]
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_elements(rectangles, primary=rectangles[-1])
+    before = [artist_visible_extent(artist) for artist in rectangles]
+
+    assert manager.selection.align_points("distribute_x") is True
+    fig.canvas.draw()
+    after = [artist_visible_extent(artist) for artist in rectangles]
+    gaps = [right[0] - left[2] for left, right in zip(after, after[1:])]
+
+    assert after[0] == pytest.approx(before[0], abs=1e-8)
+    assert after[-1] == pytest.approx(before[-1], abs=1e-8)
+    assert np.ptp(gaps) < 1e-8
+    assert len(fig.change_tracker.edits) == 1
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_two_object_selection_distribution_is_strict_noop() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig = plt.figure(figsize=(4, 3), dpi=100)
+    rectangles = [
+        add_figure_rectangle(fig, bounds)
+        for bounds in ((0.1, 0.2, 0.16, 0.1), (0.72, 0.2, 0.09, 0.1))
+    ]
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_elements(rectangles, primary=rectangles[-1])
+    before = [artist_visible_extent(artist) for artist in rectangles]
+
+    assert manager.selection.align_points("distribute_x") is False
+
+    assert [artist_visible_extent(artist) for artist in rectangles] == pytest.approx(
+        before, abs=1e-8
+    )
+    assert not fig.change_tracker.edits
+    assert fig.signals.moved_count == 0
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+@pytest.mark.parametrize("axis", [0, 1])
+def test_artboard_distribution_uses_canvas_edges_and_equal_gaps(axis) -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig = plt.figure(figsize=(4, 3), dpi=100)
+    rectangles = [
+        add_figure_rectangle(fig, bounds)
+        for bounds in (
+            (0.18, 0.12, 0.1, 0.11),
+            (0.46, 0.43, 0.16, 0.08),
+            (0.73, 0.76, 0.08, 0.14),
+        )
+    ]
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_elements(rectangles, primary=rectangles[-1])
+    manager.selection.set_alignment_reference("artboard")
+    mode = ("distribute_x", "distribute_y")[axis]
+
+    assert manager.selection.align_points(mode) is True
+    fig.canvas.draw()
+    extents = [artist_visible_extent(artist) for artist in rectangles]
+    low, high = ((0, 2), (1, 3))[axis]
+    gaps = [
+        right[low] - left[high] for left, right in zip(extents, extents[1:])
+    ]
+    artboard = fig.bbox.extents
+
+    assert extents[0][low] == pytest.approx(artboard[low], abs=1e-8)
+    assert extents[-1][high] == pytest.approx(artboard[high], abs=1e-8)
+    assert np.ptp(gaps) < 1e-8
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+@pytest.mark.parametrize("axis", [0, 1])
+@pytest.mark.parametrize("key_index", [0, 1, 3])
+@pytest.mark.parametrize("spacing", [17.0, 0.0, -9.0])
+def test_key_distribution_uses_exact_signed_display_gap(
+    axis, key_index, spacing
+) -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig = plt.figure(figsize=(4, 3), dpi=100)
+    rectangles = [
+        add_figure_rectangle(fig, bounds)
+        for bounds in (
+            (0.08, 0.10, 0.10, 0.12),
+            (0.29, 0.31, 0.15, 0.08),
+            (0.57, 0.54, 0.08, 0.16),
+            (0.82, 0.79, 0.12, 0.10),
+        )
+    ]
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_elements(rectangles, primary=rectangles[-1])
+    key = rectangles[key_index]
+    manager.selection.set_alignment_reference("key_object", key=key)
+    key_before = artist_visible_extent(key)
+    mode = ("distribute_x", "distribute_y")[axis]
+
+    assert manager.selection.align_points(mode, spacing=spacing) is True
+    fig.canvas.draw()
+    extents = [artist_visible_extent(artist) for artist in rectangles]
+    low, high = ((0, 2), (1, 3))[axis]
+    gaps = [
+        right[low] - left[high] for left, right in zip(extents, extents[1:])
+    ]
+
+    assert gaps == pytest.approx([spacing] * 3, abs=1e-8)
+    assert artist_visible_extent(key) == pytest.approx(key_before, abs=1e-8)
+    assert manager.selected_element is rectangles[-1]
+    assert manager.selection.alignment_key is key
+    assert len(fig.change_tracker.edits) == 1
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_key_auto_distribution_reuses_mean_current_gap() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig = plt.figure(figsize=(4, 3), dpi=100)
+    rectangles = [
+        add_figure_rectangle(fig, bounds)
+        for bounds in (
+            (0.08, 0.2, 0.10, 0.1),
+            (0.27, 0.2, 0.13, 0.1),
+            (0.56, 0.2, 0.08, 0.1),
+            (0.83, 0.2, 0.11, 0.1),
+        )
+    ]
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_elements(rectangles, primary=rectangles[-1])
+    key = rectangles[1]
+    manager.selection.set_alignment_reference("key_object", key=key)
+    before = [artist_visible_extent(artist) for artist in rectangles]
+    expected_gap = np.mean(
+        [right[0] - left[2] for left, right in zip(before, before[1:])]
+    )
+    key_before = before[1]
+
+    assert manager.selection.align_points("distribute_x") is True
+    fig.canvas.draw()
+    after = [artist_visible_extent(artist) for artist in rectangles]
+    gaps = [right[0] - left[2] for left, right in zip(after, after[1:])]
+
+    assert gaps == pytest.approx([expected_gap] * 3, abs=1e-8)
+    assert after[1] == pytest.approx(key_before, abs=1e-8)
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_key_distribution_tie_order_is_stable_and_repeat_is_noop() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig = plt.figure(figsize=(4, 3), dpi=100)
+    rectangles = [
+        add_figure_rectangle(fig, bounds)
+        for bounds in (
+            (0.2, 0.2, 0.08, 0.1),
+            (0.2, 0.4, 0.12, 0.1),
+            (0.48, 0.6, 0.09, 0.1),
+            (0.78, 0.75, 0.10, 0.1),
+        )
+    ]
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_elements(rectangles, primary=rectangles[-1])
+    manager.selection.set_alignment_reference("key_object", key=rectangles[-1])
+
+    assert manager.selection.align_points("distribute_x", spacing=5) is True
+    fig.canvas.draw()
+    first = [artist_visible_extent(artist) for artist in rectangles]
+    assert [right[0] - left[2] for left, right in zip(first, first[1:])] == (
+        pytest.approx([5.0, 5.0, 5.0], abs=1e-8)
+    )
+    edit_count = len(fig.change_tracker.edits)
+
+    assert manager.selection.align_points("distribute_x", spacing=5) is False
+    assert [artist_visible_extent(artist) for artist in rectangles] == pytest.approx(
+        first, abs=1e-8
+    )
+    assert len(fig.change_tracker.edits) == edit_count
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_numeric_distribution_validation_never_pollutes_reference_state() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig = plt.figure(figsize=(4, 3), dpi=100)
+    rectangles = [
+        add_figure_rectangle(fig, bounds)
+        for bounds in ((0.1, 0.2, 0.1, 0.1), (0.7, 0.2, 0.1, 0.1))
+    ]
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_elements(rectangles, primary=rectangles[-1])
+    manager.selection.set_alignment_reference("key_object", key=rectangles[0])
+    before = [artist_visible_extent(artist) for artist in rectangles]
+
+    for spacing in (np.nan, np.inf, -np.inf):
+        with pytest.raises(ValueError, match="finite"):
+            manager.selection.align_points("distribute_x", spacing=spacing)
+
+    assert [artist_visible_extent(artist) for artist in rectangles] == pytest.approx(
+        before, abs=1e-8
+    )
+    assert manager.selection.alignment_reference_mode == "key_object"
+    assert manager.selection.alignment_key is rectangles[0]
+    assert manager.selected_element is rectangles[-1]
+    assert not fig.change_tracker.edits
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_alignment_key_survives_membership_add_and_clears_when_removed() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, axes = plt.subplots(1, 3, figsize=(6, 2), dpi=100)
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_elements(axes[:2], primary=axes[1])
+    manager.selection.set_alignment_reference("key_object", key=axes[0])
+
+    manager.select_elements(axes, primary=axes[2])
+    assert manager.selection.alignment_key is axes[0]
+    assert manager.selected_element is axes[2]
+
+    manager.select_elements(axes[1:], primary=axes[2])
+    assert manager.selection.alignment_reference_mode == "key_object"
+    assert manager.selection.alignment_key is None
+    assert manager.selected_element is axes[2]
+    with pytest.raises(ValueError, match="Choose a selected key object"):
+        manager.selection.align_points("left_x")
+    assert not fig.change_tracker.edits
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_key_object_match_size_resizes_every_non_key_target() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig = plt.figure(figsize=(4, 3), dpi=100)
+    rectangles = [
+        add_figure_rectangle(fig, bounds)
+        for bounds in (
+            (0.08, 0.15, 0.10, 0.12),
+            (0.31, 0.38, 0.27, 0.14),
+            (0.76, 0.68, 0.08, 0.09),
+        )
+    ]
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_elements(rectangles, primary=rectangles[-1])
+    key = rectangles[1]
+    manager.selection.set_alignment_reference("key_object", key=key)
+    before = [artist_visible_extent(artist) for artist in rectangles]
+    key_width = before[1][2] - before[1][0]
+
+    assert manager.selection.match_size("width", keep_aspect_ratio=False) is True
+    fig.canvas.draw()
+    after = [artist_visible_extent(artist) for artist in rectangles]
+
+    assert [bounds[2] - bounds[0] for bounds in after] == pytest.approx(
+        [key_width] * 3, abs=1e-8
+    )
+    assert after[1] == pytest.approx(before[1], abs=1e-8)
+    assert manager.selection.alignment_key is key
+    assert manager.selected_element is rectangles[-1]
+    assert len(fig.change_tracker.edits) == 1
+    assert {
+        artist for artist, _command in fig.change_tracker.changes
+    } == {rectangles[0], rectangles[2]}
+
+    fig.change_tracker.edit[0]()
+    fig.canvas.draw()
+    assert np.allclose(
+        [artist_visible_extent(artist) for artist in rectangles],
+        before,
+        atol=1e-8,
+    )
+    assert manager.selection.alignment_key is key
+    assert manager.selected_element is rectangles[-1]
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_key_alignment_clip_failure_is_atomic_and_preserves_ui_state() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, axes = plt.subplots(1, 2, figsize=(6, 3), dpi=100)
+    key = axes[0].add_patch(Rectangle((0.25, 0.35), 0.12, 0.18))
+    safe = add_figure_rectangle(fig, (0.72, 0.15, 0.08, 0.1))
+    clipped = axes[1].add_patch(Rectangle((0.58, 0.38), 0.14, 0.17))
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    artists = [key, safe, clipped]
+    manager.select_elements(artists, primary=clipped)
+    manager.selection.set_alignment_reference("key_object", key=key)
+    before = [TargetWrapper(artist).get_restore_state() for artist in artists]
+
+    with pytest.raises(TypeError, match="clip region"):
+        manager.selection.align_points("left_x")
+
+    after = [TargetWrapper(artist).get_restore_state() for artist in artists]
+    assert all(semantic_equal(old, new) for old, new in zip(before, after))
+    assert not fig.change_tracker.edits
+    assert fig.change_tracker.change_count == 0
+    assert manager.selection.alignment_reference_mode == "key_object"
+    assert manager.selection.alignment_key is key
+    assert manager.selected_element is clipped
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_interaction_state_roundtrip_includes_alignment_reference_and_key() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, axes = plt.subplots(1, 3, figsize=(6, 2), dpi=100)
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_elements(axes[:2], primary=axes[1])
+    manager.selection.set_alignment_reference("key_object", key=axes[0])
+    state = manager.capture_interaction_state()
+
+    manager.select_element(axes[2])
+    manager.selection.set_alignment_reference("artboard")
+    manager.restore_interaction_state(state)
+
+    assert [target.target for target in manager.selection.targets] == list(axes[:2])
+    assert manager.selected_element is axes[1]
+    assert manager.selection.alignment_reference_mode == "key_object"
+    assert manager.selection.alignment_key is axes[0]
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_align_widget_tracks_reference_and_spacing_controls() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    signals = WidgetSignals()
+    container = QtWidgets.QWidget()
+    layout = QtWidgets.QVBoxLayout(container)
+    widget = Align(layout, signals)
+    fig, axes = plt.subplots(1, 2, figsize=(4, 2), dpi=100)
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    fig.signals = signals
+    signals.figure_changed.emit(fig)
+    manager.select_elements(axes, primary=axes[1])
+    signals.figure_element_selected.emit(axes[1])
+
+    key_index = widget.reference_combo.findData("key_object")
+    widget.reference_combo.setCurrentIndex(key_index)
+    assert manager.selection.alignment_reference_mode == "key_object"
+    assert manager.selection.alignment_key is axes[1]
+    assert widget.spacing_enabled.isEnabled()
+
+    widget.spacing_enabled.setChecked(True)
+    assert widget.spacing_input.isEnabled()
+    widget.spacing_input.setValue(-12.5)
+
+    artboard_index = widget.reference_combo.findData("artboard")
+    widget.reference_combo.setCurrentIndex(artboard_index)
+    assert manager.selection.alignment_reference_mode == "artboard"
+    assert not widget.spacing_enabled.isEnabled()
+    assert not widget.spacing_input.isEnabled()
+
+    calls = []
+
+    def capture_alignment(mode, *, spacing=None):
+        calls.append((mode, spacing))
+        return False
+
+    manager.selection.align_points = capture_alignment
+    widget.execute_action("distribute_x")
+    assert calls == [("distribute_x", None)]
+
+    manager.selection.clear_targets()
+    plt.close(fig)
+    container.deleteLater()
     assert app is not None
 
 
