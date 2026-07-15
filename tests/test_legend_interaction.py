@@ -225,6 +225,36 @@ def test_axes_legend_change_description_preserves_handles_and_labels() -> None:
     plt.close(fig)
 
 
+def test_axes_proxy_legend_replay_uses_existing_legend_handles() -> None:
+    from pylustrator.change_tracker import ChangeTracker
+
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    legend = ax.legend(
+        handles=[Patch(facecolor="red"), Patch(facecolor="blue")],
+        labels=["proxy A", "proxy B"],
+        loc="upper right",
+    )
+    fig.canvas.draw()
+    assert ax.get_legend_handles_labels() == ([], [])
+
+    tracker = ChangeTracker.__new__(ChangeTracker)
+    command_parent, command = tracker.get_describtion_string(
+        legend, exclude_default=False
+    )
+
+    assert command_parent is ax
+    assert ".get_legend().legend_handles" in command
+    eval("command_parent" + command)
+
+    changed = ax.get_legend()
+    assert [text.get_text() for text in changed.get_texts()] == [
+        "proxy A",
+        "proxy B",
+    ]
+    assert len(changed.legend_handles) == 2
+    plt.close(fig)
+
+
 def test_extra_axes_legend_uses_artist_reference_not_current_axes_legend() -> None:
     from pylustrator.change_tracker import ChangeTracker, getReference
 

@@ -4,6 +4,7 @@ import qtawesome as qta
 
 import matplotlib as mpl
 import matplotlib.transforms as transforms
+import numpy as np
 from matplotlib.figure import Figure
 from matplotlib.artist import Artist
 
@@ -11,10 +12,9 @@ try:  # starting from mpl version 3.6.0
     from matplotlib.axes import Axes
 except ImportError:
     from matplotlib.axes._subplots import Axes
-from matplotlib.text import Text
-
 from pylustrator.helper_functions import changeFigureSize, main_figure
 from pylustrator.QLinkableWidgets import DimensionsWidget, ComboWidget
+from pylustrator.snap import TargetWrapper
 
 
 class QPosAndSize(QtWidgets.QWidget):
@@ -39,7 +39,7 @@ class QPosAndSize(QtWidgets.QWidget):
 
         layout.addWidget(self)
         self.layout = QtWidgets.QGridLayout(self)
-        self.layout.setContentsMargins(10, 0, 10, 0)
+        self.layout.setContentsMargins(4, 0, 4, 0)
 
         self.input_position = DimensionsWidget(self.layout, "X:", "Y:", "cm")
         self.layout.addWidget(self.input_position, 0, 0)
@@ -128,11 +128,7 @@ class QPosAndSize(QtWidgets.QWidget):
     ) -> list[float]:
         new_size = [float(value[0]), float(value[1])]
         current_width, current_height = current_size
-        if (
-            changed_axis is None
-            or current_width == 0
-            or current_height == 0
-        ):
+        if changed_axis is None or current_width == 0 or current_height == 0:
             return new_size
         if changed_axis == 0:
             new_size[1] = new_size[0] * current_height / current_width
@@ -187,69 +183,67 @@ class QPosAndSize(QtWidgets.QWidget):
         self.signals.figure_size_changed.emit()
 
     def changePos(self, value_x: float, value_y: float):
-        """change the position of an axes"""
-        elements = [self.element]
-        elements += [
-            element.target for element in main_figure(self.element).selection.targets
-        ]
+        """Move the selection by one display-space delta.
 
-        old_positions = []
-        new_positions = []
+        Native Matplotlib positions can be data, axes, figure, or display
+        coordinates.  Assigning one raw X/Y value to a mixed selection corrupts
+        every element whose transform differs from the primary element.
+        """
+        selection = main_figure(self.element).selection
+        elements = [target.target for target in selection.targets]
+        if self.element not in elements:
+            elements.append(self.element)
+        wrappers = []
+        seen = set()
         for element in elements:
-            old_pos = element.get_position()
-            try:
-                old_positions.append(
-                    [old_pos.x0, old_pos.y0, old_pos.width, old_pos.height]
-                )
-            except AttributeError:
-                old_positions.append(old_pos)
-            if getattr(old_pos, "width", None) is not None:
-                pos = [old_pos.x0, old_pos.y0, old_pos.width, old_pos.height]
-            else:
-                pos = [old_pos[0], old_pos[1]]
-            if value_x is not None:
-                pos[0] = value_x
-            if value_y is not None:
-                pos[1] = value_y
-            new_positions.append(pos)
+            if id(element) in seen or not TargetWrapper.supports_target(element):
+                continue
+            seen.add(id(element))
+            wrappers.append(TargetWrapper(element))
+        if not wrappers:
+            return
 
-        fig = self.fig
+        primary = TargetWrapper(self.element)
+        old_position = self.element.get_position()
+        if getattr(old_position, "width", None) is not None:
+            desired_native = [old_position.x0, old_position.y0]
+        else:
+            desired_native = [old_position[0], old_position[1]]
+        if value_x is not None:
+            desired_native[0] = value_x
+        if value_y is not None:
+            desired_native[1] = value_y
+
+        current_display = np.asarray(primary.get_positions()[0], dtype=float)
+        desired_display = np.asarray(
+            primary.transform_points([desired_native])[0], dtype=float
+        )
+        delta = desired_display - current_display
+        if np.allclose(delta, 0):
+            return
+
+        old_states = [wrapper.get_restore_state() for wrapper in wrappers]
+        for wrapper in wrappers:
+            points = np.asarray(wrapper.get_positions(), dtype=float)
+            wrapper.set_positions(points + delta)
+        new_states = [wrapper.get_restore_state() for wrapper in wrappers]
+
+        def apply(states):
+            for wrapper, state in zip(wrappers, states):
+                wrapper.restore_state(state)
+            selection.update_extent()
+            selection.update_selection_rectangles()
+            self.fig.canvas.draw()
 
         def redo():
-            for element, pos in zip(elements, new_positions):
-                element.set_position(pos)
-                if isinstance(element, Text):
-                    fig.change_tracker.addNewTextChange(element)
-                elif isinstance(element, Axes):
-                    fig.change_tracker.addNewAxesChange(element)
-                elif len(pos) == 4:
-                    fig.change_tracker.addChange(
-                        element, ".set_position([%f, %f, %f, %f])" % tuple(pos)
-                    )
-                else:
-                    fig.change_tracker.addChange(
-                        element, ".set_position([%f, %f])" % tuple(pos)
-                    )
+            apply(new_states)
 
         def undo():
-            for element, pos in zip(elements, old_positions):
-                element.set_position(pos)
-                if isinstance(element, Text):
-                    fig.change_tracker.addNewTextChange(element)
-                elif isinstance(element, Axes):
-                    fig.change_tracker.addNewAxesChange(element)
-                elif len(pos) == 4:
-                    fig.change_tracker.addChange(
-                        element, ".set_position([%f, %f, %f, %f])" % tuple(pos)
-                    )
-                else:
-                    fig.change_tracker.addChange(
-                        element, ".set_position([%f, %f])" % tuple(pos)
-                    )
+            apply(old_states)
 
-        redo()
         self.fig.change_tracker.addEdit([undo, redo, "Change position"])
-
+        selection.update_extent()
+        selection.update_selection_rectangles()
         self.fig.signals.figure_selection_property_changed.emit()
         self.fig.canvas.draw()
 
@@ -308,9 +302,7 @@ class QPosAndSize(QtWidgets.QWidget):
                 pos = [pos.x0, pos.y0, pos.width, pos.height]
                 size = list(value)
                 if self._lock_aspect_enabled():
-                    size = self._locked_size(
-                        size, (pos[2], pos[3]), changed_axis
-                    )
+                    size = self._locked_size(size, (pos[2], pos[3]), changed_axis)
                 pos[2] = size[0]
                 pos[3] = size[1]
                 new_positions.append(pos)
@@ -346,19 +338,17 @@ class QPosAndSize(QtWidgets.QWidget):
                 return transforms.Affine2D().scale(2.54, 2.54)
             return None
         if isinstance(element, Axes):
+            display_transform = TargetWrapper(element).get_transform()
             if self.transform_index == 0:
                 return (
                     transforms.Affine2D().scale(2.54, 2.54)
                     + element.figure.dpi_scale_trans.inverted()
-                    + element.figure.transFigure
+                    + display_transform
                 )
             if self.transform_index == 1:
-                return (
-                    element.figure.dpi_scale_trans.inverted()
-                    + element.figure.transFigure
-                )
+                return element.figure.dpi_scale_trans.inverted() + display_transform
             if self.transform_index == 2:
-                return element.figure.transFigure
+                return display_transform
             return None
         if self.transform_index == 0:
             return (

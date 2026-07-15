@@ -297,12 +297,22 @@ def getReference(element: Artist, allow_using_variable_names=True):
     legend_reference = get_legend_reference(element)
     if legend_reference is not None:
         return legend_reference
+    figure = getattr(element, "figure", None)
+    if (
+        figure is not None
+        and getattr(element, "axes", None) is None
+        and element in figure.artists
+    ):
+        return getReference(figure) + ".artists[%d]" % figure.artists.index(element)
     if isinstance(element, matplotlib.lines.Line2D):
         index = element.axes.lines.index(element)
         return getReference(element.axes) + ".lines[%d]" % index
     if isinstance(element, matplotlib.collections.Collection):
         index = element.axes.collections.index(element)
         return getReference(element.axes) + ".collections[%d]" % index
+    if isinstance(element, matplotlib.image.AxesImage):
+        index = element.axes.images.index(element)
+        return getReference(element.axes) + ".images[%d]" % index
     if isinstance(element, matplotlib.patches.Patch):
         if element.axes:
             index = element.axes.patches.index(element)
@@ -607,17 +617,28 @@ class ChangeTracker:
             ]
 
             parent = element.figure if element.axes is None else element.axes
+            labels = [text.get_text() for text in element.get_texts()]
             if element.axes is not None and element.axes.get_legend() is element:
-                handles = CodeReference(
-                    getReference(parent) + ".get_legend_handles_labels()[0]"
-                )
+                axes_handles, axes_labels = parent.get_legend_handles_labels()
+                if len(axes_handles) == len(labels) and list(axes_labels) == labels:
+                    handles = CodeReference(
+                        getReference(parent) + ".get_legend_handles_labels()[0]"
+                    )
+                else:
+                    # Legends built from explicit proxy handles may have no
+                    # corresponding labelled artists on their Axes.  Resolve
+                    # the proxies before calling Axes.legend(), while the old
+                    # legend is still installed, so replay preserves contents.
+                    handles = CodeReference(
+                        getReference(element) + ".legend_handles"
+                    )
             else:
                 handles = CodeReference(getReference(element) + ".legend_handles")
 
             # get current property values
             kwargs = {
                 "handles": handles,
-                "labels": [text.get_text() for text in element.get_texts()],
+                "labels": labels,
                 "loc": element._loc,
             }
             kwargs.update(get_legend_anchor_kwargs(element))
@@ -960,6 +981,8 @@ class ChangeTracker:
             r"\.{title|_left_title|_right_title}",
             r"\.lines\[\d*\]",
             r"\.collections\[\d*\]",
+            r"\.images\[\d*\]",
+            r"\.artists\[\d*\]",
             r"\.patches\[\d*\]",
             r"\.get_[xy]axis\(\)\.get_(major|minor)_ticks\(\)\[\d*\]",
             r"\.get_[xy]axis\(\)\.get_label\(\)",

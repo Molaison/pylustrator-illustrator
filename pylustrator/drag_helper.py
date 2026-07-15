@@ -24,7 +24,6 @@ from matplotlib.artist import Artist
 from matplotlib.figure import Figure, SubFigure
 from matplotlib.axes import Axes
 from matplotlib.legend import Legend
-from matplotlib.lines import Line2D
 from matplotlib.text import Text
 from matplotlib.patches import Patch, Rectangle
 from matplotlib.backend_bases import MouseEvent, KeyEvent
@@ -33,8 +32,6 @@ from qtpy import QtCore, QtGui, QtWidgets
 
 from .snap import (
     TargetWrapper,
-    checkXLabel,
-    checkYLabel,
     getSnaps,
     checkSnaps,
     checkSnapsActive,
@@ -94,7 +91,7 @@ def get_artist_children(element: Artist) -> list[Artist]:
 
 
 def _is_internal_label(artist: Artist, explicit: bool = False) -> bool:
-    if explicit:
+    if explicit or getattr(artist, "_pylustrator_explicitly_editable", False):
         return False
     label = artist.get_label()
     return isinstance(label, str) and label.startswith("_")
@@ -210,9 +207,10 @@ class GrabFunctions(object):
         dy = event.y - self.mouse_xy[1]
 
         control_toggles_aspect = _event_has_modifier(event, "control")
-        keep_aspect = bool(
-            getattr(self.parent, "lock_aspect_ratio", False)
-        ) ^ control_toggles_aspect
+        keep_aspect = (
+            bool(getattr(self.parent, "lock_aspect_ratio", False))
+            ^ control_toggles_aspect
+        )
         constrain_direction = _event_has_modifier(event, "shift")
         ignore_snaps = _event_has_modifier(event, "alt") or _event_has_modifier(
             event, "option"
@@ -286,32 +284,26 @@ class GrabbableRectangleSelection(GrabFunctions):
 
         self.hide_grabber()
 
-    def add_target(self, target: Artist):
+    def add_target(self, target: Artist, update: bool = True):
         """add an artist to the selection"""
         if target in [wrapped.target for wrapped in self.targets]:
             return
         target = TargetWrapper(target)
+        if not target.supported:
+            return
 
-        new_points = np.array(target.get_positions())
+        new_points = np.array(target.get_selection_points())
         if len(new_points) == 0:
             return
 
         self.targets.append(target)
 
-        if new_points.shape[0] == 3:
-            x0, y0, x1, y1 = (
-                np.min(new_points[1:, 0]),
-                np.min(new_points[1:, 1]),
-                np.max(new_points[1:, 0]),
-                np.max(new_points[1:, 1]),
-            )
-        else:
-            x0, y0, x1, y1 = (
-                np.min(new_points[:, 0]),
-                np.min(new_points[:, 1]),
-                np.max(new_points[:, 0]),
-                np.max(new_points[:, 1]),
-            )
+        x0, y0, x1, y1 = (
+            np.min(new_points[:, 0]),
+            np.min(new_points[:, 1]),
+            np.max(new_points[:, 0]),
+            np.max(new_points[:, 1]),
+        )
         if 0:
             rect1 = Rectangle(
                 (x0, y0),
@@ -363,13 +355,14 @@ class GrabbableRectangleSelection(GrabFunctions):
             self.targets_rects.append(rect1)
             self.targets_rects.append(rect2)
 
-        self.update_extent()
+        if update:
+            self.update_extent()
 
     def update_extent(self):
         """updates the extend of the selection to all the selected elements"""
         points = None
         for target in self.targets:
-            new_points = np.array(target.get_positions())
+            new_points = np.array(target.get_selection_points())
 
             if points is None:
                 points = new_points
@@ -403,75 +396,6 @@ class GrabbableRectangleSelection(GrabFunctions):
         else:
             self.hide_grabber()
 
-    def _known_legends(self) -> list[Legend]:
-        legends = list(getattr(self.figure, "legends", []))
-        for axes in self.figure.axes:
-            legend = axes.get_legend()
-            if legend is not None:
-                legends.append(legend)
-            legends.extend(
-                artist for artist in axes.artists if isinstance(artist, Legend)
-            )
-
-        unique = []
-        seen = set()
-        for legend in legends:
-            if id(legend) not in seen:
-                unique.append(legend)
-                seen.add(id(legend))
-        return unique
-
-    def _find_direct_parent(self, parent: Artist, target: Artist, seen=None):
-        if seen is None:
-            seen = set()
-        if id(parent) in seen:
-            return None
-        seen.add(id(parent))
-
-        children = get_artist_children(parent)
-        if target in children:
-            return parent
-        for child in children:
-            found = self._find_direct_parent(child, target, seen)
-            if found is not None:
-                return found
-        return None
-
-    def _artist_parent(self, artist: Artist):
-        if isinstance(artist, Figure):
-            return None
-        if isinstance(artist, Legend):
-            return getattr(artist, "parent", None) or artist.figure
-        if isinstance(artist, Text):
-            label_axes = checkXLabel(artist) or checkYLabel(artist)
-            if label_axes is not None:
-                return label_axes
-        for legend in self._known_legends():
-            if artist in get_artist_children(legend):
-                return legend
-        found = self._find_direct_parent(self.figure, artist)
-        if found is not None:
-            return found
-        axes = getattr(artist, "axes", None)
-        if axes is not None and axes is not artist:
-            return axes
-        figure = getattr(artist, "figure", None)
-        if figure is not None and figure is not artist:
-            return figure
-        return None
-
-    def _ancestor_chain(self, artist: Artist) -> list[Artist]:
-        chain = []
-        current = artist
-        seen = set()
-        while current is not None and id(current) not in seen:
-            seen.add(id(current))
-            if isinstance(current, Figure):
-                break
-            chain.append(current)
-            current = self._artist_parent(current)
-        return chain
-
     @staticmethod
     def _unique_wrappers(wrappers: Iterable[TargetWrapper]) -> list[TargetWrapper]:
         unique = []
@@ -484,60 +408,14 @@ class GrabbableRectangleSelection(GrabFunctions):
             unique.append(wrapper)
         return unique
 
-    def _drag_wrapper(self, target: TargetWrapper) -> TargetWrapper:
-        """Return the artist that should receive drag transforms."""
-        parent = self._artist_parent(target.target)
-        if isinstance(parent, Legend) and target.target is not parent:
-            return TargetWrapper(parent)
-        return target
-
     def _resolve_alignment_items(self) -> list[tuple[TargetWrapper, TargetWrapper]]:
-        """Return pairs of selected measurement wrapper and same-layer move wrapper."""
-        if len(self.targets) <= 1:
-            return [(target, target) for target in self.targets]
+        """Measure and move the exact artists selected by the user.
 
-        chains = [self._ancestor_chain(target.target) for target in self.targets]
-        if any(len(chain) == 0 for chain in chains):
-            raise ValueError("Selected object has no parent layer.")
-
-        best_indices = None
-        best_score = None
-
-        def visit(indices: list[int], index: int) -> None:
-            nonlocal best_indices, best_score
-            if index == len(chains):
-                candidates = [chains[i][indices[i]] for i in range(len(chains))]
-                parents = [self._artist_parent(candidate) for candidate in candidates]
-                if any(parent is None for parent in parents):
-                    return
-                if len({id(parent) for parent in parents}) != 1:
-                    return
-                score = (max(indices), sum(indices), tuple(indices))
-                if best_score is None or score < best_score:
-                    best_score = score
-                    best_indices = tuple(indices)
-                return
-            for candidate_index in range(len(chains[index])):
-                indices.append(candidate_index)
-                visit(indices, index + 1)
-                indices.pop()
-
-        visit([], 0)
-        if best_indices is None:
-            raise ValueError("Selected objects do not resolve to one parent layer.")
-
-        wrappers_by_artist = {
-            id(target.target): target for target in self.targets
-        }
-        items = []
-        for target, chain, chain_index in zip(self.targets, chains, best_indices):
-            move_artist = chain[chain_index]
-            move_wrapper = wrappers_by_artist.get(id(move_artist))
-            if move_wrapper is None:
-                move_wrapper = TargetWrapper(move_artist)
-                wrappers_by_artist[id(move_artist)] = move_wrapper
-            items.append((target, move_wrapper))
-        return items
+        Every wrapper accepts display-space deltas, so alignment no longer needs
+        to promote children to an ancestor merely to find a shared coordinate
+        system.
+        """
+        return [(target, target) for target in self.targets]
 
     def _delta_plan(
         self,
@@ -574,22 +452,10 @@ class GrabbableRectangleSelection(GrabFunctions):
         self, measure_target: TargetWrapper, move_target: TargetWrapper
     ) -> np.ndarray:
         """Return display-space bounds used to compute alignment deltas."""
-        if measure_target.target is move_target.target:
-            return np.array(measure_target.get_positions(), dtype=float)
-        if isinstance(measure_target.target, (Text, Legend, Line2D)):
-            bbox = measure_target.target.get_window_extent(
-                self.figure.canvas.get_renderer()
-            )
-            return np.array([[bbox.x0, bbox.y0], [bbox.x1, bbox.y1]], dtype=float)
-        points = np.array(measure_target.get_positions(), dtype=float)
-        if points.shape[0] == 3:
-            return points[1:]
-        return points
+        return np.array(measure_target.get_selection_points(), dtype=float)
 
     @staticmethod
     def _measure_size(points: np.ndarray, y: int, direct_target: bool) -> float:
-        if direct_target:
-            return np.diff(points[:, y])[0]
         return np.max(points[:, y]) - np.min(points[:, y])
 
     def align_points(self, mode: str):
@@ -714,8 +580,6 @@ class GrabbableRectangleSelection(GrabFunctions):
     @staticmethod
     def _points_bounds(points: np.ndarray) -> np.ndarray:
         """Return x0, y0, x1, y1 bounds for a TargetWrapper point set."""
-        if points.shape[0] == 3:
-            points = points[1:]
         return np.array(
             [
                 np.min(points[:, 0]),
@@ -741,7 +605,7 @@ class GrabbableRectangleSelection(GrabFunctions):
             keep_aspect_ratio = self.lock_aspect_ratio
 
         match_width, match_height = modes[mode]
-        reference_points = np.array(self.targets[0].get_positions(), dtype=float)
+        reference_points = np.array(self.targets[0].get_selection_points(), dtype=float)
         reference_bounds = self._points_bounds(reference_points)
         reference_width = reference_bounds[2] - reference_bounds[0]
         reference_height = reference_bounds[3] - reference_bounds[1]
@@ -750,7 +614,9 @@ class GrabbableRectangleSelection(GrabFunctions):
         if match_height and reference_height <= 0:
             raise ValueError("Reference object has no height.")
 
-        non_scalable = [target.target for target in self.targets[1:] if not target.do_scale]
+        non_scalable = [
+            target.target for target in self.targets[1:] if not target.do_scale
+        ]
         if non_scalable:
             names = ", ".join(type(target).__name__ for target in non_scalable)
             raise ValueError(f"Selected object cannot be resized: {names}")
@@ -758,7 +624,9 @@ class GrabbableRectangleSelection(GrabFunctions):
         planned: list[tuple[TargetWrapper, np.ndarray, np.ndarray]] = []
         for target in self.targets[1:]:
             points = np.array(target.get_positions(), dtype=float)
-            bounds = self._points_bounds(points)
+            bounds = self._points_bounds(
+                np.array(target.get_selection_points(), dtype=float)
+            )
             current_width = bounds[2] - bounds[0]
             current_height = bounds[3] - bounds[1]
             if match_width and current_width <= 0:
@@ -930,27 +798,17 @@ class GrabbableRectangleSelection(GrabFunctions):
             for index, target in enumerate(self.targets):
                 new_points = None
                 if use_previous_offset:
-                    new_points = getattr(self, "move_current_positions", {}).get(
+                    new_points = getattr(self, "move_current_selection_points", {}).get(
                         id(target.target)
                     )
                 if new_points is None:
-                    new_points = np.array(
-                        target.get_positions(use_previous_offset)
-                    )
-                if new_points.shape[0] == 3:
-                    x0, y0, x1, y1 = (
-                        np.min(new_points[1:, 0]),
-                        np.min(new_points[1:, 1]),
-                        np.max(new_points[1:, 0]),
-                        np.max(new_points[1:, 1]),
-                    )
-                else:
-                    x0, y0, x1, y1 = (
-                        np.min(new_points[:, 0]),
-                        np.min(new_points[:, 1]),
-                        np.max(new_points[:, 0]),
-                        np.max(new_points[:, 1]),
-                    )
+                    new_points = np.array(target.get_selection_points())
+                x0, y0, x1, y1 = (
+                    np.min(new_points[:, 0]),
+                    np.min(new_points[:, 1]),
+                    np.max(new_points[:, 0]),
+                    np.max(new_points[:, 1]),
+                )
                 w0, h0 = x1 - x0, y1 - y0
                 for i in range(2):
                     rect = self.targets_rects[index * 2 + i]
@@ -1000,8 +858,8 @@ class GrabbableRectangleSelection(GrabFunctions):
         self.hide_grabber()
 
     def do_target_scale(self) -> bool:
-        """if any of the elements in the selection allows scaling"""
-        return np.any([target.do_scale for target in self.targets])
+        """Only expose resize handles when every selected artist can scale."""
+        return bool(self.targets) and all(target.do_scale for target in self.targets)
 
     def do_change_aspect_ratio(self) -> bool:
         """if any of the element sin the selection wants to perserve its aspect ratio"""
@@ -1029,6 +887,10 @@ class GrabbableRectangleSelection(GrabFunctions):
         """the inverse transformation for the current displacement and scaling of the selection"""
         x, y = self.p1
         w, h = self.size()
+        if not np.isfinite(w) or abs(w) < np.finfo(float).eps:
+            w = np.copysign(np.finfo(float).eps, w if w else 1.0)
+        if not np.isfinite(h) or abs(h) < np.finfo(float).eps:
+            h = np.copysign(np.finfo(float).eps, h if h else 1.0)
         return np.array(
             [[1.0 / w, 0, -x / w], [0, 1.0 / h, -y / h], [0, 0, 1]], dtype=float
         )
@@ -1058,7 +920,9 @@ class GrabbableRectangleSelection(GrabFunctions):
                 target = TargetWrapper(target)
                 target.restore_state(state)
             for target in selected_targets:
-                self.add_target(target)
+                self.add_target(target, update=False)
+            if self.targets:
+                self.update_extent()
 
         return undo
 
@@ -1070,58 +934,58 @@ class GrabbableRectangleSelection(GrabFunctions):
         self.hide_grabber()
         self.has_moved = False
         self.defer_current_move = bool(self.defer_artist_updates)
-        self.move_drag_targets = {
-            id(target.target): self._drag_wrapper(target) for target in self.targets
-        }
-        drag_targets = self._unique_wrappers(self.move_drag_targets.values())
-        self.save_targets = self._unique_wrappers(
-            list(save_targets or self.targets) + drag_targets
-        )
-        for target in self._unique_wrappers(
-            list(self.targets) + drag_targets + self.save_targets
-        ):
+        self.save_targets = self._unique_wrappers(save_targets or self.targets)
+        for target in self._unique_wrappers(list(self.targets) + self.save_targets):
             target.refresh_offset()
         self.move_start_positions = {
             id(target.target): np.array(target.get_positions(), dtype=float)
             for target in self.targets
         }
-        self.move_drag_start_positions = {
-            id(target.target): np.array(target.get_positions(), dtype=float)
-            for target in drag_targets
+        self.move_start_selection_points = {
+            id(target.target): np.array(target.get_selection_points(), dtype=float)
+            for target in self.targets
         }
         self.move_current_positions = {}
-        self.move_drag_current_positions = {}
+        self.move_current_selection_points = {}
 
         self.store_start = self.get_save_point(self.save_targets)
 
     @staticmethod
     def _clear_preview(target: TargetWrapper):
-        try:
-            delattr(target.target, "_pylustrator_preview_positions")
-        except AttributeError:
-            pass
+        for attribute in (
+            "_pylustrator_preview_positions",
+            "_pylustrator_preview_selection_points",
+        ):
+            try:
+                delattr(target.target, attribute)
+            except AttributeError:
+                pass
         setattr(target.target, "_pylustrator_cached_get_extend", None)
 
     def clear_move_previews(self):
-        targets = list(getattr(self, "targets", [])) + list(
-            getattr(self, "move_drag_targets", {}).values()
-        )
-        for target in self._unique_wrappers(targets):
+        for target in self._unique_wrappers(getattr(self, "targets", [])):
             self._clear_preview(target)
 
-    def _set_preview_positions(self, target: TargetWrapper, points: np.ndarray):
+    def _set_preview_positions(
+        self,
+        target: TargetWrapper,
+        points: np.ndarray,
+        selection_points: np.ndarray = None,
+    ):
         target.target._pylustrator_preview_positions = [
             np.array(point, dtype=float).copy() for point in points
         ]
+        if selection_points is not None:
+            target.target._pylustrator_preview_selection_points = [
+                np.array(point, dtype=float).copy() for point in selection_points
+            ]
         setattr(target.target, "_pylustrator_cached_get_extend", None)
 
     def _commit_deferred_positions(self):
         if not getattr(self, "defer_current_move", False):
             return
-        for target in self._unique_wrappers(
-            getattr(self, "move_drag_targets", {}).values()
-        ):
-            points = self.move_drag_current_positions.get(id(target.target))
+        for target in self.targets:
+            points = self.move_current_positions.get(id(target.target))
             if points is None:
                 continue
             self._clear_preview(target)
@@ -1148,10 +1012,9 @@ class GrabbableRectangleSelection(GrabFunctions):
                 elif hasattr(canvas, "draw_idle"):
                     canvas.draw_idle()
         self.move_start_positions = {}
-        self.move_drag_start_positions = {}
+        self.move_start_selection_points = {}
         self.move_current_positions = {}
-        self.move_drag_current_positions = {}
-        self.move_drag_targets = {}
+        self.move_current_selection_points = {}
         self.defer_current_move = False
 
     def addOffset(self, pos: Sequence, dir: int, keep_aspect_ratio: bool = True):
@@ -1205,34 +1068,22 @@ class GrabbableRectangleSelection(GrabFunctions):
         )
         transform = np.dot(self.get_trans_matrix(), start_inv_transform)
         start_positions = getattr(self, "move_start_positions", {})
-        drag_start_positions = getattr(self, "move_drag_start_positions", {})
+        start_selection_points = getattr(self, "move_start_selection_points", {})
         self.move_current_positions = {}
-        self.move_drag_current_positions = {}
+        self.move_current_selection_points = {}
         for target in self.targets:
             points = start_positions.get(id(target.target))
             if points is None:
                 points = np.array(target.get_positions(), dtype=float)
             points = self.apply_transform(transform, points)
             self.move_current_positions[id(target.target)] = points
+            selection_points = start_selection_points.get(id(target.target))
+            if selection_points is None:
+                selection_points = np.array(target.get_selection_points(), dtype=float)
+            selection_points = self.apply_transform(transform, selection_points)
+            self.move_current_selection_points[id(target.target)] = selection_points
             if getattr(self, "defer_current_move", False):
-                self._set_preview_positions(target, points)
-
-        drag_targets = self._unique_wrappers(
-            getattr(self, "move_drag_targets", {}).values()
-        )
-        if not drag_targets:
-            drag_targets = self.targets
-        for target in drag_targets:
-            points = drag_start_positions.get(id(target.target))
-            if points is None:
-                points = start_positions.get(id(target.target))
-            if points is None:
-                points = np.array(target.get_positions(), dtype=float)
-            points = self.apply_transform(transform, points)
-            self.move_drag_current_positions[id(target.target)] = points
-            if getattr(self, "defer_current_move", False):
-                if target.target in [selected.target for selected in self.targets]:
-                    self._set_preview_positions(target, points)
+                self._set_preview_positions(target, points, selection_points)
             else:
                 target.set_positions(points)
 
@@ -1334,12 +1185,21 @@ class DragManager:
     def __init__(self, figure: Figure, no_save):
         self.figure = figure
         self.figure.figure_dragger = self
+        self._selectable_artists = []
+        self._selectable_artist_ids = set()
+        self._uneditable_artists = []
+        self._uneditable_artist_ids = set()
+        self._interaction_artists = []
+        self._interaction_artist_ids = set()
+        self._selection_parent_by_id = {}
+        self._draw_child_orders = {}
         self.marquee_select_containers_only = False
         self.marquee_start = None
         self.marquee_rect = None
         self.marquee_active = False
         self.marquee_additive = False
         self.marquee_click_element = None
+        self._last_pick_blocked = False
 
         self.figure.canvas.mpl_disconnect(
             self.figure.canvas.manager.key_press_handler_id
@@ -1368,6 +1228,14 @@ class DragManager:
         self.c5 = self.figure.canvas.mpl_connect(
             "motion_notify_event", self.motion_notify_event0
         )
+        self.c6 = self.figure.canvas.mpl_connect(
+            "draw_event", self.invalidate_geometry_cache
+        )
+
+    def invalidate_geometry_cache(self, _event=None):
+        """Drop visible-bound caches after any render/transform change."""
+        for artist in getattr(self, "_selectable_artists", []):
+            setattr(artist, "_pylustrator_cached_get_extend", None)
 
     def deactivate(self):
         """deactivate the interaction callbacks from the figure"""
@@ -1375,59 +1243,116 @@ class DragManager:
         self.figure.canvas.mpl_disconnect(self.c2)
         self.figure.canvas.mpl_disconnect(self.c4)
         self.figure.canvas.mpl_disconnect(self.c5)
+        self.figure.canvas.mpl_disconnect(self.c6)
 
         self.selection.clear_targets()
         self.selected_element = None
         self.on_select(None, None)
         self.figure.canvas.draw()
 
-    def make_draggable(self, target: Artist):
+    def make_draggable(self, target: Artist, parent: Artist = None):
         """make an artist draggable"""
-        target.set_picker(True)
+        if not hasattr(self, "_selectable_artists"):
+            self._selectable_artists = []
+            self._selectable_artist_ids = set()
+            self._uneditable_artists = []
+            self._uneditable_artist_ids = set()
+            self._interaction_artists = []
+            self._interaction_artist_ids = set()
+            self._selection_parent_by_id = {}
+            self._draw_child_orders = {}
+        if not hasattr(self, "_uneditable_artists"):
+            self._uneditable_artists = []
+            self._uneditable_artist_ids = set()
+        if not hasattr(self, "_interaction_artists"):
+            self._interaction_artists = []
+            self._interaction_artist_ids = set()
+        if parent is None:
+            if isinstance(target, Legend):
+                parent = getattr(target, "parent", None)
+            if parent is None:
+                parent = getattr(target, "axes", None)
+            if parent is target or parent is None:
+                parent = getattr(target, "figure", None)
+        if parent is not None and parent is not target:
+            self._selection_parent_by_id[id(target)] = parent
+        if id(target) not in self._interaction_artist_ids:
+            self._interaction_artists.append(target)
+            self._interaction_artist_ids.add(id(target))
+            self._draw_child_orders = {}
+        if not TargetWrapper.supports_target(target):
+            if (
+                id(target) not in self._selectable_artist_ids
+                and id(target) not in self._uneditable_artist_ids
+            ):
+                self._uneditable_artists.append(target)
+                self._uneditable_artist_ids.add(id(target))
+            return False
+        if id(target) not in self._selectable_artist_ids:
+            self._selectable_artists.append(target)
+            self._selectable_artist_ids.add(id(target))
+        target._pylustrator_explicitly_editable = True
+        if not target.pickable():
+            target.set_picker(True)
         if isinstance(target, Text):
             add_text_default(target)
-            target.set_bbox(dict(facecolor="none", edgecolor="none"))
         if isinstance(target, Legend):
             for handle in target.legend_handles:
-                self.make_draggable(handle)
+                self.make_draggable(handle, target)
             for text in target.get_texts():
-                self.make_draggable(text)
+                self.make_draggable(text, target)
             title = target.get_title()
             if title is not None:
-                self.make_draggable(title)
+                self.make_draggable(title, target)
+        return True
 
-    def make_axes_draggable(self, axes: list[Axes]) -> None:
+    def make_axes_draggable(self, axes: list[Axes], parent: Artist = None) -> None:
         for index, ax in enumerate(axes):
             ax.set_picker(True)
             leg = ax.get_legend()
             if leg:
-                self.make_draggable(leg)
+                self.make_draggable(leg, ax)
+            for artist in ax.artists:
+                self.make_draggable(artist, ax)
             for text in ax.texts:
-                self.make_draggable(text)
+                self.make_draggable(text, ax)
             for attribute_name in ["title", "_left_title", "_right_title"]:
                 text = getattr(ax, attribute_name, None)
                 if text is not None:
-                    self.make_draggable(text)
+                    self.make_draggable(text, ax)
             for patch in ax.patches:
-                self.make_draggable(patch)
-            self.make_draggable(ax.xaxis.get_label())
-            self.make_draggable(ax.yaxis.get_label())
-            self.make_draggable(ax)
-            self.make_axes_draggable(ax.child_axes)
+                self.make_draggable(patch, ax)
+            for line in ax.lines:
+                self.make_draggable(line, ax)
+            for collection in ax.collections:
+                self.make_draggable(collection, ax)
+            for image in ax.images:
+                self.make_draggable(image, ax)
+            self.make_draggable(ax.xaxis.get_label(), ax)
+            self.make_draggable(ax.yaxis.get_label(), ax)
+            self.make_draggable(ax, parent or ax.figure or self.figure)
+            self.make_axes_draggable(ax.child_axes, parent=ax)
 
     def make_figure_draggable(self, fig: Figure | SubFigure) -> None:
+        for artist in fig.artists:
+            self.make_draggable(artist, fig)
         for text in fig.texts:
-            self.make_draggable(text)
+            self.make_draggable(text, fig)
         for patch in fig.patches:
-            self.make_draggable(patch)
+            self.make_draggable(patch, fig)
         for leg in fig.legends:
-            self.make_draggable(leg)
+            self.make_draggable(leg, fig)
         for subfig in fig.subfigs:
             self.make_figure_draggable(subfig)
 
     def iter_selectable_artists(
         self, element: Artist = None, seen: set[int] = None
     ) -> Iterable[Artist]:
+        if element is None and hasattr(self, "_selectable_artists"):
+            for artist in self._selectable_artists:
+                if self._is_pick_candidate(artist, explicit=True):
+                    yield artist
+            return
         if element is None:
             element = self.figure
         if seen is None:
@@ -1445,6 +1370,8 @@ class DragManager:
     def _is_pick_candidate(
         self, child: Artist, event: MouseEvent = None, explicit: bool = False
     ) -> bool:
+        if getattr(child, "figure", None) is None:
+            return False
         if not child.get_visible():
             return False
         if isinstance(child, Text) and child.get_text() == "":
@@ -1462,9 +1389,28 @@ class DragManager:
         return self._resolve_selectable_artist(child) is not None
 
     @staticmethod
+    def _is_interaction_hit(artist: Artist, event: MouseEvent) -> bool:
+        """Return whether an explicitly discovered foreground artist was hit.
+
+        Unsupported foreground objects must participate in hit ordering even
+        though they cannot become selection targets.  Otherwise a click passes
+        through them and selects a containing Axes, recreating the dangerous
+        "clicked child, moved parent" behaviour through a different code path.
+        """
+        if getattr(artist, "figure", None) is None or not artist.get_visible():
+            return False
+        try:
+            return bool(artist.contains(event)[0])
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            return False
+
+    @staticmethod
     def _artist_has_selection_geometry(artist: Artist) -> bool:
         try:
-            points = np.array(TargetWrapper(artist).get_positions(), dtype=float)
+            target = TargetWrapper(artist)
+            if not target.supported:
+                return False
+            points = np.array(target.get_selection_points(), dtype=float)
         except (AttributeError, TypeError, ValueError, RuntimeError):
             return False
         return (
@@ -1479,13 +1425,6 @@ class DragManager:
             return None
         if self._artist_has_selection_geometry(artist):
             return artist
-        axes = getattr(artist, "axes", None)
-        if (
-            axes is not None
-            and axes is not artist
-            and self._artist_has_selection_geometry(axes)
-        ):
-            return axes
         return None
 
     def _resolve_selectable_elements(
@@ -1500,6 +1439,16 @@ class DragManager:
         return resolved, primary
 
     def _artist_contains_descendant(self, parent: Artist, descendant: Artist) -> bool:
+        parent_map = getattr(self, "_selection_parent_by_id", {})
+        if id(descendant) in parent_map:
+            current = parent_map.get(id(descendant))
+            seen = set()
+            while current is not None and id(current) not in seen:
+                if current is parent:
+                    return True
+                seen.add(id(current))
+                current = parent_map.get(id(current))
+            return False
         for child, _explicit in iter_artist_children(parent):
             if child is descendant:
                 return True
@@ -1519,39 +1468,62 @@ class DragManager:
             if element is not None and element not in unique:
                 unique.append(element)
 
+        unique_by_id = {id(element): element for element in unique}
+        parent_map = getattr(self, "_selection_parent_by_id", {})
+        remove_ids = set()
+        for descendant in unique:
+            current = parent_map.get(id(descendant))
+            seen = set()
+            while current is not None and id(current) not in seen:
+                current_id = id(current)
+                seen.add(current_id)
+                if current_id in unique_by_id:
+                    if _container_keeps_children(current) or (
+                        prefer_containers and _container_yields_to_children(current)
+                    ):
+                        remove_ids.add(id(descendant))
+                    elif (
+                        _container_yields_to_children(current)
+                        and not (preserve_axes and isinstance(current, Axes))
+                        and not prefer_containers
+                    ):
+                        remove_ids.add(current_id)
+                current = parent_map.get(current_id)
+
+        # Programmatic callers may submit supported artists before the manager
+        # has registered their semantic parent.  Keep the recursive fallback
+        # for only those rare objects instead of paying O(n^2) for every marquee.
+        for descendant in unique:
+            if id(descendant) in parent_map:
+                continue
+            for possible_parent in unique:
+                if possible_parent is descendant or not self._artist_contains_descendant(
+                    possible_parent, descendant
+                ):
+                    continue
+                if _container_keeps_children(possible_parent) or (
+                    prefer_containers
+                    and _container_yields_to_children(possible_parent)
+                ):
+                    remove_ids.add(id(descendant))
+                elif (
+                    _container_yields_to_children(possible_parent)
+                    and not (
+                        preserve_axes and isinstance(possible_parent, Axes)
+                    )
+                    and not prefer_containers
+                ):
+                    remove_ids.add(id(possible_parent))
+
         normalized = [
-            element
-            for element in unique
-            if not any(
-                other is not element
-                and (
-                    (
-                        _container_yields_to_children(element)
-                        and not (preserve_axes and isinstance(element, Axes))
-                        and not (
-                            prefer_containers
-                            and _container_yields_to_children(element)
-                        )
-                        and self._artist_contains_descendant(element, other)
-                    )
-                    or (
-                        (
-                            _container_keeps_children(other)
-                            or (
-                                prefer_containers
-                                and _container_yields_to_children(other)
-                            )
-                        )
-                        and self._artist_contains_descendant(other, element)
-                    )
-                )
-                for other in unique
-            )
+            element for element in unique if id(element) not in remove_ids
         ]
 
         if primary not in normalized:
             for element in normalized:
-                if primary is not None and self._artist_contains_descendant(primary, element):
+                if primary is not None and self._artist_contains_descendant(
+                    primary, element
+                ):
                     primary = element
                     break
             else:
@@ -1568,6 +1540,82 @@ class DragManager:
         """get the picked element that an event refers to.
         To implement selection of elements at the back with multiple clicks.
         """
+        if element is None and hasattr(self, "_selectable_artists"):
+            picked = picked_element
+            blocked = object()
+            self._last_pick_blocked = False
+            selectable_ids = self._selectable_artist_ids
+            interaction_artists = [
+                (artist, id(artist) in selectable_ids)
+                for artist in getattr(
+                    self, "_interaction_artists", self._selectable_artists
+                )
+            ]
+            registration_order = {
+                id(artist): index
+                for index, (artist, _editable) in enumerate(interaction_artists)
+            }
+            parent_map = getattr(self, "_selection_parent_by_id", {})
+            child_orders: dict[int, dict[int, int]] = getattr(
+                self, "_draw_child_orders", {}
+            )
+            self._draw_child_orders = child_orders
+
+            def semantic_parent(artist):
+                parent = parent_map.get(id(artist))
+                if parent is None and isinstance(artist, SubFigure):
+                    parent = getattr(artist, "_parent", None)
+                return parent
+
+            def child_order(parent, child, fallback):
+                parent_key = id(parent)
+                if parent_key not in child_orders:
+                    try:
+                        children = get_artist_children(parent)
+                    except (AttributeError, TypeError, ValueError, RuntimeError):
+                        children = []
+                    child_orders[parent_key] = {
+                        id(item): index for index, item in enumerate(children)
+                    }
+                return child_orders[parent_key].get(id(child), fallback)
+
+            def pick_order(entry):
+                index, (artist, _editable) = entry
+                path = []
+                current = artist
+                seen = set()
+                while current is not None and not isinstance(current, Figure):
+                    current_key = id(current)
+                    if current_key in seen:
+                        break
+                    seen.add(current_key)
+                    parent = semantic_parent(current)
+                    fallback = registration_order.get(current_key, index)
+                    order = (
+                        child_order(parent, current, fallback)
+                        if parent is not None
+                        else fallback
+                    )
+                    path.append((float(current.get_zorder()), order))
+                    current = parent
+                return tuple(reversed(path)), index
+
+            candidates = sorted(
+                enumerate(interaction_artists),
+                key=pick_order,
+            )
+            for _index, (candidate, editable) in candidates:
+                if not self._is_interaction_hit(candidate, event):
+                    continue
+                if not editable or self._resolve_selectable_artist(candidate) is None:
+                    picked = blocked
+                    continue
+                if candidate is last_selected:
+                    self._last_pick_blocked = picked is blocked
+                    return (None if self._last_pick_blocked else picked), True
+                picked = candidate
+            self._last_pick_blocked = picked is blocked
+            return (None if self._last_pick_blocked else picked), False
         # start with the figure
         if element is None:
             element = self.figure
@@ -1623,7 +1671,9 @@ class DragManager:
         pen = QtGui.QPen(QtGui.QColor("#1E88E5"), 1)
         pen.setStyle(QtCore.Qt.DashLine)
         brush = QtGui.QBrush(QtGui.QColor(30, 136, 229, 24))
-        self.marquee_rect = QtWidgets.QGraphicsRectItem(0, 0, 0, 0, self.figure._pyl_scene)
+        self.marquee_rect = QtWidgets.QGraphicsRectItem(
+            0, 0, 0, 0, self.figure._pyl_scene
+        )
         self.marquee_rect.setPen(pen)
         self.marquee_rect.setBrush(brush)
         self.marquee_rect.setZValue(899)
@@ -1654,7 +1704,9 @@ class DragManager:
         if start is None:
             return
         if active:
-            self.select_elements_in_bbox(start[0], start[1], event.x, event.y, additive=additive)
+            self.select_elements_in_bbox(
+                start[0], start[1], event.x, event.y, additive=additive
+            )
         else:
             self.select_element(click_element, event)
 
@@ -1683,13 +1735,29 @@ class DragManager:
         return ax1 >= x0 and ax0 <= x1 and ay1 >= y0 and ay0 <= y1
 
     @staticmethod
-    def _artist_display_bounds(artist: Artist) -> tuple[float, float, float, float] | None:
-        points = np.array(TargetWrapper(artist).get_positions())
+    def _artist_display_bounds(
+        artist: Artist,
+    ) -> tuple[float, float, float, float] | None:
+        points = np.array(TargetWrapper(artist).get_selection_points())
         if len(points) == 0:
             return None
         ax0, ay0 = np.min(points[:, 0]), np.min(points[:, 1])
         ax1, ay1 = np.max(points[:, 0]), np.max(points[:, 1])
         return float(ax0), float(ay0), float(ax1), float(ay1)
+
+    def _uneditable_artist_display_bounds(
+        self, artist: Artist
+    ) -> tuple[float, float, float, float] | None:
+        if getattr(artist, "figure", None) is None:
+            return None
+        try:
+            bbox = artist.get_window_extent(self.figure.canvas.get_renderer())
+            bounds = np.asarray(bbox.extents, dtype=float)
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            return None
+        if bounds.shape != (4,) or not np.all(np.isfinite(bounds)):
+            return None
+        return tuple(float(value) for value in bounds)
 
     def select_elements_in_bbox(
         self, x0: float, y0: float, x1: float, y1: float, additive: bool = False
@@ -1702,21 +1770,38 @@ class DragManager:
             for artist in artists
             if self._artist_intersects_bbox(artist, x0, y0, x1, y1)
         ]
-        prefer_containers = bool(
-            getattr(self, "marquee_select_containers_only", False)
-        )
-        selected_elements, _ = self._normalize_selection(
-            elements,
-            preserve_axes=prefer_containers,
-            prefer_containers=prefer_containers,
-        )
+        prefer_containers = bool(getattr(self, "marquee_select_containers_only", False))
+        if not prefer_containers:
+            blockers = [
+                artist
+                for artist in getattr(self, "_uneditable_artists", [])
+                if (
+                    (bounds := self._uneditable_artist_display_bounds(artist))
+                    is not None
+                    and self._bounds_intersect(*bounds, x0, y0, x1, y1)
+                )
+            ]
+            if blockers:
+                elements = [
+                    element
+                    for element in elements
+                    if not (
+                        _container_yields_to_children(element)
+                        and any(
+                            self._artist_contains_descendant(element, blocker)
+                            for blocker in blockers
+                        )
+                    )
+                ]
         if elements or not additive:
-            self.select_elements(
+            selected_elements = self.select_elements(
                 elements,
                 additive=additive,
                 preserve_axes=prefer_containers,
                 prefer_containers=prefer_containers,
             )
+        else:
+            selected_elements = []
         return selected_elements
 
     def button_release_event0(self, event: MouseEvent):
@@ -1750,9 +1835,16 @@ class DragManager:
             )
 
             # if the element is a grabber, store it
+            if getattr(self, "_last_pick_blocked", False):
+                self._start_marquee_selection(event)
+                return
             if isinstance(picked_element, GrabberGeneric):
                 self.grab_element = picked_element
-            elif isinstance(picked_element, Axes) and not contained and not event.dblclick:
+            elif (
+                isinstance(picked_element, Axes)
+                and not contained
+                and not event.dblclick
+            ):
                 self._start_marquee_selection(event, click_element=picked_element)
                 return
             elif picked_element is None and not contained:
@@ -1803,19 +1895,26 @@ class DragManager:
 
         current = [target.target for target in self.selection.targets]
         if primary == self.selected_element and current == elements:
-            return
+            return elements
 
         self.selection.clear_targets()
 
         for element in elements:
             if element != primary:
-                self.selection.add_target(element)
+                self.selection.add_target(element, update=False)
 
         if primary is not None:
-            self.on_select(primary, event)
+            self.selection._batch_add_targets = True
+            try:
+                self.on_select(primary, event)
+            finally:
+                self.selection._batch_add_targets = False
         else:
             self.on_select(None, event)
         self.selected_element = primary
+        if self.selection.targets:
+            self.selection.update_extent()
+        return elements
 
     def on_deselect(self, event: MouseEvent):
         """deselect currently selected artists"""
@@ -1827,7 +1926,10 @@ class DragManager:
     def on_select(self, element: Artist, event: MouseEvent):
         """when an artist is selected"""
         if element is not None:
-            self.selection.add_target(element)
+            self.selection.add_target(
+                element,
+                update=not getattr(self.selection, "_batch_add_targets", False),
+            )
 
     def undo(self):
         print("back edit")

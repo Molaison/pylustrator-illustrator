@@ -113,7 +113,7 @@ class TestText(BaseTest):
 
         self.change_property2(
             "position",
-            [(0.55, 0.2), (0.472, 0.6)],
+            [(0.5170, 0.2), (0.4, 0.6)],
             lambda _: fig.window.input_align.buttons[1].clicked.emit(0),
             get_text,
             line_command,
@@ -158,7 +158,7 @@ class TestText(BaseTest):
 
         self.change_property2(
             "position",
-            [(0.2, 0.404), (0.6, 0.404)],
+            [(0.2, 0.4), (0.6, 0.4)],
             lambda _: fig.window.input_align.buttons[5].clicked.emit(0),
             get_text,
             line_command,
@@ -213,7 +213,7 @@ class TestText(BaseTest):
 
         self.change_property2(
             "position",
-            [(0.2, 0.2), (1.0301, 0.6), (0.5, 0.5)],
+            [(0.2, 0.2), (0.6, 0.6), (0.5, 0.5)],
             lambda _: fig.window.input_align.buttons[3].clicked.emit(0),
             get_text,
             line_command,
@@ -230,7 +230,7 @@ class TestText(BaseTest):
 
         self.change_property2(
             "position",
-            [(0.2, 0.2), (0.6, 0.6460), (0.5, 0.5)],
+            [(0.2, 0.2), (0.6, 0.6), (0.5, 0.5)],
             lambda _: fig.window.input_align.buttons[7].clicked.emit(0),
             get_text,
             line_command,

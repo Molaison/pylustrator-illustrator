@@ -5,11 +5,25 @@ import matplotlib
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
+import numpy as np
 from matplotlib.backend_bases import KeyEvent, MouseEvent
-from matplotlib.patches import Patch, RegularPolygon
+from matplotlib.collections import LineCollection, PolyCollection
+from matplotlib.patches import (
+    ConnectionPatch,
+    Ellipse,
+    FancyArrowPatch,
+    FancyBboxPatch,
+    Patch,
+    Rectangle,
+    RegularPolygon,
+    Wedge,
+)
 from qtpy import QtCore, QtGui, QtWidgets
 
-from pylustrator.components.plot_layout import scene_point_to_canvas_pixels, selection_scene_transform
+from pylustrator.components.plot_layout import (
+    scene_point_to_canvas_pixels,
+    selection_scene_transform,
+)
 from pylustrator.components.qpos_and_size import QPosAndSize
 from pylustrator.components.tree_view import MyTreeView
 from pylustrator.drag_helper import (
@@ -153,7 +167,7 @@ class EmptySelection:
 def selection_target_extents(selection):
     extents = []
     for target in selection.targets:
-        points = TargetWrapper(target.target).get_positions()
+        points = TargetWrapper(target.target).get_selection_points()
         x_values = [point[0] for point in points]
         y_values = [point[1] for point in points]
         extents.append((min(x_values), min(y_values), max(x_values), max(y_values)))
@@ -346,7 +360,7 @@ def test_drag_motion_uses_original_display_geometry_for_legend_text() -> None:
     assert app is not None
 
 
-def test_legend_child_drag_moves_parent_legend_without_internal_offset() -> None:
+def test_legend_child_drag_moves_only_selected_child() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
     fig.canvas.draw()
@@ -358,6 +372,7 @@ def test_legend_child_drag_moves_parent_legend_without_internal_offset() -> None
     text_before = text.get_window_extent(renderer).frozen()
     legend_before = legend.get_window_extent(renderer).frozen()
     text_position = text.get_position()
+    anchor_before = legend.get_bbox_to_anchor().bounds
     manager.selection.defer_artist_updates = True
     manager.selection.add_target(text)
 
@@ -373,14 +388,62 @@ def test_legend_child_drag_moves_parent_legend_without_internal_offset() -> None
 
     text_after = text.get_window_extent(renderer)
     legend_after = legend.get_window_extent(renderer)
-    assert text.get_position() == text_position
+    assert text.get_position() != text_position
     assert abs((text_after.x0 - text_before.x0) - 12) < 1e-9
     assert abs((text_after.y0 - text_before.y0) + 7) < 1e-9
-    assert abs((legend_after.x0 - legend_before.x0) - 12) < 1e-9
-    assert abs((legend_after.y0 - legend_before.y0) + 7) < 1e-9
-    assert fig.change_tracker.legend is legend
-    assert fig.change_tracker.legend_change_count == 1
-    assert fig.change_tracker.text_change_count == 0
+    assert legend.get_bbox_to_anchor().bounds == anchor_before
+    assert legend_after.bounds == legend_before.bounds
+    assert fig.change_tracker.legend_change_count == 0
+    assert fig.change_tracker.text is text
+    assert fig.change_tracker.text_change_count == 1
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_extra_axes_legend_is_registered_and_directly_selectable() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    first = ax.legend(handles=[Patch(label="first")], loc="upper left")
+    ax.add_artist(first)
+    current = ax.legend(handles=[Patch(label="current")], loc="upper right")
+    fig.canvas.draw()
+
+    manager = attach_drag_manager(fig)
+    registered = manager._selectable_artists
+
+    assert first in registered
+    assert current in registered
+    assert first.pickable()
+    assert current.pickable()
+    manager.select_element(first)
+    assert manager.selected_element is first
+    assert [target.target for target in manager.selection.targets] == [first]
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_overlapping_legends_follow_matplotlib_draw_order_for_child_hits() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    extra = ax.legend(handles=[Patch(label="same")], loc="center")
+    ax.add_artist(extra)
+    current = ax.legend(handles=[Patch(label="same")], loc="center")
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    current_text = current.get_texts()[0]
+    extra_text = extra.get_texts()[0]
+    bbox = current_text.get_window_extent(fig.canvas.get_renderer())
+    x = (bbox.x0 + bbox.x1) / 2
+    y = (bbox.y0 + bbox.y1) / 2
+    event = MouseEvent("button_press_event", fig.canvas, x, y, button=1)
+
+    assert extra_text.contains(event)[0]
+    assert current_text.contains(event)[0]
+    assert ax.get_children().index(current) > ax.get_children().index(extra)
+    assert manager.get_picked_element(event)[0] is current_text
+
     manager.selection.clear_targets()
     plt.close(fig)
     assert app is not None
@@ -417,6 +480,469 @@ def test_yaxis_label_drag_keeps_selection_box_and_text_together() -> None:
     assert abs(text_after.y0 - text_before.y0) < 1e-9
     assert abs((rect_after[0] - rect_before[0]) + 20) < 1e-9
     assert abs(rect_after[1] - rect_before[1]) < 1e-9
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_annotation_with_mixed_coordinate_systems_moves_as_one_visual_object() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    annotation = ax.annotate(
+        "mixed coords",
+        xy=(0.2, 0.3),
+        xycoords="data",
+        xytext=(0.7, 0.8),
+        textcoords="axes fraction",
+        arrowprops={"arrowstyle": "->"},
+    )
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    renderer = fig.canvas.get_renderer()
+    before = annotation.get_window_extent(renderer).frozen()
+    manager.select_element(annotation)
+
+    manager.selection.start_move()
+    manager.selection.move(
+        (19, -11),
+        DIR_X0 | DIR_X1 | DIR_Y0 | DIR_Y1,
+        [],
+        ignore_snaps=True,
+    )
+    manager.selection.end_move()
+    fig.canvas.draw()
+    manager.selection.update_selection_rectangles()
+
+    after = annotation.get_window_extent(renderer)
+    rect = selection_rect_extents(manager.selection)[0]
+    # Arrow clipping/shrink is recomputed from the translated endpoints and may
+    # move an extreme by a few thousandths of a pixel.
+    assert abs((after.x0 - before.x0) - 19) < 0.02
+    assert abs((after.y0 - before.y0) + 11) < 0.02
+    assert all(
+        abs(actual - selected) < 1e-9 for actual, selected in zip(after.extents, rect)
+    )
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_text_visible_bbox_is_preserved_and_used_for_selection() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    text = ax.text(
+        0.4,
+        0.5,
+        "boxed",
+        bbox={"facecolor": "yellow", "edgecolor": "red", "pad": 8},
+    )
+    fig.canvas.draw()
+    patch = text.get_bbox_patch()
+    facecolor = patch.get_facecolor()
+    manager = attach_drag_manager(fig)
+    fig.canvas.draw()
+    manager.select_element(text)
+    renderer = fig.canvas.get_renderer()
+    patch_bounds = patch.get_window_extent(renderer).extents
+    selection_bounds = np.array(selection_rect_extents(manager.selection)[0])
+
+    assert text.get_bbox_patch() is patch
+    assert text.get_bbox_patch().get_facecolor() == facecolor
+    assert np.allclose(selection_bounds, patch_bounds)
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_regular_polygon_drag_does_not_promote_selection_to_parent_axes() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    polygon = RegularPolygon((0.4, 0.5), 6, radius=0.15, transform=ax.transAxes)
+    ax.add_patch(polygon)
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    renderer = fig.canvas.get_renderer()
+    before = polygon.get_window_extent(renderer).frozen()
+    axes_before = ax.get_position().frozen()
+    center_before = polygon.xy
+
+    manager.select_element(polygon)
+    manager.selection.start_move()
+    manager.selection.move(
+        (16, -8),
+        DIR_X0 | DIR_X1 | DIR_Y0 | DIR_Y1,
+        [],
+        ignore_snaps=True,
+    )
+    manager.selection.end_move()
+    fig.canvas.draw()
+
+    after = polygon.get_window_extent(renderer)
+    assert manager.selected_element is polygon
+    assert ax.get_position().bounds == axes_before.bounds
+    assert abs((after.x0 - before.x0) - 16) < 1e-9
+    assert abs((after.y0 - before.y0) + 8) < 1e-9
+
+    fig.change_tracker.edit[0]()
+    assert np.allclose(polygon.xy, center_before)
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_unsupported_artist_is_not_silently_promoted_to_parent_axes() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    connection = ConnectionPatch(
+        (0.2, 0.3),
+        (0.8, 0.7),
+        coordsA="data",
+        coordsB="axes fraction",
+        axesA=ax,
+        axesB=ax,
+    )
+    ax.add_artist(connection)
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+
+    manager.select_element(connection)
+
+    assert manager.selected_element is None
+    assert manager.selection.targets == []
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_click_on_unsupported_artist_does_not_fall_through_to_parent_axes() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    connection = ConnectionPatch(
+        (0.2, 0.3),
+        (0.8, 0.7),
+        coordsA="data",
+        coordsB="data",
+        axesA=ax,
+        axesB=ax,
+        linewidth=8,
+        zorder=10,
+    )
+    ax.add_artist(connection)
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    x, y = ax.transData.transform((0.5, 0.5))
+    press = MouseEvent("button_press_event", fig.canvas, x, y, button=1)
+    release = MouseEvent("button_release_event", fig.canvas, x, y, button=1)
+
+    assert connection.contains(press)[0]
+    assert connection in manager._uneditable_artists
+    assert manager.get_picked_element(press)[0] is None
+    manager.select_element(ax)
+    assert manager.selected_element is ax
+
+    manager.button_press_event0(press)
+    manager.button_release_event0(release)
+
+    assert manager.selected_element is None
+    assert manager.selection.targets == []
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_marquee_on_unsupported_artist_does_not_select_parent_axes() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    connection = ConnectionPatch(
+        (0.2, 0.3),
+        (0.8, 0.7),
+        coordsA="data",
+        coordsB="data",
+        axesA=ax,
+        axesB=ax,
+        linewidth=8,
+        zorder=10,
+    )
+    ax.add_artist(connection)
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    x, y = ax.transData.transform((0.5, 0.5))
+
+    selected = manager.select_elements_in_bbox(x - 8, y - 8, x + 8, y + 8)
+
+    assert selected == []
+    assert manager.selected_element is None
+    assert manager.selection.targets == []
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_supported_foreground_artist_wins_over_unsupported_blocker() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    connection = ConnectionPatch(
+        (0.2, 0.3),
+        (0.8, 0.7),
+        coordsA="data",
+        coordsB="data",
+        axesA=ax,
+        axesB=ax,
+        linewidth=8,
+        zorder=10,
+    )
+    ax.add_artist(connection)
+    text = ax.text(0.5, 0.5, "top", ha="center", va="center", zorder=20)
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    x, y = ax.transData.transform((0.5, 0.5))
+    event = MouseEvent("button_press_event", fig.canvas, x, y, button=1)
+
+    assert connection.contains(event)[0]
+    assert text.contains(event)[0]
+    assert manager.get_picked_element(event)[0] is text
+    assert not manager._last_pick_blocked
+
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_figure_level_supported_artist_is_registered_and_referenceable() -> None:
+    from pylustrator.change_tracker import getReference
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig = plt.figure(figsize=(4, 3), dpi=100)
+    rectangle = Rectangle(
+        (0.2, 0.3),
+        0.25,
+        0.2,
+        transform=fig.transFigure,
+    )
+    fig.add_artist(rectangle)
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+
+    assert rectangle in manager._selectable_artists
+    assert getReference(rectangle).endswith(".artists[0]")
+    assert eval(getReference(rectangle)) is rectangle
+    manager.select_element(rectangle)
+    assert manager.selected_element is rectangle
+
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_scatter_collection_is_selectable_and_moves_in_its_own_coordinates() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    scatter = ax.scatter([0.2, 0.7], [0.3, 0.8], s=[25, 100])
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    before_offsets = np.asarray(scatter.get_offsets(), dtype=float).copy()
+    before_bounds = TargetWrapper(scatter).get_selection_points().copy()
+
+    manager.select_element(scatter)
+    manager.selection.start_move()
+    manager.selection.move(
+        (14, -6),
+        DIR_X0 | DIR_X1 | DIR_Y0 | DIR_Y1,
+        [],
+        ignore_snaps=True,
+    )
+    manager.selection.end_move()
+    fig.canvas.draw()
+    after_bounds = TargetWrapper(scatter).get_selection_points()
+
+    assert manager.selected_element is scatter
+    assert np.allclose(after_bounds - before_bounds, [14, -6])
+    assert not np.allclose(scatter.get_offsets(), before_offsets)
+    fig.change_tracker.edit[0]()
+    assert np.allclose(scatter.get_offsets(), before_offsets)
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_canvas_click_selects_scatter_instead_of_parent_axes() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    scatter = ax.scatter([0.25, 0.75], [0.3, 0.8], s=180)
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    x, y = ax.transData.transform((0.25, 0.3))
+    press = MouseEvent("button_press_event", fig.canvas, x, y, button=1)
+    release = MouseEvent("button_release_event", fig.canvas, x, y, button=1)
+
+    manager.button_press_event0(press)
+    manager.button_release_event0(release)
+
+    assert manager.selected_element is scatter
+    assert [target.target for target in manager.selection.targets] == [scatter]
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_line_and_poly_collections_move_undo_and_replay_in_native_groups() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    factories = [
+        lambda: LineCollection(
+            [
+                [[0.2, 0.3], [0.8, 0.9]],
+                [[1.0, 0.4], [1.3, 1.2]],
+            ]
+        ),
+        lambda: PolyCollection(
+            [
+                [[0.2, 0.3], [0.8, 0.4], [0.6, 1.1]],
+                [[1.0, 0.2], [1.4, 0.3], [1.2, 0.8]],
+            ]
+        ),
+    ]
+
+    for factory in factories:
+        fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+        collection = factory()
+        ax.add_collection(collection)
+        ax.set_xlim(0, 2)
+        ax.set_ylim(0, 2)
+        fig.canvas.draw()
+        manager = attach_drag_manager(fig)
+        before = TargetWrapper(collection).get_selection_points().copy()
+
+        manager.select_element(collection)
+        manager.selection.start_move()
+        manager.selection.move(
+            (12, -5),
+            DIR_X0 | DIR_X1 | DIR_Y0 | DIR_Y1,
+            [],
+            ignore_snaps=True,
+        )
+        manager.selection.end_move()
+        fig.canvas.draw()
+
+        moved = TargetWrapper(collection).get_selection_points().copy()
+        assert np.allclose(moved - before, [12, -5])
+        command_target, command = fig.change_tracker.change
+        assert command_target is collection
+        fig.change_tracker.edit[0]()
+        fig.canvas.draw()
+        assert np.allclose(TargetWrapper(collection).get_selection_points(), before)
+
+        eval("collection" + command)
+        fig.canvas.draw()
+        assert np.allclose(TargetWrapper(collection).get_selection_points(), moved)
+        manager.selection.clear_targets()
+        plt.close(fig)
+    assert app is not None
+
+
+def test_resize_handles_require_lossless_scaling_for_every_selected_artist() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    scalable = ax.add_patch(Rectangle((0.1, 0.1), 0.2, 0.3))
+    non_scalable = [
+        ax.add_patch(Rectangle((0.4, 0.1), 0.2, 0.3, angle=25)),
+        ax.add_patch(Ellipse((0.5, 0.6), 0.2, 0.3, angle=25)),
+        ax.add_patch(FancyArrowPatch((0.1, 0.8), (0.3, 0.9))),
+        ax.add_patch(FancyBboxPatch((0.4, 0.4), 0.2, 0.2, boxstyle="round,pad=0.1")),
+        ax.add_patch(RegularPolygon((0.7, 0.7), 6, radius=0.1)),
+        ax.add_patch(Wedge((0.8, 0.3), 0.1, 10, 250)),
+        ax.scatter([0.2, 0.3], [0.5, 0.6]),
+    ]
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+
+    manager.select_element(scalable)
+    assert manager.selection.do_target_scale()
+    for artist in non_scalable:
+        assert not TargetWrapper(artist).do_scale
+        manager.select_elements([scalable, artist], primary=artist)
+        assert not manager.selection.do_target_scale()
+
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_non_affine_fancy_bbox_is_blocking_instead_of_inexactly_editable() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    ax.set_xscale("log")
+    fancy = FancyBboxPatch(
+        (0.2, 0.3),
+        0.4,
+        0.3,
+        boxstyle="round,pad=0.1",
+        linewidth=8,
+        zorder=10,
+    )
+    ax.add_patch(fancy)
+    ax.set_xlim(0.1, 1)
+    ax.set_ylim(0, 1)
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    bbox = fancy.get_window_extent(fig.canvas.get_renderer())
+    x = (bbox.x0 + bbox.x1) / 2
+    y = (bbox.y0 + bbox.y1) / 2
+    event = MouseEvent("button_press_event", fig.canvas, x, y, button=1)
+
+    assert not TargetWrapper.supports_target(fancy)
+    assert fancy in manager._uneditable_artists
+    assert fancy.contains(event)[0]
+    assert manager.get_picked_element(event)[0] is None
+
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_axes_image_drag_preserves_camera_and_matches_selection_preview() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    image = ax.imshow([[0, 1], [1, 0]], extent=(0.2, 0.6, 0.3, 0.7))
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    renderer = fig.canvas.get_renderer()
+    before = image.get_window_extent(renderer).frozen()
+    extent_before = image.get_extent()
+    limits_before = (ax.get_xlim(), ax.get_ylim())
+
+    manager.select_element(image)
+    manager.selection.start_move()
+    manager.selection.move(
+        (13, -7),
+        DIR_X0 | DIR_X1 | DIR_Y0 | DIR_Y1,
+        [],
+        ignore_snaps=True,
+    )
+    manager.selection.end_move()
+    fig.canvas.draw()
+    manager.selection.update_selection_rectangles()
+
+    after = image.get_window_extent(renderer)
+    rect = selection_rect_extents(manager.selection)[0]
+    assert ax.get_xlim() == limits_before[0]
+    assert ax.get_ylim() == limits_before[1]
+    assert abs((after.x0 - before.x0) - 13) < 1e-9
+    assert abs((after.y0 - before.y0) + 7) < 1e-9
+    assert all(
+        abs(actual - selected) < 1e-9 for actual, selected in zip(after.extents, rect)
+    )
+    moved_extent = image.get_extent()
+    command_target, command = fig.change_tracker.change
+    assert command_target is image
+    image.set_extent(extent_before)
+    ax.set_xlim(limits_before[0])
+    ax.set_ylim(limits_before[1])
+    eval("image" + command)
+    assert np.allclose(image.get_extent(), moved_extent)
+    assert ax.get_xlim() == limits_before[0]
+    assert ax.get_ylim() == limits_before[1]
     manager.selection.clear_targets()
     plt.close(fig)
     assert app is not None
@@ -649,6 +1175,75 @@ def test_size_widget_lock_aspect_resizes_from_changed_axis() -> None:
     assert app is not None
 
 
+def test_position_widget_moves_mixed_transforms_by_one_display_delta() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    container = QtWidgets.QWidget()
+    layout = QtWidgets.QVBoxLayout(container)
+    signals = WidgetSignals()
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    axes_text = ax.text(0.2, 0.4, "axes", transform=ax.transAxes)
+    figure_text = fig.text(0.7, 0.7, "figure", transform=fig.transFigure)
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    fig.signals = signals
+    manager.select_elements([axes_text, figure_text], primary=axes_text)
+    widget = QPosAndSize(layout, signals)
+    widget.setFigure(fig)
+    widget.setElement(axes_text)
+    renderer = fig.canvas.get_renderer()
+    axes_before = axes_text.get_window_extent(renderer).frozen()
+    figure_before = figure_text.get_window_extent(renderer).frozen()
+    positions_before = (axes_text.get_position(), figure_text.get_position())
+
+    widget.changePos(0.3, None)
+    fig.canvas.draw()
+
+    axes_after = axes_text.get_window_extent(renderer)
+    figure_after = figure_text.get_window_extent(renderer)
+    axes_delta = axes_after.x0 - axes_before.x0
+    figure_delta = figure_after.x0 - figure_before.x0
+    assert abs(axes_delta - 31) < 1e-9
+    assert abs(figure_delta - axes_delta) < 1e-9
+    assert abs(axes_after.y0 - axes_before.y0) < 1e-9
+    assert abs(figure_after.y0 - figure_before.y0) < 1e-9
+
+    fig.change_tracker.edit[0]()
+    assert np.allclose(axes_text.get_position(), positions_before[0])
+    assert np.allclose(figure_text.get_position(), positions_before[1])
+    manager.selection.clear_targets()
+    container.deleteLater()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_position_widget_uses_subfigure_transform_for_axes() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    container = QtWidgets.QWidget()
+    layout = QtWidgets.QVBoxLayout(container)
+    signals = WidgetSignals()
+    fig = plt.figure(figsize=(6, 3), dpi=100)
+    _left, right = fig.subfigures(1, 2)
+    ax = right.subplots()
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    fig.signals = signals
+    manager.select_element(ax)
+    widget = QPosAndSize(layout, signals)
+    widget.setFigure(fig)
+    widget.transform_index = 2
+
+    native = ax.get_position().p0
+    widget_display = widget.getTransform(ax).transform(native)
+    interaction_display = TargetWrapper(ax).get_positions()[0]
+
+    assert np.allclose(widget_display, interaction_display)
+    assert manager._selection_parent_by_id[id(ax)] is right
+    manager.selection.clear_targets()
+    container.deleteLater()
+    plt.close(fig)
+    assert app is not None
+
+
 def test_backspace_deletes_selected_object() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     fig, ax = plt.subplots(figsize=(4, 2), dpi=100)
@@ -656,7 +1251,9 @@ def test_backspace_deletes_selected_object() -> None:
     manager = attach_drag_manager(fig)
     manager.selection.add_target(ax)
 
-    manager.selection.keyPressEvent(KeyEvent("key_press_event", fig.canvas, "backspace"))
+    manager.selection.keyPressEvent(
+        KeyEvent("key_press_event", fig.canvas, "backspace")
+    )
 
     assert fig.change_tracker.removed is ax
     assert not ax.get_visible()
@@ -664,7 +1261,9 @@ def test_backspace_deletes_selected_object() -> None:
     assert app is not None
 
 
-def test_selection_scene_transform_maps_physical_canvas_pixels_to_logical_scene() -> None:
+def test_selection_scene_transform_maps_physical_canvas_pixels_to_logical_scene() -> (
+    None
+):
     transform = selection_scene_transform(2.0, 200)
 
     assert transform.map(100, 300) == (50, 50)
@@ -688,6 +1287,30 @@ def test_drag_manager_select_elements_uses_single_multi_selection_model() -> Non
 
     assert [target.target for target in manager.selection.targets] == [axes[0], axes[1]]
     assert manager.selected_element is axes[1]
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_bulk_selection_updates_combined_extent_once() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    texts = [ax.text(0.1 + index * 0.08, 0.5, str(index)) for index in range(10)]
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    original_update = manager.selection.update_extent
+    calls = 0
+
+    def counted_update():
+        nonlocal calls
+        calls += 1
+        original_update()
+
+    manager.selection.update_extent = counted_update
+    manager.select_elements(texts, primary=texts[-1])
+
+    assert calls == 1
+    assert [target.target for target in manager.selection.targets] == texts
     manager.selection.clear_targets()
     plt.close(fig)
     assert app is not None
@@ -739,9 +1362,7 @@ def test_drag_rectangle_container_only_mode_replaces_selected_children() -> None
     manager.select_element(text)
     bbox = text.get_window_extent(fig.canvas.get_renderer()).expanded(1.2, 1.4)
 
-    manager.select_elements_in_bbox(
-        bbox.x0, bbox.y0, bbox.x1, bbox.y1, additive=True
-    )
+    manager.select_elements_in_bbox(bbox.x0, bbox.y0, bbox.x1, bbox.y1, additive=True)
 
     assert [target.target for target in manager.selection.targets] == [ax]
     manager.selection.clear_targets()
@@ -824,7 +1445,7 @@ def test_canvas_drag_rectangle_starts_on_axes_and_selects_after_release() -> Non
     assert app is not None
 
 
-def test_transparent_figure_level_inset_axes_click_selects_axes() -> None:
+def test_transparent_inset_children_remain_directly_selectable() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     fig = plt.figure(figsize=(7.35, 8.8), dpi=150)
     fig.add_axes([0.1067, 0.1104, 0.525, 0.2646], label="panel_g")
@@ -868,8 +1489,8 @@ def test_transparent_figure_level_inset_axes_click_selects_axes() -> None:
     fig.canvas.draw()
     manager = attach_drag_manager(fig)
     manager.select_element(fill_hex)
-    assert manager.selected_element is inset
-    assert [target.target for target in manager.selection.targets] == [inset]
+    assert manager.selected_element is fill_hex
+    assert [target.target for target in manager.selection.targets] == [fill_hex]
     manager.selection.clear_targets()
     manager.selected_element = None
 
@@ -883,9 +1504,33 @@ def test_transparent_figure_level_inset_axes_click_selects_axes() -> None:
     manager.button_press_event0(press)
     manager.button_release_event0(release)
 
+    assert picked in (fill_hex, outline)
+    assert manager.selected_element in (fill_hex, outline)
+    assert [target.target for target in manager.selection.targets] == [
+        manager.selected_element
+    ]
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_top_inset_axes_wins_over_artists_in_lower_axes_layer() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig = plt.figure(figsize=(4, 3), dpi=100)
+    lower = fig.add_axes([0.1, 0.1, 0.8, 0.8])
+    lower.scatter([0.5], [0.5], s=300)
+    inset = fig.add_axes([0.35, 0.35, 0.3, 0.3])
+    inset.patch.set_alpha(0)
+    inset.set_xticks([])
+    inset.set_yticks([])
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    x, y = inset.transAxes.transform((0.5, 0.5))
+    event = MouseEvent("button_press_event", fig.canvas, x, y, button=1)
+
+    picked, _finished = manager.get_picked_element(event)
+
     assert picked is inset
-    assert manager.selected_element is inset
-    assert [target.target for target in manager.selection.targets] == [inset]
     manager.selection.clear_targets()
     plt.close(fig)
     assert app is not None

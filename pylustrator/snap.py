@@ -31,17 +31,35 @@ try:  # starting from mpl version 3.6.0
     from matplotlib.axes import Axes
 except ImportError:
     from matplotlib.axes._subplots import Axes
+from matplotlib.collections import (
+    Collection,
+    LineCollection,
+    PathCollection,
+    PolyCollection,
+)
+from matplotlib.image import AxesImage
 from matplotlib.legend import Legend
 from matplotlib.lines import Line2D
-from matplotlib.patches import Rectangle, Ellipse, FancyArrowPatch
-from matplotlib.text import Text
-from matplotlib.figure import Figure
-from matplotlib.transforms import BboxTransformFrom, BboxTransformTo, IdentityTransform
+from matplotlib.path import Path
+from matplotlib.patches import (
+    Ellipse,
+    ConnectionPatch,
+    FancyArrowPatch,
+    FancyBboxPatch,
+    PathPatch,
+    Polygon,
+    Rectangle,
+    RegularPolygon,
+    Wedge,
+)
+from matplotlib.text import Annotation, Text
+from matplotlib.transforms import (
+    Bbox,
+    BboxTransformFrom,
+    BboxTransformTo,
+    IdentityTransform,
+)
 
-try:
-    from matplotlib.figure import SubFigure  # since matplotlib 3.4.0
-except ImportError:
-    SubFigure = None
 from .helper_functions import main_figure
 
 
@@ -126,18 +144,70 @@ def legend_display_loc(legend: Legend):
 
 
 class TargetWrapper(object):
-    """a wrapper to add unified set and get position methods for any matplotlib artist"""
+    """Expose one display-space interaction contract for supported artists.
+
+    ``get_positions`` returns writable control points.  Selection and alignment
+    use ``get_selection_points`` instead, because an artist's visible bounds are
+    not necessarily writable state (text and annotations are the most obvious
+    examples).  Keeping those concepts separate is what makes preview, commit,
+    and undo agree across artist types.
+    """
 
     target = None
+
+    _patch_types = (
+        Rectangle,
+        Ellipse,
+        FancyArrowPatch,
+        FancyBboxPatch,
+        PathPatch,
+        Polygon,
+        RegularPolygon,
+        Wedge,
+    )
+    _collection_types = (PathCollection, LineCollection, PolyCollection)
+
+    @classmethod
+    def supports_target(cls, target: Artist) -> bool:
+        """Return whether the artist has a lossless move implementation."""
+        if isinstance(target, ConnectionPatch):
+            return False
+        if isinstance(target, FancyBboxPatch) and not target.get_data_transform().is_affine:
+            # BoxStyle padding and corner geometry are expressed around the
+            # native bounds.  Under a non-affine transform, changing those
+            # bounds does not translate the visible box by one display delta.
+            return False
+        return isinstance(
+            target,
+            (Axes, Text, Legend, Line2D, AxesImage)
+            + cls._patch_types
+            + cls._collection_types,
+        )
 
     def __init__(self, target: Artist):
         self.target = target
         self.figure = target.figure
+        self.supported = self.supports_target(target)
         self.do_scale = True
         self.fixed_aspect = False
         # a patch uses the data_transform
-        if isinstance(self.target, mpl.patches.Patch):
+        if isinstance(self.target, self._patch_types):
             self.get_transform = self.target.get_data_transform
+            if isinstance(
+                self.target,
+                (FancyArrowPatch, FancyBboxPatch, RegularPolygon, Wedge),
+            ):
+                # These artists expose a movable center but not a general affine
+                # shape setter, or have BoxStyle padding/corners that do not
+                # follow a bounds-only scale.  Hiding resize handles is safer
+                # than committing a result that cannot match the preview.
+                self.do_scale = False
+            elif isinstance(self.target, (Rectangle, Ellipse)) and not np.isclose(
+                float(self.target.get_angle()) % 180.0, 0.0
+            ):
+                # Width/height setters operate in the unrotated local frame, so
+                # an axis-aligned resize preview would not describe the result.
+                self.do_scale = False
         # axes use the figure_transform
         elif isinstance(self.target, Axes):
             # and optionally have a fixed aspect ratio
@@ -160,10 +230,7 @@ class TargetWrapper(object):
             cache_property(self.target, "position")
         # texts use get_transform
         elif isinstance(self.target, Text):
-            if getattr(self.target, "xy", None) is not None:
-                self.do_scale = True
-            else:
-                self.do_scale = False
+            self.do_scale = False
             if checkXLabel(self.target):
                 self.label_factor = self.figure.dpi / 72.0
                 if getattr(self.target, "pad_offset", None) is None:
@@ -187,15 +254,139 @@ class TargetWrapper(object):
         elif isinstance(self.target, Line2D):
             self.get_transform = IdentityTransform
             self.do_scale = False
+        elif isinstance(self.target, AxesImage):
+            self.get_transform = self.target.get_transform
+        elif isinstance(self.target, self._collection_types):
+            self.get_transform = self.target.get_transform
+            # Scaling a collection's anchors without also scaling marker/stroke
+            # geometry is misleading.  Collections remain directly movable.
+            self.do_scale = False
         # the default is to use get_transform
         else:
-            self.get_transform = self.target.get_transform
+            self.get_transform = getattr(
+                self.target, "get_transform", IdentityTransform
+            )
             self.do_scale = False
+
+    def _renderer(self):
+        return self.figure.canvas.get_renderer()
+
+    def _annotation_xy_transform(self):
+        return self.target._get_xy_transform(self._renderer(), self.target.xycoords)
+
+    @staticmethod
+    def _point_array(points) -> np.ndarray:
+        points = np.ma.asarray(points, dtype=float)
+        if np.ma.isMaskedArray(points):
+            points = points.filled(np.nan)
+        points = np.asarray(points, dtype=float)
+        if points.ndim != 2 or points.shape[1] < 2:
+            return np.empty((0, 2), dtype=float)
+        return points[:, :2]
+
+    @staticmethod
+    def _finite_points(points) -> np.ndarray:
+        points = TargetWrapper._point_array(points)
+        return points[np.all(np.isfinite(points), axis=1)]
+
+    def _collection_local_groups(self) -> list[np.ndarray]:
+        if isinstance(self.target, PathCollection):
+            return [self._point_array(self.target.get_offsets())]
+        if isinstance(self.target, LineCollection):
+            return [
+                self._point_array(segment) for segment in self.target.get_segments()
+            ]
+        if isinstance(self.target, PolyCollection):
+            return [
+                self._point_array(path.vertices) for path in self.target.get_paths()
+            ]
+        return []
+
+    def _collection_display_groups(self) -> list[np.ndarray]:
+        groups = self._collection_local_groups()
+        if isinstance(self.target, PathCollection):
+            transform = self.target.get_offset_transform()
+        else:
+            transform = self.target.get_transform()
+        return [
+            self._finite_points(transform.transform(group))
+            for group in groups
+            if len(group)
+        ]
+
+    def _collection_padding(self) -> float:
+        """Approximate display padding contributed by markers and strokes."""
+        dpi_per_point = float(self.figure.dpi) / 72.0
+        linewidths = np.asarray(self.target.get_linewidths(), dtype=float)
+        stroke = (
+            float(np.max(linewidths)) * dpi_per_point / 2 if linewidths.size else 0.0
+        )
+        if isinstance(self.target, PathCollection):
+            sizes = np.asarray(self.target.get_sizes(), dtype=float)
+            marker = (
+                float(np.sqrt(np.max(sizes))) * dpi_per_point / 2 if sizes.size else 0.0
+            )
+            return marker + stroke
+        return stroke
+
+    @staticmethod
+    def _bounds_points(points: np.ndarray, padding: float = 0.0) -> np.ndarray:
+        points = TargetWrapper._finite_points(points)
+        if len(points) == 0:
+            return np.empty((0, 2), dtype=float)
+        return np.array(
+            [
+                [np.min(points[:, 0]) - padding, np.min(points[:, 1]) - padding],
+                [np.max(points[:, 0]) + padding, np.max(points[:, 1]) + padding],
+            ],
+            dtype=float,
+        )
+
+    def get_selection_points(self) -> np.ndarray:
+        """Return the visible display-space bounds used by selection/alignment."""
+        preview = getattr(self.target, "_pylustrator_preview_selection_points", None)
+        if preview is not None:
+            return np.asarray(preview, dtype=float).copy()
+
+        if isinstance(self.target, Collection):
+            groups = self._collection_display_groups()
+            if groups:
+                return self._bounds_points(
+                    np.concatenate(groups), padding=self._collection_padding()
+                )
+
+        try:
+            bbox = self.target.get_window_extent(self._renderer())
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            bbox = None
+        if isinstance(self.target, Text):
+            bbox_patch = self.target.get_bbox_patch()
+            if bbox_patch is not None:
+                face_alpha = bbox_patch.get_facecolor()[-1]
+                edge_alpha = bbox_patch.get_edgecolor()[-1]
+                if face_alpha > 0 or edge_alpha > 0:
+                    self.target.update_bbox_position_size(self._renderer())
+                    patch_bbox = bbox_patch.get_window_extent(self._renderer())
+                    if bbox is None:
+                        bbox = patch_bbox
+                    else:
+                        bbox = Bbox.from_extents(
+                            min(bbox.x0, patch_bbox.x0),
+                            min(bbox.y0, patch_bbox.y0),
+                            max(bbox.x1, patch_bbox.x1),
+                            max(bbox.y1, patch_bbox.y1),
+                        )
+        if bbox is not None:
+            bounds = np.asarray(bbox.extents, dtype=float)
+            if bounds.shape == (4,) and np.all(np.isfinite(bounds)):
+                return np.array([bounds[:2], bounds[2:]], dtype=float)
+
+        return self._bounds_points(np.asarray(self.get_positions(), dtype=float))
 
     def get_positions(
         self, use_previous_offset=False, update_offset=False
     ) -> (int, int, int, int):
-        """get the current position of the target Artist"""
+        """Return writable control points in display coordinates."""
         preview = getattr(self.target, "_pylustrator_preview_positions", None)
         if preview is not None:
             return [np.array(point, dtype=float).copy() for point in preview]
@@ -217,82 +408,50 @@ class TargetWrapper(object):
         elif isinstance(self.target, FancyArrowPatch):
             points.append(self.target._posA_posB[0])
             points.append(self.target._posA_posB[1])
+        elif isinstance(self.target, FancyBboxPatch):
+            points.append((self.target.get_x(), self.target.get_y()))
+            points.append(
+                (
+                    self.target.get_x() + self.target.get_width(),
+                    self.target.get_y() + self.target.get_height(),
+                )
+            )
+        elif isinstance(self.target, RegularPolygon):
+            points.append(self.target.xy)
+        elif isinstance(self.target, Wedge):
+            points.append(self.target.center)
+        elif isinstance(self.target, Polygon):
+            points.extend(self.target.get_xy())
+        elif isinstance(self.target, PathPatch):
             points.extend(self.target.get_path().vertices)
+        elif isinstance(self.target, Annotation):
+            points.append(self.target.get_position())
+            points.append(self.target.xy)
         elif isinstance(self.target, Text):
             points.append(self.target.get_position())
             if checkXLabel(self.target):
                 points[0] = (points[0][0], self.label_y)
             elif checkYLabel(self.target):
                 points[0] = (self.label_x, points[0][1])
-            if getattr(self.target, "xy", None) is not None:
-                points.append(self.target.xy)
-            if len(points) == 1:
-                renderer = self.figure.canvas.get_renderer()
-                bbox_patch = self.target.get_bbox_patch()
-                has_visible_bbox = False
-                if bbox_patch:
-                    face_alpha = bbox_patch.get_facecolor()[-1]
-                    edge_alpha = bbox_patch.get_edgecolor()[-1]
-                    has_visible_bbox = face_alpha > 0 or edge_alpha > 0
-                if has_visible_bbox:
-                    self.target.update_bbox_position_size(renderer)
-                    bbox = bbox_patch.get_window_extent(renderer)
-                else:
-                    bbox = self.target.get_window_extent(renderer)
-                points.extend(
-                    self.transform_inverted_points(
-                        [(bbox.x0, bbox.y0), (bbox.x1, bbox.y1)]
-                    )
-                )
-            if use_previous_offset is True:
-                offset = getattr(self.target, "_pylustrator_offset", None)
-                if offset is None:
-                    raise AttributeError("Text has no stored pylustrator offset")
-                points[2] = (
-                    points[0] + offset + points[2] - points[1]
-                )
-                points[1] = points[0] + offset
-            else:
-                if update_offset:
-                    self.target._pylustrator_offset = np.array(points[1]) - np.array(
-                        points[0]
-                    )
         elif isinstance(self.target, Axes):
             p1, p2 = np.array(self.target.get_position())
             points.append(p1)
             points.append(p2)
-        elif isinstance(self.target, SubFigure):
-            p1 = [self.target.bbox.x0, self.target.bbox.y0]
-            p2 = [self.target.bbox.x1, self.target.bbox.y1]
-            points.append(p1)
-            points.append(p2)
         elif isinstance(self.target, Legend):
-            bbox = self.target.get_frame().get_bbox()
             points.append(legend_display_loc(self.target))
-            # add points to span bounding box around the frame
-            points.append([bbox.x0, bbox.y0])
-            points.append([bbox.x1, bbox.y1])
-            if use_previous_offset is True:
-                offset = getattr(self.target, "_pylustrator_offset", None)
-                if offset is None:
-                    raise AttributeError("Legend has no stored pylustrator offset")
-                points[2] = (
-                    points[0] + offset + points[2] - points[1]
-                )
-                points[1] = points[0] + offset
-            else:
-                if update_offset:
-                    self.target._pylustrator_offset = points[1] - points[0]
         elif isinstance(self.target, Line2D):
-            bbox = self.target.get_window_extent(self.figure.canvas.get_renderer())
-            points.append([bbox.x0, bbox.y0])
-            points.append([bbox.x1, bbox.y1])
+            points.extend(self.target.get_xydata())
+        elif isinstance(self.target, AxesImage):
+            left, right, bottom, top = self.target.get_extent()
+            points.extend(((left, bottom), (right, top)))
+        elif isinstance(self.target, self._collection_types):
+            groups = self._collection_local_groups()
+            if groups:
+                points.extend(np.concatenate(groups))
         return self.transform_points(points)
 
     def refresh_offset(self):
-        """Store the current display bbox offset for drag-time rectangle updates."""
-        if isinstance(self.target, (Text, Legend)):
-            self.get_positions(update_offset=True)
+        """Compatibility hook retained for older drag code."""
 
     def get_local_positions(
         self, use_previous_offset=False, update_offset=False
@@ -316,6 +475,20 @@ class TargetWrapper(object):
 
     def get_restore_state(self):
         """Return a transform-independent state for undo/redo restore points."""
+        label_axes = (
+            checkXLabel(self.target) or checkYLabel(self.target)
+            if isinstance(self.target, Text)
+            else None
+        )
+        if label_axes is not None:
+            axis_name = "x" if checkXLabel(self.target) is not None else "y"
+            axis = label_axes.xaxis if axis_name == "x" else label_axes.yaxis
+            return {
+                "type": "axis_label",
+                "axis": axis_name,
+                "position": tuple(float(value) for value in self.target.get_position()),
+                "labelpad": float(axis.labelpad),
+            }
         if isinstance(self.target, Legend):
             bbox = self.target.get_bbox_to_anchor()
             transform = legend_anchor_transform(self.target)
@@ -338,6 +511,32 @@ class TargetWrapper(object):
 
     def restore_state(self, state):
         """Restore a state captured with get_restore_state."""
+        if state["type"] == "axis_label":
+            axes = checkXLabel(self.target) or checkYLabel(self.target)
+            axis = axes.xaxis if state["axis"] == "x" else axes.yaxis
+            self.target.set_position(state["position"])
+            axis.labelpad = state["labelpad"]
+            wrapper = TargetWrapper(self.target)
+            if state["axis"] == "x":
+                wrapper.label_y = self.target.get_position()[1]
+                self.target.pad_offset = (
+                    wrapper.label_y + axis.labelpad * wrapper.label_factor
+                )
+            else:
+                wrapper.label_x = self.target.get_position()[0]
+                self.target.pad_offset = (
+                    wrapper.label_x + axis.labelpad * wrapper.label_factor
+                )
+            change_tracker = (
+                self.figure.figure.change_tracker
+                if self.figure.figure is not None
+                else self.figure.change_tracker
+            )
+            change_tracker.addChange(
+                axes, f".{state['axis']}axis.labelpad = {axis.labelpad:f}"
+            )
+            change_tracker.addNewTextChange(self.target)
+            return
         if state["type"] == "legend":
             anchor = state["anchor"]
             if state["is_point"]:
@@ -395,18 +594,40 @@ class TargetWrapper(object):
                 self.target,
                 ".set_positions(%s, %s)" % (tuple(points[0]), tuple(points[1])),
             )
-        elif isinstance(self.target, Line2D):
-            bbox = self.target.get_window_extent(self.figure.canvas.get_renderer())
-            dx = points[0][0] - bbox.x0
-            dy = points[0][1] - bbox.y0
-            xy = np.column_stack(
-                [
-                    self.target.get_xdata(orig=False),
-                    self.target.get_ydata(orig=False),
-                ]
+        elif isinstance(self.target, FancyBboxPatch):
+            bounds = (
+                float(points[0][0]),
+                float(points[0][1]),
+                float(points[1][0] - points[0][0]),
+                float(points[1][1] - points[0][1]),
             )
-            moved_xy = self.target.get_transform().transform(xy) + [dx, dy]
-            new_xy = self.target.get_transform().inverted().transform(moved_xy)
+            self.target.set_bounds(*bounds)
+            change_tracker.addChange(self.target, f".set_bounds{bounds!r}")
+        elif isinstance(self.target, RegularPolygon):
+            self.target.xy = tuple(float(value) for value in points[0])
+            self.target.stale = True
+            change_tracker.addChange(self.target, f".xy = {self.target.xy!r}")
+        elif isinstance(self.target, Wedge):
+            center = tuple(float(value) for value in points[0])
+            self.target.set_center(center)
+            change_tracker.addChange(self.target, f".set_center({center!r})")
+        elif isinstance(self.target, Polygon):
+            vertices = [[float(x), float(y)] for x, y in points]
+            self.target.set_xy(vertices)
+            change_tracker.addChange(self.target, f".set_xy({vertices!r})")
+        elif isinstance(self.target, PathPatch):
+            old_path = self.target.get_path()
+            vertices = np.asarray(points, dtype=float)
+            codes = None if old_path.codes is None else old_path.codes.copy()
+            self.target.set_path(Path(vertices, codes))
+            vertices_literal = [[float(x), float(y)] for x, y in vertices]
+            codes_literal = None if codes is None else [int(code) for code in codes]
+            change_tracker.addChange(
+                self.target,
+                f".set_path(mpl.path.Path({vertices_literal!r}, {codes_literal!r}))",
+            )
+        elif isinstance(self.target, Line2D):
+            new_xy = np.asarray(points, dtype=float)
             self.target.set_data(new_xy[:, 0], new_xy[:, 1])
             change_tracker.addChange(
                 self.target,
@@ -416,43 +637,39 @@ class TargetWrapper(object):
                     [float(value) for value in new_xy[:, 1]],
                 ),
             )
+        elif isinstance(self.target, Annotation):
+            self.target.set_position(points[0])
+            self.target.xy = tuple(float(value) for value in points[1])
+            change_tracker.addNewTextChange(self.target)
+            change_tracker.addChange(self.target, f".xy = {self.target.xy!r}")
         elif isinstance(self.target, Text):
             if checkXLabel(self.target):
                 axes = checkXLabel(self.target)
                 axes.xaxis.labelpad = (
-                    (self.target.pad_offset - points[0][1]) / self.label_factor
-                )
+                    self.target.pad_offset - points[0][1]
+                ) / self.label_factor
                 change_tracker.addChange(
                     axes, ".xaxis.labelpad = %f" % axes.xaxis.labelpad
                 )
 
                 self.target.set_position(points[0])
                 self.label_y = points[0][1]
+                change_tracker.addNewTextChange(self.target)
             elif checkYLabel(self.target):
                 axes = checkYLabel(self.target)
                 axes.yaxis.labelpad = (
-                    (self.target.pad_offset - points[0][0]) / self.label_factor
-                )
+                    self.target.pad_offset - points[0][0]
+                ) / self.label_factor
                 change_tracker.addChange(
                     axes, ".yaxis.labelpad = %f" % axes.yaxis.labelpad
                 )
 
                 self.target.set_position(points[0])
                 self.label_x = points[0][0]
+                change_tracker.addNewTextChange(self.target)
             else:
                 self.target.set_position(points[0])
-                if isinstance(self.target, Text):
-                    change_tracker.addNewTextChange(self.target)
-                else:
-                    change_tracker.addChange(
-                        self.target,
-                        ".set_position([%f, %f])" % self.target.get_position(),
-                    )
-                if getattr(self.target, "xy", None) is not None:
-                    self.target.xy = points[1]
-                    change_tracker.addChange(
-                        self.target, ".xy = (%f, %f)" % tuple(self.target.xy)
-                    )
+                change_tracker.addNewTextChange(self.target)
         elif isinstance(self.target, Legend):
             bbox = self.target.get_bbox_to_anchor()
             if bbox.width == 0 and bbox.height == 0:
@@ -478,11 +695,60 @@ class TargetWrapper(object):
             change_tracker.addNewAxesChange(self.target)
             # change_tracker.addChange(self.target, ".set_position([%f, %f, %f, %f])" % tuple(
             #    np.array([points[0], points[1] - points[0]]).flatten()))
+        elif isinstance(self.target, AxesImage):
+            extent = tuple(
+                float(value)
+                for value in (points[0][0], points[1][0], points[0][1], points[1][1])
+            )
+            axes = self.target.axes
+            xlim = tuple(float(value) for value in axes.get_xlim())
+            ylim = tuple(float(value) for value in axes.get_ylim())
+            self.target.set_extent(extent)
+            # AxesImage.set_extent may autoscale the parent axes.  A move should
+            # transform the image inside its current canvas, not move the camera
+            # with it and leave the pixels apparently stationary.
+            axes.set_xlim(xlim)
+            axes.set_ylim(ylim)
+            from .change_tracker import getReference
+
+            axes_reference = getReference(axes)
+            change_tracker.addChange(
+                self.target,
+                f".set_extent({extent!r}), "
+                f"{axes_reference}.set_xlim({xlim!r}), "
+                f"{axes_reference}.set_ylim({ylim!r})",
+            )
+        elif isinstance(self.target, self._collection_types):
+            lengths = [len(group) for group in self._collection_local_groups()]
+            groups = []
+            start = 0
+            for length in lengths:
+                groups.append(np.asarray(points[start : start + length], dtype=float))
+                start += length
+            literal = [[[float(x), float(y)] for x, y in group] for group in groups]
+            if isinstance(self.target, PathCollection):
+                offsets = groups[0] if groups else np.empty((0, 2))
+                self.target.set_offsets(offsets)
+                change_tracker.addChange(self.target, f".set_offsets({literal[0]!r})")
+            elif isinstance(self.target, LineCollection):
+                self.target.set_segments(groups)
+                change_tracker.addChange(self.target, f".set_segments({literal!r})")
+            else:
+                codes = [path.codes for path in self.target.get_paths()]
+                codes_literal = [
+                    None if path_codes is None else [int(code) for code in path_codes]
+                    for path_codes in codes
+                ]
+                self.target.set_verts_and_codes(groups, codes)
+                change_tracker.addChange(
+                    self.target,
+                    f".set_verts_and_codes({literal!r}, {codes_literal!r})",
+                )
         setattr(self.target, "_pylustrator_cached_get_extend", None)
 
     def get_extent(self):
         # get get_extent as it can be called very frequently when checking snap conditions
-        if getattr(self.target, "_pylustrator_cached_get_extend_added", False):
+        if not getattr(self.target, "_pylustrator_cached_get_extend_added", False):
             setattr(self.target, "_pylustrator_cached_get_extend_added", True)
         if getattr(self.target, "_pylustrator_cached_get_extend", None) is None:
             setattr(self.target, "_pylustrator_cached_get_extend", self.do_get_extent())
@@ -490,7 +756,7 @@ class TargetWrapper(object):
 
     def do_get_extent(self) -> (int, int, int, int):
         """get the extent of the target"""
-        points = np.array(self.get_positions())
+        points = np.array(self.get_selection_points())
         return [
             np.min(points[:, 0]),
             np.min(points[:, 1]),
@@ -499,21 +765,51 @@ class TargetWrapper(object):
         ]
 
     def transform_points(self, points: (int, int)) -> (int, int):
-        """transform points from the targets local coordinate system to the figure coordinate system"""
+        """Transform native control points to display coordinates."""
+        if isinstance(self.target, Annotation):
+            if len(points) == 0:
+                return []
+            transformed = [self.target.get_transform().transform(points[0])]
+            if len(points) > 1:
+                transformed.append(self._annotation_xy_transform().transform(points[1]))
+            return transformed
+        if isinstance(self.target, Line2D):
+            return [self.target.get_transform().transform(point) for point in points]
+        if isinstance(self.target, PathCollection):
+            transform = self.target.get_offset_transform()
+            return [transform.transform(point) for point in points]
+        if isinstance(self.target, (LineCollection, PolyCollection)):
+            transform = self.target.get_transform()
+            return [transform.transform(point) for point in points]
         transform = self.get_transform()
         return [transform.transform(p) for p in points]
 
     def transform_inverted_points(self, points: (int, int)) -> (int, int):
-        """transform points from the figure coordinate system to the targets local coordinate system"""
+        """Transform display control points back to native coordinates."""
+        if isinstance(self.target, Annotation):
+            if len(points) == 0:
+                return []
+            transformed = [self.target.get_transform().inverted().transform(points[0])]
+            if len(points) > 1:
+                transformed.append(
+                    self._annotation_xy_transform().inverted().transform(points[1])
+                )
+            return transformed
+        if isinstance(self.target, Line2D):
+            transform = self.target.get_transform()
+            return [transform.inverted().transform(point) for point in points]
+        if isinstance(self.target, PathCollection):
+            transform = self.target.get_offset_transform()
+            return [transform.inverted().transform(point) for point in points]
+        if isinstance(self.target, (LineCollection, PolyCollection)):
+            transform = self.target.get_transform()
+            return [transform.inverted().transform(point) for point in points]
         transform = self.get_transform()
         return [transform.inverted().transform(p) for p in points]
 
 
 def _text_display_position(text: TargetWrapper) -> np.ndarray:
-    preview = getattr(text.target, "_pylustrator_preview_positions", None)
-    if preview is not None:
-        return np.array(preview[0], dtype=float)
-    return np.array(text.get_transform().transform(text.target.get_position()))
+    return np.array(text.get_positions()[0], dtype=float)
 
 
 class SnapBase:
@@ -813,7 +1109,7 @@ class SnapCenterWith(SnapBase):
 
     def getPosition2(self, axes: TargetWrapper) -> int:
         """get the position of the second object"""
-        pos = np.array(axes.figure.transFigure.transform(axes.target.get_position()))
+        pos = np.array(axes.get_positions())
         p = pos[0, :]
         p[self.edge] = np.mean(pos, axis=0)[self.edge]
         return p
@@ -880,7 +1176,6 @@ def getSnaps(targets: List[TargetWrapper], dir: int, no_height=False) -> List[Sn
                     if txt in targets or not txt.get_visible():
                         continue
                     # snap to the x and the y coordinate
-                    x, y = txt.get_transform().transform(txt.get_position())
                     snaps.append(SnapSamePos(target, txt, 0))
                     snaps.append(SnapSamePos(target, txt, 1))
             continue
