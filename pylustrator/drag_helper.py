@@ -1286,10 +1286,15 @@ class GrabbableRectangleSelection(GrabFunctions):
             id(target.target): np.array(target.get_positions(), dtype=float)
             for target in self.targets
         }
-        self.move_start_selection_points = {
-            id(target.target): np.array(target.get_selection_points(), dtype=float)
-            for target in self.targets
-        }
+        self.move_start_raw_selection_points = {}
+        self.move_start_selection_points = {}
+        for target in self.targets:
+            raw = np.asarray(target.adapter.selection_points(), dtype=float)
+            key = id(target.target)
+            self.move_start_raw_selection_points[key] = raw
+            self.move_start_selection_points[key] = np.asarray(
+                target.adapter.clip_selection_points(raw), dtype=float
+            )
         self.move_current_positions = {}
         self.move_current_selection_points = {}
         self.move_start_states = {
@@ -1347,18 +1352,53 @@ class GrabbableRectangleSelection(GrabFunctions):
                 deltas = np.asarray(points, dtype=float) - np.asarray(start, dtype=float)
                 if np.allclose(deltas, deltas[0]):
                     translation_delta = deltas[0]
-            pending.append((target, points, translation_delta))
+            pending.append(
+                (
+                    target,
+                    points,
+                    translation_delta,
+                    start,
+                    self.move_start_raw_selection_points.get(id(target.target)),
+                    self.move_current_selection_points.get(id(target.target)),
+                )
+            )
 
         # Preview geometry is already at the proposed destination. Clear every
         # preview before validating the display delta, otherwise adapters would
         # add the delta to the preview a second time. Preflight the complete
         # transaction before mutating any target.
-        for target, _points, _translation_delta in pending:
+        for (
+            target,
+            _points,
+            _translation_delta,
+            _start,
+            _selection,
+            _destination,
+        ) in pending:
             self._clear_preview(target)
-        for target, _points, translation_delta in pending:
+        for (
+            target,
+            _points,
+            translation_delta,
+            start,
+            selection_points,
+            destination_selection_points,
+        ) in pending:
             if translation_delta is not None:
-                target.preflight_translation(translation_delta)
-        for target, points, _translation_delta in pending:
+                target.preflight_translation(
+                    translation_delta,
+                    control_points=start,
+                    selection_points=selection_points,
+                    destination_selection_points=destination_selection_points,
+                )
+        for (
+            target,
+            points,
+            _translation_delta,
+            _start,
+            _selection,
+            _destination,
+        ) in pending:
             target.set_positions(points)
 
     def _move_changed_semantically(self) -> bool:
@@ -1421,6 +1461,7 @@ class GrabbableRectangleSelection(GrabFunctions):
                 elif hasattr(canvas, "draw_idle"):
                     canvas.draw_idle()
         self.move_start_positions = {}
+        self.move_start_raw_selection_points = {}
         self.move_start_selection_points = {}
         self.move_current_positions = {}
         self.move_current_selection_points = {}
@@ -1488,6 +1529,9 @@ class GrabbableRectangleSelection(GrabFunctions):
         )
         transform = np.dot(self.get_trans_matrix(), start_inv_transform)
         start_positions = getattr(self, "move_start_positions", {})
+        start_raw_selection_points = getattr(
+            self, "move_start_raw_selection_points", {}
+        )
         start_selection_points = getattr(self, "move_start_selection_points", {})
         self.move_current_positions = {}
         self.move_current_selection_points = {}
@@ -1499,6 +1543,9 @@ class GrabbableRectangleSelection(GrabFunctions):
             if selection_points is None:
                 selection_points = np.array(target.get_selection_points(), dtype=float)
             if whole_object:
+                selection_points = start_raw_selection_points.get(
+                    id(target.target), selection_points
+                )
                 points = self.apply_transform(transform, points)
                 selection_points = self.apply_transform(transform, selection_points)
             else:
@@ -2181,6 +2228,10 @@ class DragManager:
                 parent = getattr(target, "figure", None)
         if parent is not None and parent is not target:
             self._selection_parent_by_id[id(target)] = parent
+        if isinstance(target, Text):
+            target._pylustrator_legend_owner = (
+                parent if isinstance(parent, Legend) else None
+            )
         self._ensure_editor_scene().register_artist(target)
         if id(target) not in self._interaction_artist_ids:
             self._interaction_artists.append(target)

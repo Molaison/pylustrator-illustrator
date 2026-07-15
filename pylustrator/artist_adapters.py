@@ -66,6 +66,7 @@ _CHANGE_RECORDING_ENABLED = ContextVar(
 _SELECTION_GEOMETRY_CACHE = ContextVar(
     "pylustrator_selection_geometry_cache", default=None
 )
+_LEGEND_OWNER_UNKNOWN = object()
 
 
 @contextmanager
@@ -210,12 +211,12 @@ def _clip_selection_points(target: Artist, points) -> np.ndarray:
     points = np.asarray(points, dtype=float)
     if points.ndim != 2 or points.shape[1] < 2 or not len(points):
         return points
-    finite = points[np.all(np.isfinite(points[:, :2]), axis=1), :2]
-    if not len(finite):
-        return np.empty((0, 2), dtype=float)
     clip_box, clip_path = _display_clip_components(target)
     if clip_box is None and clip_path is None:
         return points
+    finite = points[np.all(np.isfinite(points[:, :2]), axis=1), :2]
+    if not len(finite):
+        return np.empty((0, 2), dtype=float)
 
     low = np.min(finite, axis=0)
     high = np.max(finite, axis=0)
@@ -360,6 +361,34 @@ def iter_figure_legends(figure) -> tuple[Legend, ...]:
 
     visit(figure)
     return tuple(legends)
+
+
+def legend_owner_for_text(target: Text) -> Legend | None:
+    """Return and cache whether a Text is managed by a live Legend packer."""
+
+    cached = getattr(target, "_pylustrator_legend_owner", _LEGEND_OWNER_UNKNOWN)
+    if cached is None:
+        return None
+    if cached is not _LEGEND_OWNER_UNKNOWN:
+        if (
+            isinstance(cached, Legend)
+            and cached.figure is getattr(target, "figure", None)
+            and target in iter_legend_children(cached)
+        ):
+            return cached
+        try:
+            delattr(target, "_pylustrator_legend_owner")
+        except AttributeError:
+            pass
+
+    figure = getattr(target, "figure", None)
+    if figure is not None:
+        for legend in iter_figure_legends(figure):
+            if target in iter_legend_children(legend):
+                target._pylustrator_legend_owner = legend
+                return legend
+    target._pylustrator_legend_owner = None
+    return None
 
 
 def legend_display_loc(legend: Legend) -> np.ndarray:
@@ -604,6 +633,11 @@ class ArtistAdapter:
                 return np.array([bounds[:2], bounds[2:]], dtype=float)
         return self.bounds_points(self.control_points())
 
+    def clip_selection_points(self, points) -> np.ndarray:
+        """Apply the active paint clip to a display-space selection envelope."""
+
+        return _clip_selection_points(self.target, points)
+
     def hit_test(self, event) -> bool:
         """Return whether a canvas event hits the artist's visible paint.
 
@@ -762,18 +796,35 @@ class ArtistAdapter:
                 "geometry entirely outside the active clip region"
             )
 
-    def preflight_translation(self, delta: Sequence[float]) -> None:
+    def preflight_translation(
+        self,
+        delta: Sequence[float],
+        *,
+        control_points=None,
+        selection_points=None,
+        destination_selection_points=None,
+    ) -> None:
         support = self.operation_support(TransformOperation.TRANSLATE)
         if not support.supported:
             raise UnsupportedArtistError(support.reason)
         delta = np.asarray(delta, dtype=float)
         if delta.shape != (2,) or not np.all(np.isfinite(delta)):
             raise ValueError("Display-space translation must contain two finite values")
-        points = self.point_array(self.control_points())
+        if control_points is None:
+            control_points = self.control_points()
+        if selection_points is None:
+            selection_points = self.selection_points()
+        points = self.point_array(control_points)
         self.validate_native_control_points(self.display_to_native(points + delta))
-        self.validate_translation_visibility(
-            self.point_array(self.selection_points()) + delta
-        )
+        if destination_selection_points is None:
+            self.validate_translation_visibility(
+                self.point_array(selection_points) + delta
+            )
+        elif not len(self.finite_points(destination_selection_points)):
+            raise UnsupportedArtistError(
+                f"{type(self.target).__name__} translation would leave no visible "
+                "geometry inside the active clip region"
+            )
 
     def preview_translation_selection_points(
         self, delta: Sequence[float]
@@ -1738,11 +1789,7 @@ class TextAdapter(ArtistAdapter):
 
     @classmethod
     def capabilities_for(cls, target: Text) -> ArtistCapabilities:
-        figure = getattr(target, "figure", None)
-        if figure is not None and any(
-            target in iter_legend_children(legend)
-            for legend in iter_figure_legends(figure)
-        ):
+        if legend_owner_for_text(target) is not None:
             capabilities = cls.default_capabilities
             return ArtistCapabilities(
                 can_select=capabilities.can_select,
@@ -2348,7 +2395,14 @@ class EditorGroupAdapter(ArtistAdapter):
         points = [value for value in points if len(value)]
         return np.concatenate(points) if points else np.empty((0, 2), dtype=float)
 
-    def preflight_translation(self, delta: Sequence[float]) -> None:
+    def preflight_translation(
+        self,
+        delta: Sequence[float],
+        *,
+        control_points=None,
+        selection_points=None,
+        destination_selection_points=None,
+    ) -> None:
         support = self.operation_support(TransformOperation.TRANSLATE)
         if not support.supported:
             raise UnsupportedArtistError(support.reason)

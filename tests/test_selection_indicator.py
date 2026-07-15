@@ -1058,6 +1058,32 @@ def test_deferred_translation_preflight_uses_pre_preview_geometry() -> None:
     assert app is not None
 
 
+def test_deferred_drag_rejects_empty_clipped_preview_before_mutation() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    rectangle = ax.add_patch(Rectangle((0.4, 0.4), 0.1, 0.1))
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_element(rectangle)
+    before = TargetWrapper(rectangle).get_restore_state()
+
+    manager.selection.start_move()
+    manager.selection.move(
+        (400.0, 0.0),
+        DIR_X0 | DIR_X1 | DIR_Y0 | DIR_Y1,
+        [],
+        ignore_snaps=True,
+    )
+    with pytest.raises(TypeError, match="leave no visible geometry"):
+        manager.selection.end_move()
+
+    assert semantic_equal(before, TargetWrapper(rectangle).get_restore_state())
+    assert not hasattr(fig.change_tracker, "edit")
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
 def test_partially_clipped_drag_keeps_preview_selection_on_visible_paint() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
@@ -1094,6 +1120,37 @@ def test_partially_clipped_drag_keeps_preview_selection_on_visible_paint() -> No
     assert np.allclose(committed, preview, atol=0.25)
     assert np.max(committed[:, 0]) - painted_right <= 1.5
     rectangle.set_visible(True)
+    fig.change_tracker.edit[0]()
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_partially_clipped_drag_preview_includes_newly_revealed_geometry() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    rectangle = ax.add_patch(
+        Rectangle((0.9, 0.35), 0.2, 0.25, color="red", linewidth=0)
+    )
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_element(rectangle)
+    before = manager.selection.selection_bounds()
+
+    manager.selection.start_move()
+    manager.selection.move(
+        (-40.0, 0.0),
+        DIR_X0 | DIR_X1 | DIR_Y0 | DIR_Y1,
+        [],
+        ignore_snaps=True,
+    )
+    preview = manager.selection.move_current_selection_points[id(rectangle)].copy()
+    manager.selection.end_move()
+    fig.canvas.draw()
+    committed = TargetWrapper(rectangle).get_selection_points()
+
+    assert np.allclose(committed, preview, atol=0.25)
+    assert np.ptp(committed[:, 0]) > np.ptp(before[[0, 2]])
     fig.change_tracker.edit[0]()
     manager.selection.clear_targets()
     plt.close(fig)

@@ -24,7 +24,7 @@ Implementation order follows architectural dependencies.
 
 Status (2026-07-15): implemented on
 ``refactor/artist-adapter-architecture``.  The P0 implementation is covered by
-588 passing tests, 119 explicit capability-branch skips, no xfails, Ruff, the
+590 passing tests, 119 explicit capability-branch skips, no xfails, Ruff, the
 full Fig2 interaction probe, and a read-only smoke replay of
 the unmodified formal Fig2.  The formal file retained SHA-256
 ``b0cd72abf3962cd6cd2354467ad57aa37ecc213332645d7cb56e6f4af598ad70``.
@@ -90,7 +90,9 @@ The destination-specific clip audit now treats paint clipping as part of the
 visible selection contract. Rectangular clips intersect the displayed envelope;
 non-rectangular clip paths use their transformed polygon intersection, which
 reduced the independent circle-clip raster comparison to roughly 0.5 px. Free
-drag previews and commits share that clipped envelope, while exact commands
+drag previews transform the unclipped source envelope before applying the clip,
+so newly revealed geometry appears before release and the commit shares the
+same clipped result. Exact commands
 such as alignment, numeric position/size, match-size, and toolbar scaling first
 require a rigid visible-envelope plan. A fully hidden destination or a plan that
 cannot reach its requested visible bounds raises `UnsupportedArtistError`

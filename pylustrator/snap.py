@@ -117,8 +117,20 @@ class TargetWrapper:
     def translate(self, delta) -> None:
         self.adapter.translate(delta)
 
-    def preflight_translation(self, delta) -> None:
-        self.adapter.preflight_translation(delta)
+    def preflight_translation(
+        self,
+        delta,
+        *,
+        control_points=None,
+        selection_points=None,
+        destination_selection_points=None,
+    ) -> None:
+        self.adapter.preflight_translation(
+            delta,
+            control_points=control_points,
+            selection_points=selection_points,
+            destination_selection_points=destination_selection_points,
+        )
 
     def preview_translation_selection_points(self, delta) -> np.ndarray:
         return self.adapter.preview_translation_selection_points(delta)
