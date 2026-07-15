@@ -224,8 +224,7 @@ class QPosAndSize(QtWidgets.QWidget):
 
         old_states = [wrapper.get_restore_state() for wrapper in wrappers]
         for wrapper in wrappers:
-            points = np.asarray(wrapper.get_positions(), dtype=float)
-            wrapper.set_positions(points + delta)
+            wrapper.translate(delta)
         new_states = [wrapper.get_restore_state() for wrapper in wrappers]
 
         def apply(states):

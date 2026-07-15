@@ -39,6 +39,15 @@ from .helper_functions import (
 from .QtGui import initialize as StartColorChooser
 from .lab_colormap import LabColormap
 from .helper_functions import loadFigureFromFile as load
+from .artist_adapters import (
+    ArtistAdapter,
+    ArtistAdapterRegistry,
+    ArtistCapabilities,
+    ChangeRecord,
+    UnsupportedArtistError,
+    get_artist_adapter,
+    register_artist_adapter,
+)
 
 __version__ = "1.3.0"
 
@@ -61,4 +70,11 @@ __all__ = [
     "StartColorChooser",
     "LabColormap",
     "load",
+    "ArtistAdapter",
+    "ArtistAdapterRegistry",
+    "ArtistCapabilities",
+    "ChangeRecord",
+    "UnsupportedArtistError",
+    "get_artist_adapter",
+    "register_artist_adapter",
 ]

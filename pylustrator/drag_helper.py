@@ -25,7 +25,7 @@ from matplotlib.figure import Figure, SubFigure
 from matplotlib.axes import Axes
 from matplotlib.legend import Legend
 from matplotlib.text import Text
-from matplotlib.patches import Patch, Rectangle
+from matplotlib.patches import Rectangle
 from matplotlib.backend_bases import MouseEvent, KeyEvent
 from typing import Iterable, Sequence
 from qtpy import QtCore, QtGui, QtWidgets
@@ -504,9 +504,9 @@ class GrabbableRectangleSelection(GrabFunctions):
             plan = self._delta_plan(items, deltas)
             self.start_move(save_targets=[target for target, _delta in plan])
             for target, delta in plan:
-                new_points = np.array(target.get_positions())
-                new_points[:, y] += delta
-                target.set_positions(new_points)
+                display_delta = np.zeros(2, dtype=float)
+                display_delta[y] = delta
+                target.translate(display_delta)
             self.update_extent()
             self.has_moved = True
             self.end_move()
@@ -542,9 +542,9 @@ class GrabbableRectangleSelection(GrabFunctions):
             plan = self._delta_plan(items, deltas)
             self.start_move(save_targets=[target for target, _delta in plan])
             for target, delta in plan:
-                new_points = np.array(target.get_positions())
-                new_points[:, y] += delta
-                target.set_positions(new_points)
+                display_delta = np.zeros(2, dtype=float)
+                display_delta[y] = delta
+                target.translate(display_delta)
             self.has_moved = True
             self.end_move()
 
@@ -621,9 +621,8 @@ class GrabbableRectangleSelection(GrabFunctions):
             names = ", ".join(type(target).__name__ for target in non_scalable)
             raise ValueError(f"Selected object cannot be resized: {names}")
 
-        planned: list[tuple[TargetWrapper, np.ndarray, np.ndarray]] = []
+        planned: list[tuple[TargetWrapper, np.ndarray]] = []
         for target in self.targets[1:]:
-            points = np.array(target.get_positions(), dtype=float)
             bounds = self._points_bounds(
                 np.array(target.get_selection_points(), dtype=float)
             )
@@ -633,11 +632,11 @@ class GrabbableRectangleSelection(GrabFunctions):
                 raise ValueError("Selected object has no width.")
             if match_height and current_height <= 0:
                 raise ValueError("Selected object has no height.")
-            planned.append((target, points, bounds))
+            planned.append((target, bounds))
 
         self.start_move()
         changed = False
-        for target, points, bounds in planned:
+        for target, bounds in planned:
             current_width = bounds[2] - bounds[0]
             current_height = bounds[3] - bounds[1]
             scale_x = reference_width / current_width if match_width else 1.0
@@ -662,7 +661,7 @@ class GrabbableRectangleSelection(GrabFunctions):
                 ],
                 dtype=float,
             )
-            target.set_positions(self.apply_transform(transform, points))
+            target.resize(transform)
             changed = True
 
         if changed:
@@ -699,8 +698,7 @@ class GrabbableRectangleSelection(GrabFunctions):
 
         self.start_move()
         for target in self.targets:
-            points = np.array(target.get_positions(), dtype=float)
-            target.set_positions(self.apply_transform(transform, points))
+            target.resize(transform)
         self.update_extent()
         self.has_moved = True
         self.end_move("Scale")
@@ -710,29 +708,11 @@ class GrabbableRectangleSelection(GrabFunctions):
 
     @staticmethod
     def _rotatable_value(target: Artist) -> float | None:
-        if isinstance(target, Text):
-            return float(target.get_rotation())
-        if (
-            isinstance(target, Patch)
-            and hasattr(target, "get_angle")
-            and hasattr(target, "set_angle")
-        ):
-            return float(target.get_angle())
-        return None
+        wrapped = TargetWrapper(target)
+        return wrapped.get_rotation() if wrapped.capabilities.can_rotate else None
 
     def _set_rotation_value(self, target: Artist, value: float) -> None:
-        if isinstance(target, Text):
-            add_text_default(target)
-            target.set_rotation(value)
-            self.figure.change_tracker.addNewTextChange(target)
-            return
-        if isinstance(target, Patch) and hasattr(target, "set_angle"):
-            target.set_angle(value)
-            self.figure.change_tracker.addChange(
-                target, ".set_angle(%f)" % target.get_angle()
-            )
-            return
-        raise ValueError(f"Selected object cannot be rotated: {type(target).__name__}")
+        TargetWrapper(target).set_rotation(value)
 
     def rotate_selection(self, angle_degrees: float) -> bool:
         """Rotate selected objects that have a native saveable rotation property."""
@@ -1125,9 +1105,7 @@ class GrabbableRectangleSelection(GrabFunctions):
 
     def transform_target(self, transform: np.ndarray, target: TargetWrapper):
         """transform the position of an artist."""
-        points = target.get_positions()
-        points = self.apply_transform(transform, points)
-        target.set_positions(points)
+        target.apply_display_transform(transform)
 
     def keyPressEvent(self, event: KeyEvent):
         """when a key is pressed. Arrow keys move the selection, Pageup/down movein z"""

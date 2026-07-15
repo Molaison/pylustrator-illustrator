@@ -867,6 +867,28 @@ def test_resize_handles_require_lossless_scaling_for_every_selected_artist() -> 
     assert app is not None
 
 
+def test_rotation_routes_through_artist_capabilities_and_undo() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    text = ax.text(0.2, 0.7, "rotate")
+    rectangle = ax.add_patch(Rectangle((0.5, 0.3), 0.2, 0.25))
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    fig.signals.figure_selection_property_changed = Signal()
+    manager.select_elements([text, rectangle], primary=rectangle)
+
+    assert manager.selection.rotate_selection(17)
+    assert text.get_rotation() == 17
+    assert rectangle.get_angle() == 17
+
+    fig.change_tracker.edit[0]()
+    assert text.get_rotation() == 0
+    assert rectangle.get_angle() == 0
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
 def test_non_affine_fancy_bbox_is_blocking_instead_of_inexactly_editable() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
