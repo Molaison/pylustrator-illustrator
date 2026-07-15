@@ -90,6 +90,9 @@ def initialize(
 
     # remember line-numbers where texts are created
     def wrap_text_function(text):
+        if getattr(text, "_pylustrator_text_wrapper", False):
+            return text
+
         def wrapped_text(*args, **kwargs):
             element = text(
                 *args, fontdict=kwargs["fontdict"] if "fontdict" in kwargs else None
@@ -129,6 +132,8 @@ def initialize(
             element.set(**kwargs)
             return element
 
+        wrapped_text._pylustrator_text_wrapper = True
+        wrapped_text._pylustrator_original_text = text
         return wrapped_text
 
     Axes.text = wrap_text_function(Axes.text)
@@ -156,8 +161,10 @@ def initialize(
 
     if app is None:
         app = QtWidgets.QApplication(sys.argv)
-    old_pltshow = plt.show
-    old_pltfigure = plt.figure
+    if plt.show is not show:
+        old_pltshow = plt.show
+    if plt.figure is not figure:
+        old_pltfigure = plt.figure
     plt.show = show
     patchColormapsWithMetaInfo()
 
@@ -167,15 +174,18 @@ def initialize(
     plt.keys_for_lines = keys_for_lines
 
     # store the last figure save filename
-    sf = Figure.savefig
+    if not getattr(Figure.savefig, "_pylustrator_savefig_wrapper", False):
+        sf = Figure.savefig
 
-    def savefig(self, filename, *args, **kwargs):
-        self._last_saved_figure = getattr(self, "_last_saved_figure", []) + [
-            (filename, args, kwargs)
-        ]
-        sf(self, filename, *args, **kwargs)
+        def savefig(self, filename, *args, **kwargs):
+            self._last_saved_figure = getattr(self, "_last_saved_figure", []) + [
+                (filename, args, kwargs)
+            ]
+            return sf(self, filename, *args, **kwargs)
 
-    Figure.savefig = savefig
+        savefig._pylustrator_savefig_wrapper = True
+        savefig._pylustrator_original_savefig = sf
+        Figure.savefig = savefig
 
 
 def pyl_show(hide_window: bool = False):
@@ -267,6 +277,8 @@ def patchColormapsWithMetaInfo():
     """all colormaps now return color with metadata from which colormap the color came from"""
     from matplotlib.colors import Colormap
 
+    if getattr(Colormap.__call__, "_pylustrator_colormap_wrapper", False):
+        return
     cm_call = Colormap.__call__
 
     def new_call(self, *args, **kwargs):
@@ -276,6 +288,8 @@ def patchColormapsWithMetaInfo():
             c.setMeta(args[0], self.name)
         return c
 
+    new_call._pylustrator_colormap_wrapper = True
+    new_call._pylustrator_original_call = cm_call
     Colormap.__call__ = new_call
 
 

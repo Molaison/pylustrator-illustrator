@@ -36,6 +36,7 @@ from matplotlib.artist import Artist
 from matplotlib.figure import Figure
 from matplotlib.ticker import AutoLocator
 
+from pylustrator.artist_adapters import get_artist_adapter
 from pylustrator.change_tracker import getReference
 from pylustrator.QLinkableWidgets import (
     QColorWidget,
@@ -546,6 +547,32 @@ class LegendPropertiesWidget(QtWidgets.QWidget):
         self.properties[name] = value
         new_properties = self.properties.copy()
         target = self.target
+
+        # Frame visibility is an appearance property.  Reconstructing a
+        # Legend for it changes object identity, discards direct edits to its
+        # children, and leaves stale selection/undo references behind.
+        if name == "frameon":
+            if old_properties[name] == new_properties[name]:
+                return
+            fig = main_figure(target)
+            adapter = get_artist_adapter(target)
+
+            def setFrameOn(visible):
+                adapter.set_frame_on(visible)
+                self.properties[name] = bool(visible)
+                fig.figure_dragger.select_element(target)
+                fig.canvas.draw()
+                fig.selection.update_selection_rectangles()
+
+            def undo():
+                setFrameOn(old_properties[name])
+
+            def redo():
+                setFrameOn(new_properties[name])
+
+            redo()
+            fig.change_tracker.addEdit([undo, redo, f"Legend {name}"])
+            return
 
         def setProperties(properties):
             nonlocal target

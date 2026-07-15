@@ -1033,13 +1033,16 @@ class GrabbableRectangleSelection(GrabFunctions):
         for target in reversed(self.save_targets):
             state = start_states.get(id(target.target))
             if state is not None:
-                target.restore_state(state)
+                target.restore_state(state, record_changes=False)
         tracker_state = getattr(self, "move_start_tracker_state", None)
         tracker = getattr(self.figure, "change_tracker", None)
         restore = getattr(tracker, "restore_recording_state", None)
         if tracker_state is not None and restore is not None:
             restore(tracker_state)
         self.clear_move_previews()
+        if self.targets:
+            self.update_extent()
+            self.update_selection_rectangles()
 
     def end_move(self, edit_name: str = "Move", coalesce_key: str = None):
         """a grabber move stopped"""
@@ -1873,7 +1876,7 @@ class DragManager:
     def _is_pick_candidate(
         self, child: Artist, event: MouseEvent = None, explicit: bool = False
     ) -> bool:
-        if getattr(child, "figure", None) is None:
+        if not self._is_artist_attached(child):
             return False
         if not child.get_visible():
             return False
@@ -1902,7 +1905,7 @@ class DragManager:
         through them and selects a containing Axes, recreating the dangerous
         "clicked child, moved parent" behaviour through a different code path.
         """
-        if getattr(artist, "figure", None) is None or not artist.get_visible():
+        if not self._is_artist_attached(artist) or not artist.get_visible():
             return False
         scene = self._ensure_editor_scene()
         if scene.is_locked(artist) or scene.is_explicitly_hidden(artist):
@@ -1913,6 +1916,8 @@ class DragManager:
             return False
 
     def _artist_has_selection_geometry(self, artist: Artist) -> bool:
+        if not self._is_artist_attached(artist):
+            return False
         scene = self._ensure_editor_scene()
         if scene.is_locked(artist) or scene.is_explicitly_hidden(artist):
             return False
@@ -1929,6 +1934,30 @@ class DragManager:
             and points.shape[1] >= 2
             and np.all(np.isfinite(points[:, :2]))
         )
+
+    def _is_artist_attached(self, artist: Artist) -> bool:
+        """Reject replaced legends and all children registered beneath them."""
+
+        if getattr(artist, "figure", None) is None:
+            return False
+        current = artist
+        seen = set()
+        parent_map = getattr(self, "_selection_parent_by_id", {})
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            if isinstance(current, Legend):
+                axes = current.axes
+                if axes is not None:
+                    if axes.get_legend() is not current and current not in axes.artists:
+                        return False
+                else:
+                    figure = current.figure
+                    if figure is None or (
+                        current not in figure.legends and current not in figure.artists
+                    ):
+                        return False
+            current = parent_map.get(id(current))
+        return True
 
     def _resolve_selectable_artist(self, artist: Artist) -> Artist | None:
         if artist is None:

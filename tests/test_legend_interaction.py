@@ -120,6 +120,82 @@ def test_proxy_legend_property_change_preserves_anchor_and_contents() -> None:
     plt.close(fig)
 
 
+def test_frameon_property_preserves_legend_identity_children_and_undo() -> None:
+    from pylustrator.change_tracker import getReference
+    from pylustrator.components.qitem_properties import LegendPropertiesWidget
+
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    attach_figure_helpers(fig)
+    legend = ax.legend(
+        handles=[Patch(label="proxy A"), Patch(label="proxy B")],
+        labels=["proxy A", "proxy B"],
+        loc="upper center",
+        frameon=False,
+        fontsize=8,
+    )
+    fig.canvas.draw()
+    children = tuple([*legend.legend_handles, *legend.get_texts()])
+    renderer = fig.canvas.get_renderer()
+    child_bounds = [child.get_window_extent(renderer).bounds for child in children]
+
+    widget = LegendPropertiesWidget.__new__(LegendPropertiesWidget)
+    widget.properties = {"frameon": False}
+    widget.target = legend
+    widget.changePropertiy("frameon", True)
+
+    assert ax.get_legend() is legend
+    assert widget.target is legend
+    assert fig.figure_dragger.selected is legend
+    assert tuple([*legend.legend_handles, *legend.get_texts()]) == children
+    assert [child.get_window_extent(renderer).bounds for child in children] == child_bounds
+    assert legend.get_frame_on()
+    assert getReference(legend).endswith(".get_legend()")
+
+    undo, redo, _name = fig.change_tracker.edit
+    undo()
+    assert ax.get_legend() is legend
+    assert not legend.get_frame_on()
+    redo()
+    assert ax.get_legend() is legend
+    assert legend.get_frame_on()
+    plt.close(fig)
+
+
+def test_legend_selection_bounds_follow_visible_children_outside_layout_frame() -> None:
+    from pylustrator.artist_adapters import get_artist_adapter
+
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    legend = ax.legend(
+        handles=[Patch(label="A"), Patch(label="B")],
+        labels=["A", "B"],
+        loc="upper center",
+        frameon=False,
+    )
+    fig.canvas.draw()
+    legend.get_texts()[0].set_position((80.0, -25.0))
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    children = [*legend.legend_handles, *legend.get_texts()]
+    extents = np.array(
+        [child.get_window_extent(renderer).extents for child in children], dtype=float
+    )
+    visible_bounds = np.array(
+        [
+            np.min(extents[:, 0]),
+            np.min(extents[:, 1]),
+            np.max(extents[:, 2]),
+            np.max(extents[:, 3]),
+        ]
+    )
+    points = get_artist_adapter(legend).selection_points()
+    selection_bounds = np.array([*points[0], *points[1]])
+    layout_bounds = np.array(legend.get_window_extent(renderer).extents)
+
+    assert np.allclose(selection_bounds, visible_bounds)
+    assert not np.allclose(selection_bounds, layout_bounds)
+    plt.close(fig)
+
+
 def test_legend_children_are_pickable_and_referenceable() -> None:
     from pylustrator.change_tracker import ChangeTracker, getReference
     from pylustrator.drag_helper import DragManager
@@ -317,6 +393,7 @@ def test_extra_axes_legend_uses_artist_reference_not_current_axes_legend() -> No
     assert commands[1][1].startswith(".set_bbox_to_anchor(")
     assert "transFigure" in commands[1][1]
     assert "get_legend()" not in commands[1][1]
+    assert commands[-1] == [method, ".set_frame_on(True)"]
     for command_parent, command in commands:
         eval("command_parent" + command)
     assert ax.get_legend() is current

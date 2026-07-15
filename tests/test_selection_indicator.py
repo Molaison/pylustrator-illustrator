@@ -2080,6 +2080,83 @@ def test_multi_selection_drag_keeps_legend_child_rectangles_aligned() -> None:
     assert app is not None
 
 
+def test_failed_legend_commit_rolls_back_without_recording_again() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    legend = ax.legend(handles=[Patch(label="A")], frameon=False)
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_element(legend)
+    anchor_before = legend.get_bbox_to_anchor().bounds
+
+    class FailingLegendTracker(ChangeTracker):
+        def addNewLegendChange(self, target):
+            raise RuntimeError("simulated legend serialization failure")
+
+    fig.change_tracker = FailingLegendTracker()
+    manager.selection.start_move()
+    manager.selection.addOffset((12, -7), DIR_X0 | DIR_X1 | DIR_Y0 | DIR_Y1)
+    manager.selection.has_moved = True
+
+    try:
+        manager.selection.end_move()
+    except RuntimeError as error:
+        assert str(error) == "simulated legend serialization failure"
+    else:
+        raise AssertionError("Legend commit unexpectedly succeeded")
+
+    fig.canvas.draw()
+    manager.selection.update_extent()
+    manager.selection.update_selection_rectangles()
+    assert legend.get_bbox_to_anchor().bounds == anchor_before
+    assert np.allclose(
+        selection_target_extents(manager.selection)[0],
+        selection_rect_extents(manager.selection)[0],
+    )
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_frameon_property_keeps_the_live_drag_selection() -> None:
+    from pylustrator.components.qitem_properties import LegendPropertiesWidget
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    legend = ax.legend(handles=[Patch(label="A")], frameon=False)
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_element(legend)
+    renderer = fig.canvas.get_renderer()
+    bounds_before = legend.get_window_extent(renderer).bounds
+
+    widget = LegendPropertiesWidget.__new__(LegendPropertiesWidget)
+    widget.properties = {"frameon": False}
+    widget.target = legend
+    widget.changePropertiy("frameon", True)
+
+    assert ax.get_legend() is legend
+    assert manager.selected_element is legend
+    assert [target.target for target in manager.selection.targets] == [legend]
+    assert legend.get_frame_on()
+
+    manager.selection.start_move()
+    manager.selection.addOffset((12, -7), DIR_X0 | DIR_X1 | DIR_Y0 | DIR_Y1)
+    manager.selection.has_moved = True
+    manager.selection.end_move()
+    fig.canvas.draw()
+
+    assert ax.get_legend() is legend
+    bounds_after = legend.get_window_extent(renderer).bounds
+    assert np.allclose(
+        (bounds_after[0] - bounds_before[0], bounds_after[1] - bounds_before[1]),
+        (12, -7),
+    )
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
 def test_pyl_show_initializes_axes_defaults_before_drag_changes() -> None:
     from matplotlib import _pylab_helpers
     from pylustrator import QtGuiDrag

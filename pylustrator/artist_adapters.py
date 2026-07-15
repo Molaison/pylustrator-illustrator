@@ -14,6 +14,8 @@ order of ``isinstance`` branches.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from threading import RLock
 from typing import Iterable, Optional, Sequence
@@ -54,6 +56,22 @@ from packaging import version
 
 from .editor_model import EditorGroup
 from .operations import OperationSupport, TransformOperation
+
+
+_CHANGE_RECORDING_ENABLED = ContextVar(
+    "pylustrator_change_recording_enabled", default=True
+)
+
+
+@contextmanager
+def suspend_change_recording():
+    """Restore interaction state without emitting a second set of changes."""
+
+    token = _CHANGE_RECORDING_ENABLED.set(False)
+    try:
+        yield
+    finally:
+        _CHANGE_RECORDING_ENABLED.reset(token)
 
 
 def checkXLabel(target: Artist):
@@ -355,6 +373,8 @@ class ArtistAdapter:
         return ()
 
     def _record_change_records(self, records) -> None:
+        if not _CHANGE_RECORDING_ENABLED.get():
+            return
         records = tuple(records)
         if records and not self.capabilities.can_serialize:
             raise UnsupportedArtistError(
@@ -367,6 +387,8 @@ class ArtistAdapter:
             record.apply(tracker)
 
     def record_changes(self) -> None:
+        if not _CHANGE_RECORDING_ENABLED.get():
+            return
         self._record_change_records(self.serialize_changes())
 
     def invalidate_geometry_cache(self) -> None:
@@ -1147,8 +1169,53 @@ class LegendAdapter(ArtistAdapter):
         can_serialize=True,
     )
 
+    def __init__(self, target: Legend):
+        super().__init__(target)
+        if not hasattr(target, "_pylustrator_original_frameon"):
+            target._pylustrator_original_frameon = target.get_frame_on()
+
     def get_transform(self) -> Transform:
         return IdentityTransform()
+
+    def selection_points(self) -> np.ndarray:
+        """Measure the visible legend artwork, not only its layout frame.
+
+        Matplotlib permits legend texts and handles to be positioned outside
+        the packer's nominal bbox.  Figure-editing selection and alignment must
+        follow those visible children.  A visible frame remains part of the
+        artwork; an invisible frame contributes no selection padding.
+        """
+
+        preview = self._preview_points("_pylustrator_preview_selection_points")
+        if preview is not None:
+            return preview
+
+        point_sets = []
+        if self.target.get_frame_on():
+            point_sets.append(super().selection_points())
+
+        children = [
+            *getattr(self.target, "legend_handles", []),
+            *self.target.get_texts(),
+        ]
+        title = self.target.get_title()
+        if title is not None and title.get_text():
+            children.append(title)
+        for child in children:
+            if child is None or not child.get_visible():
+                continue
+            try:
+                points = np.asarray(
+                    get_artist_adapter(child).selection_points(), dtype=float
+                )
+            except (AttributeError, TypeError, ValueError, RuntimeError):
+                continue
+            if points.ndim == 2 and len(points) and np.all(np.isfinite(points)):
+                point_sets.append(points)
+
+        if point_sets:
+            return self.bounds_points(np.concatenate(point_sets))
+        return super().selection_points()
 
     def native_control_points(self):
         return [legend_display_loc(self.target)]
@@ -1163,6 +1230,17 @@ class LegendAdapter(ArtistAdapter):
 
     def serialize_changes(self):
         return (ChangeRecord.legend_change(self.target),)
+
+    def set_frame_on(self, visible: bool) -> bool:
+        """Toggle the legend frame without replacing the Legend object."""
+
+        visible = bool(visible)
+        if self.target.get_frame_on() == visible:
+            return False
+        self.target.set_frame_on(visible)
+        self.record_changes()
+        self.invalidate_geometry_cache()
+        return True
 
     def snapshot(self):
         bbox = self.target.get_bbox_to_anchor()
@@ -1610,4 +1688,5 @@ __all__ = [
     "legend_loc_transform",
     "register_artist_adapter",
     "set_legend_point_anchor_display",
+    "suspend_change_recording",
 ]

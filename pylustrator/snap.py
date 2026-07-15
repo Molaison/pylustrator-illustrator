@@ -38,6 +38,7 @@ from .artist_adapters import (
     legend_display_loc as legend_display_loc,
     legend_loc_transform as legend_loc_transform,
     set_legend_point_anchor_display as set_legend_point_anchor_display,
+    suspend_change_recording,
 )
 from .helper_functions import main_figure
 from .operations import OperationSupport, TransformOperation
@@ -130,8 +131,12 @@ class TargetWrapper:
     def get_restore_state(self):
         return self.adapter.snapshot()
 
-    def restore_state(self, state) -> None:
-        self.adapter.restore(state)
+    def restore_state(self, state, *, record_changes: bool = True) -> None:
+        if record_changes:
+            self.adapter.restore(state)
+            return
+        with suspend_change_recording():
+            self.adapter.restore(state)
 
     def get_extent(self):
         return self.adapter.get_extent()

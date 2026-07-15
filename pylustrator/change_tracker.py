@@ -719,6 +719,21 @@ class ChangeTracker:
                             f"transform={getReference(element.figure)}.transFigure)",
                         ]
                     )
+                # Non-current and figure-level legends already exist in the
+                # source tree, so appearance changes must be replayed in place.
+                # Emit this unconditionally: the source's original frameon
+                # value may differ from Matplotlib's rcParam default.
+                original_frameon = getattr(
+                    element, "_pylustrator_original_frameon", None
+                )
+                if (
+                    not exclude_default
+                    or original_frameon is None
+                    or element.get_frame_on() != original_frameon
+                ):
+                    commands.append(
+                        [element, f".set_frame_on({element.get_frame_on()!r})"]
+                    )
                 return commands
             return parent, f".legend({kwargs_to_string(kwargs)})"
         elif isinstance(element, Axes):
