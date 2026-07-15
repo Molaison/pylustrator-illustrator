@@ -30,6 +30,7 @@ from matplotlib.backend_bases import MouseEvent, KeyEvent
 from typing import Iterable, Sequence
 from qtpy import QtCore, QtGui, QtWidgets
 
+from .artist_adapters import iter_figure_legends, iter_legend_children
 from .snap import (
     TargetWrapper,
     getSnaps,
@@ -56,13 +57,7 @@ blit = False
 
 def _legend_selectable_children(legend: Legend) -> list[Artist]:
     """Return legend parts that Matplotlib does not expose reliably as children."""
-    children = []
-    children.extend(getattr(legend, "legend_handles", []))
-    children.extend(legend.get_texts())
-    title = legend.get_title()
-    if title is not None:
-        children.append(title)
-    return children
+    return list(iter_legend_children(legend))
 
 
 def iter_artist_children(element: Artist) -> list[tuple[Artist, bool]]:
@@ -1846,8 +1841,8 @@ class DragManager:
             self.make_draggable(text, fig)
         for patch in fig.patches:
             self.make_draggable(patch, fig)
-        for leg in fig.legends:
-            self.make_draggable(leg, fig)
+        for leg in iter_figure_legends(fig):
+            self.make_draggable(leg)
         for subfig in fig.subfigs:
             self.make_figure_draggable(subfig)
 

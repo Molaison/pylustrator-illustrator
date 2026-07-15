@@ -217,3 +217,113 @@ After the P0 fixes, the dedicated contract file reports 362 passed,
 accounting, not missing Artist types: supported-operation tests skip denied
 types, while rejection tests skip supported types. Registry equality guarantees
 that all 20 built-in registrations are present in the matrix.
+
+## Real Fig2 audit appendix
+
+A second audit at `447f76c` builds the disposable fork through
+`figure_workflow/validation/fig2_pylustrator_ab/fig2_fork_common.py`. The formal
+`editable/fig2.py` remained byte-identical before and after the audit at
+SHA-256
+`b0cd72abf3962cd6cd2354467ad57aa37ecc213332645d7cb56e6f4af598ad70`.
+
+The real figure contains 483 selectable and serializable instances, resolving
+13 concrete Matplotlib types through 12 adapters:
+
+| Concrete type | Instances | Adapter |
+|---|---:|---|
+| Annotation | 2 | AnnotationAdapter |
+| Axes | 13 | AxesAdapter |
+| AxesImage | 6 | AxesImageAdapter |
+| FillBetweenPolyCollection | 2 | PolyCollectionAdapter |
+| Legend | 8 | LegendAdapter |
+| Line2D | 189 | Line2DAdapter |
+| LineCollection | 7 | LineCollectionAdapter |
+| PathCollection | 40 | PathCollectionAdapter |
+| PathPatch | 35 | PathPatchAdapter |
+| PolyCollection | 1 | PolyCollectionAdapter |
+| Rectangle | 48 | RectangleAdapter |
+| RegularPolygon | 10 | RegularPolygonAdapter |
+| Text | 122 | TextAdapter |
+
+EditorGroup, Ellipse, FancyArrowPatch, ConnectionPatch, FancyBboxPatch, Wedge,
+Polygon, and the fallback Artist adapter have no selectable instance in this
+specific figure. They remain covered by the synthetic 20-type matrix.
+
+All 483 Fig2 instances advertise and pass finite selection bounds, translate,
+snapshot construction, and nonempty serialization records. Of these, 102
+advertise resize and 172 advertise rotation. The audit executes 6,279
+instance-level checks: 4,347 `OperationSupport` checks plus 1,932 selection,
+snapshot, serialization, and exact-reference checks.
+
+Seventy representative workflow checks span all 19 semantic/ownership
+categories in the figure:
+
+- 19 exact-selection and translate/preview/Undo/Redo workflows;
+- 5 advertised resize workflows;
+- 8 advertised rotation workflows;
+- 19 snapshot/restore round trips, including native rotation where available;
+- 19 real ChangeTracker generated-command replays.
+
+All geometry workflows pass. Maximum error is `3.41e-13 px` for translated
+control points, `2.28e-13 px` for preview/final, resize, snapshot, and Undo/Redo,
+and `0 degrees` for rotation. All 19 representative generated replays pass
+within `0.1 px`, including ordinary and current-Legend Line2D, Rectangle, and
+Text children.
+
+### Resolved real Fig2 reference defect: non-current Axes Legend children
+
+The first exhaustive reference check found 469 exact/evaluable references and
+14 failures. Every failure belonged to a live, selectable child of a
+non-current Axes Legend stored in `axes.artists`:
+
+| Owner | Child type | Count | Children |
+|---|---|---:|---|
+| `panel_a.artists[0]` | Rectangle | 3 | Diffusion, Hallucination, Astrolabe |
+| `panel_a.artists[0]` | Text | 4 | Diffusion, Hallucination, Astrolabe, Types |
+| `panel_g.artists[0]` | Line2D | 3 | domain-wise, full-length, ipTM < 0.7 |
+| `panel_g.artists[0]` | Text | 4 | domain-wise, full-length, ipTM < 0.7, method |
+
+The null `legend_Line2D` reference in both historical probe artifacts is the
+`domain-wise` handle owned by
+`plt.figure(1).ax_dict["panel_g"].artists[0]`. The alignment pair's other
+member is the valid current-Legend reference
+`panel_h.get_legend().legend_handles[0]`. Geometry alignment and Undo still
+pass; only the persistent locator is missing.
+
+This was a product defect, not a probe limitation. `getReference()` could resolve
+the non-current Legend itself as `axes.artists[0]`, but
+`get_legend_reference()` searched only `figure.legends` and each Axes' current
+`get_legend()`. It therefore falls through for the children: Line2D and
+Rectangle raise an empty `ValueError` when they are not found in ordinary Axes
+lists, while Text raises `TypeError: <class 'matplotlib.text.Text'> not found`.
+All 14 instances advertise serialization; their 20 emitted change records also
+contained unreplayable child targets.
+
+The fix introduces one authoritative Legend inventory covering
+`Figure.legends`, current `Axes.legend_`, and retained Legends in Figure/Axes
+`artists`. Selection discovery, Legend child discovery, and persistent
+reference resolution now consume that shared inventory. The post-fix audit
+resolves all `483/483` instances to the exact live object, with zero
+unreplayable instances and zero unreplayable change records.
+
+`tests/test_artist_reference_contract.py` now passes for Line2D, Rectangle,
+and Text children while also proving that the non-current Legend owner has an
+exact evaluable reference. The real-case artifact retains the original
+inventory categories and confirms that no reference failures remain.
+
+With the three reference xfails closed, the full headless suite reports 502
+passed, 119 explicit capability-branch skips, 7 strict P1/P2 xfails, and the
+same 4 pre-existing log-limit warnings. Ruff passes for the package, reference
+tests, and real-case audit script.
+
+Run the real audit from `Figures_source`:
+
+```bash
+QT_QPA_PLATFORM=offscreen \
+PYTHONPATH=figure_workflow/vendor/pylustrator-artist-adapters \
+uv run python \
+  figure_workflow/validation/fig2_pylustrator_ab/fig2_artist_contract_audit.py \
+  --commit 447f76c \
+  --output \
+  figure_workflow/validation/fig2_pylustrator_ab/artifacts/adapter_p0_real_contract.json
+```

@@ -95,18 +95,9 @@ def get_legend_reference(element: Artist):
     figure = getattr(element, "figure", None)
     if figure is None:
         return None
-    legends = list(
-        dict.fromkeys(
-            list(figure.legends)
-            + [
-                legend
-                for axes in figure.axes
-                for legend in [axes.get_legend()]
-                if legend is not None
-            ]
-        )
-    )
-    for legend in legends:
+    from .artist_adapters import iter_figure_legends
+
+    for legend in iter_figure_legends(figure):
         if element in legend.legend_handles:
             return (
                 getReference(legend)

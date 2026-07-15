@@ -142,6 +142,48 @@ def set_legend_point_anchor_display(
     )
 
 
+def iter_legend_children(legend: Legend) -> tuple[Artist, ...]:
+    """Return every persistent, directly editable child of a Legend."""
+
+    children = [*getattr(legend, "legend_handles", []), *legend.get_texts()]
+    title = legend.get_title()
+    if title is not None:
+        children.append(title)
+    return tuple(dict.fromkeys(child for child in children if child is not None))
+
+
+def iter_figure_legends(figure) -> tuple[Legend, ...]:
+    """Return one authoritative inventory of live Legends below *figure*.
+
+    Matplotlib stores legends in three places: ``Figure.legends``, the current
+    ``Axes.legend_``, and ``artists`` lists for additional retained legends.
+    Selection and persistent-reference resolution must see the same union.
+    """
+
+    legends = []
+    seen = set()
+
+    def add(legend) -> None:
+        if isinstance(legend, Legend) and id(legend) not in seen:
+            seen.add(id(legend))
+            legends.append(legend)
+
+    def visit(owner) -> None:
+        for legend in getattr(owner, "legends", []):
+            add(legend)
+        for artist in getattr(owner, "artists", []):
+            add(artist)
+        for axes in getattr(owner, "axes", []):
+            add(axes.get_legend())
+            for artist in axes.artists:
+                add(artist)
+        for subfigure in getattr(owner, "subfigs", []):
+            visit(subfigure)
+
+    visit(figure)
+    return tuple(legends)
+
+
 def legend_display_loc(legend: Legend) -> np.ndarray:
     if legend_anchor_is_point(legend):
         return np.array(legend.get_bbox_to_anchor().p0)
@@ -1218,15 +1260,14 @@ class LegendAdapter(ArtistAdapter):
         if self.target.get_frame_on():
             point_sets.append(super().selection_points())
 
-        children = [
-            *getattr(self.target, "legend_handles", []),
-            *self.target.get_texts(),
-        ]
+        children = list(iter_legend_children(self.target))
         title = self.target.get_title()
-        if title is not None and title.get_text():
-            children.append(title)
         for child in children:
-            if child is None or not child.get_visible():
+            if (
+                child is None
+                or not child.get_visible()
+                or (child is title and not title.get_text())
+            ):
                 continue
             try:
                 points = np.asarray(
@@ -1706,6 +1747,8 @@ __all__ = [
     "checkXLabel",
     "checkYLabel",
     "get_artist_adapter",
+    "iter_figure_legends",
+    "iter_legend_children",
     "legend_anchor_is_point",
     "legend_anchor_transform",
     "legend_display_loc",
