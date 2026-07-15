@@ -29,6 +29,7 @@ from matplotlib.patches import (
     Wedge,
 )
 from matplotlib.text import Annotation, Text
+from matplotlib.transforms import IdentityTransform
 
 from pylustrator.artist_adapters import (
     AnnotationAdapter,
@@ -57,6 +58,7 @@ from pylustrator.artist_adapters import (
     get_artist_adapter,
 )
 from pylustrator.editor_model import EditorGroup
+from pylustrator.commands import semantic_equal
 from pylustrator.operations import TransformIntent, TransformOperation
 from pylustrator.snap import TargetWrapper
 from pylustrator.transform_engine import TransformPlan, TransformPreflightError
@@ -677,7 +679,11 @@ def test_native_rotation_is_applied_to_the_selected_artist_only(artist_case) -> 
     visible = artist_case.target.get_window_extent(
         artist_case.figure.canvas.get_renderer()
     )
-    _assert_px_close(_bounds(adapter.selection_points()), visible.extents)
+    selection = _bounds(adapter.selection_points())
+    assert selection[0] <= visible.x0 + PIXEL_TOLERANCE
+    assert selection[1] <= visible.y0 + PIXEL_TOLERANCE
+    assert selection[2] >= visible.x1 - PIXEL_TOLERANCE
+    assert selection[3] >= visible.y1 - PIXEL_TOLERANCE
     np.testing.assert_allclose(
         _axis_position(artist_case.axes), axes_before, atol=0, rtol=0
     )
@@ -821,6 +827,165 @@ def test_generated_commands_replay_the_translated_rendered_bounds(
     )
 
 
+def test_line_nonfinite_coordinates_serialize_with_qualified_replay_literals() -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    fig.change_tracker = RecordingChangeTracker()
+    x = np.array([0.2, np.nan, np.inf, -np.inf, 0.8])
+    y = np.array([0.3, np.nan, np.inf, -np.inf, 0.7])
+    target = ax.plot(x, y)[0]
+    fig.canvas.draw()
+    adapter = get_artist_adapter(target)
+    initial_command = adapter.serialize_changes()[0].command
+
+    try:
+        assert "np.nan" in initial_command
+        assert "np.inf" in initial_command
+        assert "-np.inf" in initial_command
+
+        adapter.translate(TRANSLATION)
+        moved = np.asarray(target.get_xydata(), dtype=float).copy()
+        command = adapter.serialize_changes()[0].command
+        target.set_data(x, y)
+        exec(f"target{command}", {"target": target, "np": np})
+        np.testing.assert_allclose(
+            target.get_xydata(), moved, rtol=1e-12, atol=1e-15, equal_nan=True
+        )
+    finally:
+        plt.close(fig)
+
+
+def test_replay_literals_preserve_exact_finite_scale_and_qualify_nonfinite() -> None:
+    from pylustrator.replay import replay_literal
+
+    narrow_axis_value = 1.0000000000000002
+    assert float(replay_literal(narrow_axis_value)) == narrow_axis_value
+    assert float(replay_literal(1.2345678901234567e-12)) == (
+        1.2345678901234567e-12
+    )
+    assert replay_literal(np.nan) == "np.nan"
+    assert replay_literal(np.inf) == "np.inf"
+    assert replay_literal(-np.inf) == "-np.inf"
+
+
+def test_narrow_axis_line_translate_replays_without_precision_amplification() -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    ax.set_xlim(1.0, 1.0 + 1e-12)
+    ax.set_ylim(0.0, 1.0)
+    x = np.array([1.0 + 2e-13, 1.0 + 8e-13])
+    y = np.array([0.3, 0.7])
+    target = ax.plot(x, y, linewidth=3)[0]
+    fig.change_tracker = RecordingChangeTracker()
+    fig.canvas.draw()
+    adapter = get_artist_adapter(target)
+
+    try:
+        adapter.translate(TRANSLATION)
+        fig.canvas.draw()
+        moved_bounds = _bounds(adapter.selection_points())
+        command = adapter.serialize_changes()[0].command
+
+        target.set_data(x, y)
+        exec(f"target{command}", {"target": target, "np": np})
+        fig.canvas.draw()
+        _assert_px_close(_bounds(adapter.selection_points()), moved_bounds)
+    finally:
+        plt.close(fig)
+
+
+def test_saved_generated_block_imports_numpy_for_nonfinite_literals(
+    monkeypatch,
+) -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    target = ax.plot([0.2, np.nan, 0.8], [0.3, np.nan, 0.7])[0]
+    fig.canvas.draw()
+    tracker = _install_real_change_tracker(fig)
+    tracker.get_reference_cached = {}
+    get_artist_adapter(target).record_changes()
+    saved = {}
+
+    import pylustrator.change_tracker as change_tracker_module
+
+    monkeypatch.setattr(change_tracker_module, "getTextFromFile", lambda *_args: [])
+    monkeypatch.setattr(
+        change_tracker_module, "stack_position", object(), raising=False
+    )
+
+    def capture_output(output, *_args):
+        saved["lines"] = list(output)
+
+    monkeypatch.setattr(change_tracker_module, "insertTextToFile", capture_output)
+
+    try:
+        tracker.save()
+        generated = "\n".join(saved["lines"])
+        assert "import numpy as np" in generated
+        assert generated.index("import numpy as np") < generated.index("np.nan")
+
+        target.set_data([0.1, 0.9], [0.1, 0.9])
+        namespace = {"plt": plt}
+        exec(generated, namespace)
+        assert "np" in namespace
+        assert np.isnan(target.get_xydata()[1]).all()
+    finally:
+        plt.close(fig)
+
+
+@pytest.mark.parametrize("kind", ["rectangle", "ellipse", "text"])
+def test_tiny_log_coordinates_translate_serialize_and_replay_losslessly(kind) -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlim(1e-12, 1e-6)
+    ax.set_ylim(1e-12, 1e-6)
+    if kind == "rectangle":
+        target = ax.add_patch(
+            Rectangle(
+                (2e-10, 3e-10),
+                1e-10,
+                2e-10,
+                facecolor="none",
+                edgecolor="black",
+                label="_rect-data",
+            )
+        )
+    elif kind == "ellipse":
+        target = ax.add_patch(
+            Ellipse(
+                (3e-10, 4e-10),
+                1e-10,
+                2e-10,
+                facecolor="none",
+                edgecolor="black",
+                label="qa-tiny-ellipse",
+            )
+        )
+    else:
+        target = ax.text(3e-10, 4e-10, "tiny log text")
+    fig.canvas.draw()
+    tracker = _install_real_change_tracker(fig)
+    wrapper = TargetWrapper(target)
+    before_state = wrapper.get_restore_state()
+
+    try:
+        wrapper.translate(TRANSLATION)
+        fig.canvas.draw()
+        moved_bounds = _bounds(wrapper.get_selection_points())
+        generated = list(tracker.changes.values())
+        assert generated
+        assert "e-" in " ".join(command for _, command in generated)
+
+        wrapper.restore_state(before_state, record_changes=False)
+        namespace = {"mpl": matplotlib, "np": np, "plt": plt}
+        from pylustrator.change_tracker import getReference
+
+        for command_target, command in generated:
+            exec(f"{getReference(command_target)}{command}", namespace)
+        fig.canvas.draw()
+        _assert_px_close(_bounds(wrapper.get_selection_points()), moved_bounds)
+    finally:
+        plt.close(fig)
+
+
 def _observable_state(built: BuiltArtistCase) -> tuple:
     adapter = built.adapter
     try:
@@ -871,7 +1036,7 @@ def test_unsupported_operation_is_rejected_without_mutation(
         artist_case.spec.name == "Artist fallback"
         and operation is TransformOperation.TRANSLATE
     ):
-        pytest.skip("covered by strict-xfail minimum reproduction")
+        pytest.skip("covered by dedicated adapter-contract error tests")
     before = _observable_state(artist_case)
 
     with pytest.raises(UnsupportedArtistError):
@@ -883,13 +1048,6 @@ def test_unsupported_operation_is_rejected_without_mutation(
     _assert_observable_state_equal(_observable_state(artist_case), before)
 
 
-@pytest.mark.xfail(
-    reason=(
-        "confirmed product defect: fallback translation reaches NumPy broadcasting "
-        "instead of rejecting through UnsupportedArtistError"
-    ),
-    strict=True,
-)
 def test_fallback_translate_rejects_with_adapter_contract_error() -> None:
     built = _build_case(next(case for case in ARTIST_CASES if case.name == "Artist fallback"))
     before = _observable_state(built)
@@ -900,6 +1058,112 @@ def test_fallback_translate_rejects_with_adapter_contract_error() -> None:
         _assert_observable_state_equal(_observable_state(built), before)
     finally:
         plt.close(built.figure)
+
+
+def test_fallback_display_transform_rejects_with_adapter_contract_error() -> None:
+    built = _build_case(next(case for case in ARTIST_CASES if case.name == "Artist fallback"))
+    before = _observable_state(built)
+
+    try:
+        with pytest.raises(UnsupportedArtistError):
+            built.adapter.apply_display_transform(np.eye(3))
+        _assert_observable_state_equal(_observable_state(built), before)
+    finally:
+        plt.close(built.figure)
+
+
+def test_display_transform_rejects_non_translation_matrix_without_mutation() -> None:
+    built = _build_case(next(case for case in ARTIST_CASES if case.name == "Line2D"))
+    before = _observable_state(built)
+    scale = np.array(
+        [[1.2, 0.0, -10.0], [0.0, 0.8, 12.0], [0.0, 0.0, 1.0]]
+    )
+
+    try:
+        assert not built.adapter.supports_operation(
+            TransformOperation.RESIZE_GEOMETRY
+        )
+        with pytest.raises(UnsupportedArtistError, match="semantic resize"):
+            built.adapter.apply_display_transform(scale)
+        _assert_observable_state_equal(_observable_state(built), before)
+    finally:
+        plt.close(built.figure)
+
+
+def test_display_transform_preserves_legacy_pure_translation() -> None:
+    built = _build_case(next(case for case in ARTIST_CASES if case.name == "Line2D"))
+    bounds_before = _bounds(built.adapter.selection_points())
+    matrix = np.array(
+        [
+            [1.0, 0.0, TRANSLATION[0]],
+            [0.0, 1.0, TRANSLATION[1]],
+            [0.0, 0.0, 1.0],
+        ]
+    )
+
+    try:
+        built.adapter.apply_display_transform(matrix)
+        built.figure.canvas.draw()
+        _assert_px_close(
+            _bounds(built.adapter.selection_points()),
+            bounds_before + np.tile(TRANSLATION, 2),
+        )
+    finally:
+        plt.close(built.figure)
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "line",
+        "path_collection",
+        "line_collection",
+        "poly_collection",
+        "path_patch",
+        "polygon",
+    ],
+)
+def test_empty_geometry_adapters_deny_operations_without_array_errors(kind) -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    tracker = RecordingChangeTracker()
+    fig.change_tracker = tracker
+    if kind == "line":
+        target = ax.plot([], [])[0]
+    elif kind == "path_collection":
+        target = ax.scatter([], [])
+    elif kind == "line_collection":
+        target = LineCollection([])
+        ax.add_collection(target)
+    elif kind == "poly_collection":
+        target = PolyCollection([])
+        ax.add_collection(target)
+    elif kind == "path_patch":
+        target = ax.add_patch(PathPatch(Path(np.empty((0, 2)))))
+    else:
+        target = ax.add_patch(Polygon(np.empty((0, 2))))
+    fig.canvas.draw()
+    adapter = get_artist_adapter(target)
+
+    try:
+        assert not adapter.capabilities.editable
+        assert not adapter.operation_support(TransformOperation.SELECT).supported
+        assert not adapter.operation_support(TransformOperation.TRANSLATE).supported
+        assert not adapter.operation_support(TransformOperation.RESIZE_GEOMETRY).supported
+        assert not adapter.operation_support(TransformOperation.SNAPSHOT).supported
+        assert not adapter.operation_support(TransformOperation.SERIALIZE).supported
+        assert adapter.selection_points().shape == (0, 2)
+        with pytest.raises(UnsupportedArtistError):
+            adapter.translate(TRANSLATION)
+        with pytest.raises(UnsupportedArtistError):
+            adapter.apply_display_transform(np.eye(3))
+        with pytest.raises(UnsupportedArtistError):
+            adapter.resize(np.eye(3))
+        with pytest.raises(UnsupportedArtistError):
+            adapter.snapshot()
+        assert tracker.calls == []
+        assert tracker.changes == {}
+    finally:
+        plt.close(fig)
 
 
 def test_axis_labels_translate_in_display_space_and_restore_labelpad() -> None:
@@ -984,7 +1248,6 @@ def test_legend_selection_bounds_cover_visible_children_and_optional_frame(
     fig.canvas.draw()
     legend.get_texts()[0].set_position((35.0, -18.0))
     fig.canvas.draw()
-    renderer = fig.canvas.get_renderer()
     visible_children = [
         *legend.legend_handles,
         *legend.get_texts(),
@@ -997,7 +1260,9 @@ def test_legend_selection_bounds_cover_visible_children_and_optional_frame(
                 np.asarray(get_artist_adapter(child).selection_points(), dtype=float)
             )
     if frameon:
-        expected_points.extend(legend.get_window_extent(renderer).get_points())
+        expected_points.extend(
+            get_artist_adapter(legend.get_frame()).selection_points()
+        )
 
     try:
         _assert_px_close(
@@ -1008,13 +1273,90 @@ def test_legend_selection_bounds_cover_visible_children_and_optional_frame(
         plt.close(fig)
 
 
-@pytest.mark.xfail(
-    reason=(
-        "confirmed product defect: generic Patch selection bounds omit visible "
-        "stroke width while the adapter contract calls them visible bounds"
-    ),
-    strict=True,
-)
+@pytest.mark.parametrize("kind", ["text", "annotation"])
+def test_text_bbox_selection_bounds_include_visible_edge_stroke(kind) -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    fig.change_tracker = RecordingChangeTracker()
+    bbox_style = {
+        "facecolor": "none",
+        "edgecolor": "black",
+        "linewidth": 20,
+        "pad": 10,
+    }
+    if kind == "text":
+        target = ax.text(0.3, 0.6, "QA bbox", bbox=bbox_style)
+    else:
+        target = ax.annotate(
+            "QA bbox",
+            xy=(0.7, 0.3),
+            xytext=(0.3, 0.6),
+            bbox=bbox_style,
+        )
+    fig.canvas.draw()
+    target.update_bbox_position_size(fig.canvas.get_renderer())
+    bbox_patch = target.get_bbox_patch()
+    raw = bbox_patch.get_window_extent(fig.canvas.get_renderer()).extents
+    radius = bbox_patch.get_linewidth() * fig.dpi / 72.0 / 2
+    expected = raw + np.array([-radius, -radius, radius, radius])
+
+    try:
+        _assert_px_close(
+            _bounds(get_artist_adapter(target).selection_points()), expected
+        )
+    finally:
+        plt.close(fig)
+
+
+def test_annotation_selection_bounds_include_arrow_stroke_and_translate() -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    fig.change_tracker = RecordingChangeTracker()
+    target = ax.annotate(
+        "thick arrow",
+        xy=(0.75, 0.25),
+        xytext=(0.25, 0.7),
+        arrowprops={"arrowstyle": "->", "linewidth": 20, "color": "black"},
+    )
+    fig.canvas.draw()
+    adapter = get_artist_adapter(target)
+    renderer = fig.canvas.get_renderer()
+    raw = target.get_window_extent(renderer).get_points()
+    arrow = get_artist_adapter(target.arrow_patch).selection_points()
+    expected = _bounds(np.concatenate((raw, arrow)))
+    before = _bounds(adapter.selection_points())
+
+    try:
+        _assert_px_close(before, expected)
+        adapter.translate(TRANSLATION)
+        fig.canvas.draw()
+        _assert_px_close(
+            _bounds(adapter.selection_points()),
+            before + np.tile(TRANSLATION, 2),
+        )
+    finally:
+        plt.close(fig)
+
+
+def test_legend_frame_selection_bounds_include_visible_edge_stroke() -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    fig.change_tracker = RecordingChangeTracker()
+    ax.plot([0, 1], [0, 1], label="QA legend")
+    legend = ax.legend(frameon=True)
+    legend.get_frame().set_linewidth(20)
+    fig.canvas.draw()
+    frame_bounds = _bounds(
+        get_artist_adapter(legend.get_frame()).selection_points()
+    )
+
+    try:
+        selection = _bounds(get_artist_adapter(legend).selection_points())
+        assert selection[0] <= frame_bounds[0] + PIXEL_TOLERANCE
+        assert selection[1] <= frame_bounds[1] + PIXEL_TOLERANCE
+        assert selection[2] >= frame_bounds[2] - PIXEL_TOLERANCE
+        assert selection[3] >= frame_bounds[3] - PIXEL_TOLERANCE
+    finally:
+        plt.close(fig)
+
+
 def test_rectangle_selection_bounds_include_visible_stroke_width() -> None:
     fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
     fig.change_tracker = RecordingChangeTracker()
@@ -1043,13 +1385,134 @@ def test_rectangle_selection_bounds_include_visible_stroke_width() -> None:
         plt.close(fig)
 
 
-@pytest.mark.xfail(
-    reason=(
-        "confirmed product defect: Line2D selection bounds include markers but "
-        "omit the visible line stroke width"
-    ),
-    strict=True,
-)
+def test_thick_patch_resize_keeps_stroke_fixed_and_preview_matches_commit() -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    fig.change_tracker = RecordingChangeTracker()
+    target = ax.add_patch(
+        Rectangle(
+            (0.2, 0.25),
+            0.4,
+            0.3,
+            facecolor="none",
+            edgecolor="black",
+            linewidth=18,
+        )
+    )
+    fig.canvas.draw()
+    adapter = get_artist_adapter(target)
+    visible_before = np.asarray(adapter.selection_points(), dtype=float)
+    controls_before = np.asarray(adapter.control_points(), dtype=float)
+    matrix = np.array(
+        [[1.2, 0.0, -25.0], [0.0, 0.8, 20.0], [0.0, 0.0, 1.0]],
+        dtype=float,
+    )
+    preview_visible = adapter.preview_resize_selection_points(matrix)
+    preview_controls = adapter.preview_resize_control_points(matrix)
+
+    try:
+        assert not np.allclose(
+            preview_controls, adapter._transform_points(matrix, controls_before)
+        )
+        adapter.resize(matrix)
+        fig.canvas.draw()
+        _assert_px_close(adapter.control_points(), preview_controls)
+        _assert_px_close(adapter.selection_points(), preview_visible)
+        assert target.get_linewidth() == pytest.approx(18)
+        _assert_px_close(
+            _bounds(preview_visible),
+            _bounds(adapter._transform_points(matrix, visible_before)),
+        )
+    finally:
+        plt.close(fig)
+
+
+def test_thick_patch_resize_clamps_before_fixed_stroke_would_invert() -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    fig.change_tracker = RecordingChangeTracker()
+    target = ax.add_patch(
+        Rectangle(
+            (0.2, 0.25),
+            0.4,
+            0.3,
+            facecolor="none",
+            edgecolor="black",
+            linewidth=30,
+            label="qa-collapse",
+        )
+    )
+    fig.canvas.draw()
+    adapter = get_artist_adapter(target)
+    visible = _bounds(adapter.selection_points())
+    desired_width = 5.0
+    scale_x = desired_width / (visible[2] - visible[0])
+    matrix = np.array(
+        [
+            [scale_x, 0.0, visible[0] * (1.0 - scale_x)],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+    )
+    preview = _bounds(adapter.preview_resize_selection_points(matrix))
+    minimum_width = target.get_linewidth() * fig.dpi / 72.0
+
+    try:
+        assert preview[0] == pytest.approx(visible[0])
+        assert preview[2] - preview[0] == pytest.approx(
+            minimum_width, abs=PIXEL_TOLERANCE
+        )
+        adapter.resize(matrix)
+        fig.canvas.draw()
+        _assert_px_close(_bounds(adapter.selection_points()), preview)
+        assert target.get_width() == pytest.approx(0.0, abs=1e-12)
+    finally:
+        plt.close(fig)
+
+
+def test_curved_path_patch_resize_preview_uses_rendered_path_not_control_hull() -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    fig.change_tracker = RecordingChangeTracker()
+    path = Path(
+        [
+            [0.2, 0.2],
+            [0.2, 1.0],
+            [0.8, 1.0],
+            [0.8, 0.2],
+            [0.2, 0.2],
+        ],
+        [Path.MOVETO, Path.CURVE4, Path.CURVE4, Path.CURVE4, Path.CLOSEPOLY],
+    )
+    target = ax.add_patch(
+        PathPatch(
+            path,
+            facecolor="none",
+            edgecolor="black",
+            linewidth=18,
+            label="qa-curved-path",
+        )
+    )
+    fig.canvas.draw()
+    adapter = get_artist_adapter(target)
+    visible_before = np.asarray(adapter.selection_points(), dtype=float)
+    matrix = np.array(
+        [[1.18, 0.0, -22.0], [0.0, 0.72, 35.0], [0.0, 0.0, 1.0]],
+        dtype=float,
+    )
+    preview_visible = adapter.preview_resize_selection_points(matrix)
+    preview_controls = adapter.preview_resize_control_points(matrix)
+
+    try:
+        adapter.resize(matrix)
+        fig.canvas.draw()
+        _assert_px_close(adapter.control_points(), preview_controls)
+        _assert_px_close(adapter.selection_points(), preview_visible)
+        _assert_px_close(
+            _bounds(preview_visible),
+            _bounds(adapter._transform_points(matrix, visible_before)),
+        )
+    finally:
+        plt.close(fig)
+
+
 def test_line_selection_bounds_include_visible_stroke_width() -> None:
     fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
     fig.change_tracker = RecordingChangeTracker()
@@ -1068,13 +1531,31 @@ def test_line_selection_bounds_include_visible_stroke_width() -> None:
         plt.close(fig)
 
 
-@pytest.mark.xfail(
-    reason=(
-        "confirmed product defect: PathCollection uses one global maximum marker "
-        "padding instead of the per-item visible envelope"
-    ),
-    strict=True,
-)
+def test_line_marker_selection_bounds_include_visible_edge_stroke() -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    fig.change_tracker = RecordingChangeTracker()
+    target = ax.plot(
+        [0.3, 0.7],
+        [0.5, 0.5],
+        linestyle="none",
+        marker="o",
+        markersize=20,
+        markerfacecolor="none",
+        markeredgecolor="black",
+        markeredgewidth=12,
+    )[0]
+    fig.canvas.draw()
+    bounds = _bounds(get_artist_adapter(target).selection_points())
+    expected_height = (20 + 12) * fig.dpi / 72.0
+
+    try:
+        assert bounds[3] - bounds[1] == pytest.approx(
+            expected_height, abs=PIXEL_TOLERANCE
+        )
+    finally:
+        plt.close(fig)
+
+
 def test_path_collection_selection_bounds_use_each_marker_size() -> None:
     built = _build_case(
         next(case for case in ARTIST_CASES if case.name == "PathCollection")
@@ -1106,13 +1587,75 @@ def test_path_collection_selection_bounds_use_each_marker_size() -> None:
         plt.close(built.figure)
 
 
-@pytest.mark.xfail(
-    reason=(
-        "confirmed product defect: LineCollection applies the global maximum "
-        "linewidth padding to every segment instead of a per-segment envelope"
-    ),
-    strict=True,
-)
+def test_path_collection_style_arrays_do_not_create_phantom_items() -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    fig.change_tracker = RecordingChangeTracker()
+    target = ax.scatter(
+        [0.5],
+        [0.5],
+        s=[100.0],
+        facecolors="none",
+        edgecolors=["black", "black"],
+        linewidths=[1.0, 30.0],
+    )
+    fig.canvas.draw()
+    adapter = get_artist_adapter(target)
+    rendered_groups = adapter.display_groups()
+    padding = target.get_linewidths()[0] * fig.dpi / 72.0 / 2.0
+    expected = _bounds(rendered_groups[0]) + np.array(
+        [-padding, -padding, padding, padding]
+    )
+
+    try:
+        assert len(rendered_groups) == 1
+        _assert_px_close(_bounds(adapter.selection_points()), expected)
+    finally:
+        plt.close(fig)
+
+
+def test_masked_path_collection_skips_invalid_items_and_translates_finite_bounds() -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    fig.change_tracker = RecordingChangeTracker()
+    x = np.ma.array([0.2, 0.5, 0.8], mask=[False, True, False])
+    y = np.ma.array([0.3, 0.6, 0.7], mask=[False, True, False])
+    target = ax.scatter(
+        x,
+        y,
+        s=np.ma.array([25.0, 400.0, 100.0], mask=[False, True, False]),
+        linewidths=np.ma.array([1.0, 20.0, 3.0], mask=[False, True, False]),
+    )
+    with pytest.warns(UserWarning, match="converting a masked element"):
+        fig.canvas.draw()
+    adapter = get_artist_adapter(target)
+    before = _bounds(adapter.selection_points())
+    offsets_before = np.ma.asarray(target.get_offsets()).copy()
+
+    try:
+        assert np.all(np.isfinite(before))
+        adapter.translate(TRANSLATION)
+        with pytest.warns(UserWarning, match="converting a masked element"):
+            fig.canvas.draw()
+        moved_offsets = adapter.point_array(target.get_offsets())
+        command = adapter.serialize_changes()[0].command
+        assert "np.nan" in command
+        _assert_px_close(
+            _bounds(adapter.selection_points()),
+            before + np.tile(TRANSLATION, 2),
+        )
+
+        target.set_offsets(offsets_before)
+        exec(f"target{command}", {"target": target, "np": np})
+        np.testing.assert_allclose(
+            adapter.point_array(target.get_offsets()),
+            moved_offsets,
+            rtol=1e-12,
+            atol=1e-15,
+            equal_nan=True,
+        )
+    finally:
+        plt.close(fig)
+
+
 def test_line_collection_selection_bounds_use_each_segment_linewidth() -> None:
     fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
     fig.change_tracker = RecordingChangeTracker()
@@ -1142,13 +1685,103 @@ def test_line_collection_selection_bounds_use_each_segment_linewidth() -> None:
         plt.close(fig)
 
 
-@pytest.mark.xfail(
-    reason=(
-        "confirmed product defect: PolyCollection applies the global maximum "
-        "linewidth padding to every polygon instead of a per-item envelope"
-    ),
-    strict=True,
-)
+def test_line_collection_transform_and_replay_preserve_nan_path_breaks() -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    fig.change_tracker = RecordingChangeTracker()
+    vertices = np.array(
+        [
+            [0.1, 0.1],
+            [0.2, 0.2],
+            [np.nan, np.nan],
+            [0.8, 0.8],
+            [0.9, 0.9],
+        ]
+    )
+    target = LineCollection([vertices], linewidths=[4.0])
+    ax.add_collection(target)
+    fig.canvas.draw()
+    adapter = get_artist_adapter(target)
+    vertices_before = target.get_paths()[0].vertices.copy()
+    bounds_before = _bounds(adapter.selection_points())
+
+    try:
+        adapter.translate(np.zeros(2))
+        np.testing.assert_allclose(
+            target.get_paths()[0].vertices,
+            vertices_before,
+            rtol=0,
+            atol=0,
+            equal_nan=True,
+        )
+
+        adapter.translate(TRANSLATION)
+        fig.canvas.draw()
+        moved_vertices = target.get_paths()[0].vertices.copy()
+        command = adapter.serialize_changes()[0].command
+        assert moved_vertices.shape == vertices_before.shape
+        assert np.isnan(moved_vertices[2]).all()
+        assert "np.nan" in command
+        _assert_px_close(
+            _bounds(adapter.selection_points()),
+            bounds_before + np.tile(TRANSLATION, 2),
+        )
+
+        target.set_segments([vertices_before])
+        exec(f"target{command}", {"target": target, "np": np})
+        np.testing.assert_allclose(
+            target.get_paths()[0].vertices,
+            moved_vertices,
+            rtol=1e-12,
+            atol=1e-15,
+            equal_nan=True,
+        )
+    finally:
+        plt.close(fig)
+
+
+@pytest.mark.parametrize("kind", ["line", "poly"])
+def test_offset_line_and_poly_collections_are_explicitly_denied(kind) -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    tracker = RecordingChangeTracker()
+    fig.change_tracker = tracker
+    kwargs = {
+        "offsets": [[0.2, 0.2], [0.8, 0.8]],
+        "transOffset": ax.transData,
+        "transform": IdentityTransform(),
+    }
+    if kind == "line":
+        target = LineCollection(
+            [[[-10.0, 0.0], [10.0, 0.0]]], linewidths=[4.0], **kwargs
+        )
+    else:
+        target = PolyCollection(
+            [[[-10.0, -5.0], [10.0, -5.0], [10.0, 8.0], [-10.0, 8.0]]],
+            **kwargs,
+        )
+    ax.add_collection(target)
+    fig.canvas.draw()
+    adapter = get_artist_adapter(target)
+    paths_before = [path.vertices.copy() for path in target.get_paths()]
+    offsets_before = np.asarray(target.get_offsets(), dtype=float).copy()
+
+    try:
+        assert not adapter.capabilities.editable
+        for operation in TransformOperation:
+            assert not adapter.operation_support(operation).supported
+        with pytest.raises(UnsupportedArtistError):
+            adapter.translate(TRANSLATION)
+        with pytest.raises(UnsupportedArtistError):
+            adapter.snapshot()
+        with pytest.raises(UnsupportedArtistError):
+            adapter.record_changes()
+        for actual, expected in zip(target.get_paths(), paths_before):
+            np.testing.assert_array_equal(actual.vertices, expected)
+        np.testing.assert_array_equal(target.get_offsets(), offsets_before)
+        assert tracker.calls == []
+    finally:
+        plt.close(fig)
+
+
 def test_poly_collection_selection_bounds_use_each_polygon_linewidth() -> None:
     fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
     fig.change_tracker = RecordingChangeTracker()
@@ -1158,6 +1791,7 @@ def test_poly_collection_selection_bounds_use_each_polygon_linewidth() -> None:
             [[0.6, 0.65], [0.8, 0.65], [0.8, 0.8], [0.6, 0.8]],
         ],
         linewidths=[2.0, 10.0],
+        edgecolors="black",
     )
     ax.add_collection(target)
     fig.canvas.draw()
@@ -1178,14 +1812,30 @@ def test_poly_collection_selection_bounds_use_each_polygon_linewidth() -> None:
         plt.close(fig)
 
 
-@pytest.mark.xfail(
-    reason=(
-        "confirmed product defect: EditorGroup translates members through their "
-        "adapters and then records the same member changes a second time"
-    ),
-    strict=True,
-)
-def test_editor_group_records_each_member_change_once() -> None:
+def test_poly_collection_invisible_edges_add_no_selection_padding() -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    fig.change_tracker = RecordingChangeTracker()
+    target = PolyCollection(
+        [
+            [[0.2, 0.2], [0.4, 0.2], [0.4, 0.35], [0.2, 0.35]],
+            [[0.6, 0.65], [0.8, 0.65], [0.8, 0.8], [0.6, 0.8]],
+        ],
+        linewidths=[2.0, 30.0],
+        edgecolors="none",
+    )
+    ax.add_collection(target)
+    fig.canvas.draw()
+    adapter = get_artist_adapter(target)
+    geometry = adapter.bounds_points(np.concatenate(adapter.display_groups()))
+
+    try:
+        _assert_px_close(adapter.selection_points(), geometry)
+    finally:
+        plt.close(fig)
+
+
+@pytest.mark.parametrize("operation", ["translate", "resize"])
+def test_editor_group_records_each_member_change_once(operation) -> None:
     built = _build_case(
         next(case for case in ARTIST_CASES if case.name == "EditorGroup")
     )
@@ -1195,10 +1845,98 @@ def test_editor_group_records_each_member_change_once() -> None:
     )
 
     try:
-        built.adapter.translate(TRANSLATION)
+        if operation == "translate":
+            built.adapter.translate(TRANSLATION)
+        else:
+            built.adapter.resize(
+                np.array(
+                    [[1.05, 0.0, -5.0], [0.0, 0.95, 7.0], [0.0, 0.0, 1.0]]
+                )
+            )
         assert len(built.tracker.calls) == expected_calls
     finally:
         plt.close(built.figure)
+
+
+def test_editor_group_resize_reapplies_each_members_fixed_stroke_outset() -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    tracker = RecordingChangeTracker()
+    fig.change_tracker = tracker
+    first = ax.add_patch(
+        Rectangle(
+            (0.15, 0.2),
+            0.18,
+            0.22,
+            facecolor="none",
+            edgecolor="black",
+            linewidth=4,
+            label="qa-group-first",
+        )
+    )
+    second = ax.add_patch(
+        Rectangle(
+            (0.55, 0.3),
+            0.2,
+            0.26,
+            facecolor="none",
+            edgecolor="black",
+            linewidth=18,
+            label="qa-group-second",
+        )
+    )
+    group = EditorGroup(fig, "qa-thick-group", [first, second], name="QA Thick")
+    fig.canvas.draw()
+    adapter = get_artist_adapter(group)
+    visible_before = np.asarray(adapter.selection_points(), dtype=float)
+    matrix = np.array(
+        [[1.15, 0.0, -20.0], [0.0, 0.85, 18.0], [0.0, 0.0, 1.0]],
+        dtype=float,
+    )
+    preview_visible = adapter.preview_resize_selection_points(matrix)
+    preview_controls = adapter.preview_resize_control_points(matrix)
+    expected_calls = sum(
+        len(get_artist_adapter(member).serialize_changes())
+        for member in group.members
+    )
+
+    try:
+        adapter.resize(matrix)
+        fig.canvas.draw()
+        _assert_px_close(adapter.control_points(), preview_controls)
+        _assert_px_close(
+            _bounds(adapter.selection_points()), _bounds(preview_visible)
+        )
+        _assert_px_close(
+            _bounds(preview_visible),
+            _bounds(adapter._transform_points(matrix, visible_before)),
+        )
+        assert len(tracker.calls) == expected_calls
+        assert first.get_linewidth() == pytest.approx(4)
+        assert second.get_linewidth() == pytest.approx(18)
+    finally:
+        plt.close(fig)
+
+
+def test_editor_group_selection_bounds_exclude_hidden_members() -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    fig.change_tracker = RecordingChangeTracker()
+    visible = ax.add_patch(
+        Rectangle((0.1, 0.2), 0.2, 0.25, label="qa-visible-member")
+    )
+    hidden = ax.add_patch(
+        Rectangle((0.7, 0.65), 0.2, 0.2, label="qa-hidden-member")
+    )
+    hidden.set_visible(False)
+    group = EditorGroup(fig, "qa-visible-group", [visible, hidden], name="QA Visible")
+    fig.canvas.draw()
+
+    try:
+        _assert_px_close(
+            _bounds(get_artist_adapter(group).selection_points()),
+            _bounds(get_artist_adapter(visible).selection_points()),
+        )
+    finally:
+        plt.close(fig)
 
 
 def test_axes_image_translation_does_not_move_the_viewport() -> None:
@@ -1351,7 +2089,50 @@ def test_rotated_patch_translates_exactly_and_blocks_geometry_resize(
         plt.close(fig)
 
 
-def test_fixed_aspect_axes_advertise_constraint_and_match_uniform_preview() -> None:
+def test_half_turn_rectangle_resize_is_denied_for_xy_rotation_anchor() -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    tracker = RecordingChangeTracker()
+    fig.change_tracker = tracker
+    target = ax.add_patch(
+        Rectangle(
+            (0.2, 0.25),
+            0.3,
+            0.2,
+            angle=180,
+            facecolor="none",
+            edgecolor="black",
+            linewidth=12,
+            label="qa-half-turn",
+        )
+    )
+    fig.canvas.draw()
+    adapter = get_artist_adapter(target)
+    state_before = adapter.snapshot()
+    tracker_before = tracker.capture_recording_state()
+
+    try:
+        assert not adapter.operation_support(
+            TransformOperation.RESIZE_GEOMETRY
+        ).supported
+        with pytest.raises(TransformPreflightError):
+            TransformPlan.preflight(
+                [target],
+                TransformIntent.resize(
+                    np.array(
+                        [[1.2, 0.0, -20.0], [0.0, 0.8, 15.0], [0.0, 0.0, 1.0]]
+                    )
+                ),
+            )
+        assert semantic_equal(adapter.snapshot(), state_before)
+        assert tracker.capture_recording_state() == tracker_before
+    finally:
+        plt.close(fig)
+
+
+@pytest.mark.parametrize(("scale_x", "scale_y"), [(1.1, 1.1), (1.3, 0.7)])
+def test_fixed_aspect_axes_preview_and_commit_share_native_constraint(
+    scale_x, scale_y
+) -> None:
     fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
     fig.change_tracker = RecordingChangeTracker()
     ax.set_position([0.2, 0.2, 0.45, 0.45])
@@ -1359,25 +2140,32 @@ def test_fixed_aspect_axes_advertise_constraint_and_match_uniform_preview() -> N
     fig.canvas.draw()
     adapter = get_artist_adapter(ax)
     controls_before = np.asarray(adapter.control_points(), dtype=float)
+    position_before = ax.get_position()
+    aspect_before = position_before.height / position_before.width
     center = np.mean(controls_before, axis=0)
-    scale = 1.1
     matrix = np.array(
         [
-            [scale, 0.0, center[0] * (1 - scale)],
-            [0.0, scale, center[1] * (1 - scale)],
+            [scale_x, 0.0, center[0] * (1 - scale_x)],
+            [0.0, scale_y, center[1] * (1 - scale_y)],
             [0.0, 0.0, 1.0],
         ]
     )
     support = adapter.operation_support(TransformOperation.RESIZE_GEOMETRY)
     plan = TransformPlan.preflight([ax], TransformIntent.resize(matrix))
-    preview = plan.preview_control_points()[0]
+    preview_controls = plan.preview_control_points()[0]
+    preview_selection = adapter.preview_resize_selection_points(matrix)
 
     try:
         assert adapter.capabilities.fixed_aspect
         assert support.constraints == ("fixed_aspect",)
         plan.commit()
         fig.canvas.draw()
-        _assert_px_close(adapter.control_points(), preview)
+        _assert_px_close(adapter.control_points(), preview_controls)
+        _assert_px_close(adapter.selection_points(), preview_selection)
+        position_after = ax.get_position()
+        assert position_after.height / position_after.width == pytest.approx(
+            aspect_before
+        )
     finally:
         plt.close(fig)
 

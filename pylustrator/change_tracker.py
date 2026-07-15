@@ -53,6 +53,7 @@ except ImportError:
 from .exception_swallower import Dummy
 from .jupyter_cells import open
 from .helper_functions import main_figure
+from .replay import replay_literal
 
 
 """ External overload """
@@ -119,30 +120,16 @@ def is_scalar_number(v):
 
 
 def format_scalar_number(v):
-    if isinstance(v, (int, np.integer)):
-        return str(int(v))
-    return np.format_float_positional(float(v), 4, fractional=False, trim=".")
+    return replay_literal(v)
 
 
 def to_str(v):
     if isinstance(v, CodeReference):
         return str(v)
     if isinstance(v, list) and len(v) and is_scalar_number(v[0]):
-        return (
-            "["
-            + ", ".join(
-                format_scalar_number(a) for a in v
-            )
-            + "]"
-        )
+        return replay_literal(v)
     elif isinstance(v, tuple) and len(v) and is_scalar_number(v[0]):
-        return (
-            "("
-            + ", ".join(
-                format_scalar_number(a) for a in v
-            )
-            + ")"
-        )
+        return replay_literal(v)
     elif is_scalar_number(v):
         return format_scalar_number(v)
     return repr(v)
@@ -620,11 +607,11 @@ class ChangeTracker:
                 kwargs = kwargs_to_string(kwargs)
                 return (
                     element.axes or element.figure,
-                    f".text({position[0]:.4f}, {position[1]:.4f}, {repr(text)}, transform={transform}, {kwargs})  # id={getReference(element)}.new",
+                    f".text({format_scalar_number(position[0])}, "
+                    f"{format_scalar_number(position[1])}, {repr(text)}, "
+                    f"transform={transform}, {kwargs})  # id={getReference(element)}.new",
                 )
             else:
-                if "position" in kwargs:
-                    kwargs["position"] = tuple(np.round(kwargs["position"], 4))
                 kwargs = kwargs_to_string(kwargs)
                 return element, f".set({kwargs})"
         elif isinstance(element, Legend):
@@ -790,7 +777,15 @@ class ChangeTracker:
             for prop in list(kwargs.keys()):
                 value = kwargs[prop]
                 default = element._pylustrator_old_args[prop]
-                if to_str(default) == to_str(value) and exclude_default:
+                equal = to_str(default) == to_str(value)
+                if prop == "position":
+                    try:
+                        equal = bool(
+                            np.allclose(default, value, rtol=1e-14, atol=0)
+                        )
+                    except (TypeError, ValueError):
+                        pass
+                if equal and exclude_default:
                     del kwargs[prop]
 
             # the main properties that can be set directly
@@ -1072,6 +1067,7 @@ class ChangeTracker:
         header = []
         header += ["fig = plt.figure(%s)" % self.figure.number]
         header += ["import matplotlib as mpl"]
+        header += ["import numpy as np"]
         header += [
             f"{getReference(self.figure)}._pylustrator_generated_version = {GENERATED_STATE_VERSION}"
         ]
@@ -1286,6 +1282,7 @@ class ChangeTracker:
             + getReference(self.figure)
             + ".axes}",
             "import matplotlib as mpl",
+            "import numpy as np",
             f"getattr({getReference(self.figure)}, '_pylustrator_init', lambda: ...)()",
             f"{getReference(self.figure)}._pylustrator_generated_version = {GENERATED_STATE_VERSION}",
         ]

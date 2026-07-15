@@ -10,8 +10,9 @@ The contract test is
 built-in registry entry, constructs the concrete Artist, and tests the same
 operation through display-space controls, snapshots, generated changes, and
 rendered bounds.  Tests use Python 3.13.5, Matplotlib 3.10.8, NumPy 2.4.0, the
-Agg renderer, a 0.25 display-pixel preview/commit tolerance, and strict xfails
-for confirmed product defects.
+Agg renderer and a 0.25 display-pixel preview/commit tolerance. Every confirmed
+defect found by this matrix now has a passing regression contract; no strict
+xfails remain.
 
 ## Notation and scope
 
@@ -31,41 +32,39 @@ must reject without geometry or generated-change mutation.  `scale_appearance`,
 `reflow_layout`, and `edit_points` are currently denied for every built-in
 adapter.
 
-`PASS*` means all advertised transforms pass, but a narrower selection,
-snapshot, or transaction defect remains as a strict xfail.  `DENIED` means the
-absence of edit support is deliberate and the denial contract passes.
+`PASS` means every advertised transform and its rejection paths satisfy the
+contract. `DENIED` means the absence of edit support is deliberate and the
+denial contract passes.
 
 ## Per-type matrix
 
 | Registered Artist | Adapter | Advertised | Actually tested | Result | Gap or explicit limitation |
 |---|---|---:|---|---|---|
-| `Artist` fallback | `ArtistAdapter` | none | Registry resolution; all operation descriptors; direct M/Z/R/N rejection and zero mutation | **FAIL** | Deliberately uneditable, but direct M reaches an empty-array NumPy broadcast error instead of the capability guard. |
-| `EditorGroup` | `EditorGroupAdapter` | S M Z N C | Two-member bounds; M/Z preview and commit; parent Axes immobility; N undo/redo state; real generated-command replay; failing-member rollback | **PASS*** | Geometry and generated-change rollback are atomic. A successful group transform still applies every member's change records twice. R is explicitly denied because member positions would also need pivot rotation. |
-| `Axes` | `AxesAdapter` | S M Z N C | Bounds; M/Z; parent Figure size; N; real replay; fixed-aspect capability and constraint-respecting resize | **PASS** | R is explicitly unsupported. Fixed-aspect Axes advertise the `fixed_aspect` constraint. |
+| `Artist` fallback | `ArtistAdapter` | none | Registry resolution; all operation descriptors; direct M/display-transform/Z/R/N rejection and zero mutation | **PASS** | Deliberately uneditable. Semantic entrypoints reject through `UnsupportedArtistError` before geometry arithmetic. |
+| `EditorGroup` | `EditorGroupAdapter` | S M Z N C | Bounds; M/Z preview and commit; per-leaf fixed-stroke resize; N; replay; failing-member rollback; single-emission recording | **PASS** | R is explicitly denied because member positions would also need pivot rotation. |
+| `Axes` | `AxesAdapter` | S M Z N C | Bounds; M/Z; parent Figure size; N; real replay; nonuniform fixed-aspect preview/commit | **PASS** | R is explicitly unsupported. Fixed-aspect Axes advertise the `fixed_aspect` constraint and normalize preview/commit through the same native-space rule. |
 | `Text` | `TextAdapter` | S M R N C | Axes/data/figure/display transforms; visible text bounds; M; native R; complete N; real replay; explicit Undo/Redo bookkeeping | **PASS** | Geometry resize is correctly denied in favor of future appearance scaling. |
-| `Annotation` | `AnnotationAdapter` | S M R N C | Mixed data/axes endpoint coordinates; two control points; M; R; complete N; real replay | **PASS** | Geometry resize is explicitly denied. |
+| `Annotation` | `AnnotationAdapter` | S M R N C | Mixed data/axes endpoint coordinates; text and arrow-stroke bounds; two control points; M; R; complete N; real replay | **PASS** | Geometry resize is explicitly denied. |
 | `Legend` | `LegendAdapter` | S M N C | Visible handles/text/title union; `frameon=False/True`; M; identity preservation during live movement; N; real replay | **PASS** | Geometry resize and layout reflow are explicitly denied. Generated source replay may recreate an Axes legend, while live edits retain identity. |
-| `Line2D` | `Line2DAdapter` | S M N C | Data and log transforms; M preview/commit; N; real `.set_data` replay | **PASS*** | Thick line stroke width is missing from selection bounds, although markers are included by Matplotlib. Geometry resize is explicitly denied pending affine preflight. |
+| `Line2D` | `Line2DAdapter` | S M N C | Data/log transforms; visible line, marker-path, and marker-edge bounds; M; N; real `.set_data` replay | **PASS** | Geometry resize is explicitly denied pending affine preflight. |
 | `AxesImage` | `AxesImageAdapter` | S M Z N C | M/Z preview/commit; extent replay; N; x/y viewport and Axes position invariance | **PASS** | R is explicitly unsupported. Moving or resizing the image does not autoscale the camera. |
-| `Rectangle` | `RectangleAdapter` | S M Z R N C | M/Z/R; rotated M; rotated-resize denial; complete N; real replay; parent Axes invariance | **PASS*** | Generic patch bounds omit visible stroke width. Z is only advertised at angles equivalent to 0 degrees modulo 180. |
-| `Ellipse` | `EllipseAdapter` | S M Z R N C | M/Z/R; rotated M; rotated-resize denial; complete N; real replay | **PASS*** | Generic patch bounds omit visible stroke width. Z is disabled for rotated ellipses. |
-| `FancyArrowPatch` | `FancyArrowPatchAdapter` | S M N C | Endpoint M; rendered preview/commit; N; real `.set_positions` replay | **PASS*** | Generic patch bounds do not account for all visible stroke appearance. Z/R are explicitly denied. |
+| `Rectangle` | `RectangleAdapter` | S M Z R N C | Visible-stroke bounds; fixed-stroke M/Z; R; rotated M; rotated-resize denial; N; replay | **PASS** | Z is only advertised at angles equivalent to 0 degrees modulo 360; a default `xy`-anchored 180-degree Rectangle is not equivalent and is denied. |
+| `Ellipse` | `EllipseAdapter` | S M Z R N C | Visible-stroke bounds; fixed-stroke M/Z; R; rotated M; rotated-resize denial; N; replay | **PASS** | Z is disabled for rotated ellipses. |
+| `FancyArrowPatch` | `FancyArrowPatchAdapter` | S M N C | Visible-stroke bounds; endpoint M; rendered preview/commit; N; real `.set_positions` replay | **PASS** | Z/R are explicitly denied. |
 | `ConnectionPatch` | `ConnectionPatchAdapter` | none | Specific MRO resolution; all operation descriptors; direct M/Z/R/N rejection and zero mutation | **DENIED** | Deliberately blocked because its endpoints can occupy unrelated coordinate systems. |
-| `FancyBboxPatch` | `FancyBboxPatchAdapter` | S M N C when affine | Affine M/N/replay; log/non-affine preflight denial and zero mutation | **PASS*** | Generic patch bounds omit stroke. Geometry resize is explicitly unsupported. A non-affine data transform disables the whole editable contract. |
-| `RegularPolygon` | `RegularPolygonAdapter` | S M N C | Center M; preview/commit; N; `.xy` replay | **PASS*** | Generic patch bounds omit stroke. Z is explicitly denied until it changes semantic radius rather than stretching the center control. |
-| `Wedge` | `WedgeAdapter` | S M N C | Center M; preview/commit; N; `.set_center` replay | **PASS*** | Generic patch bounds omit stroke. Z/R are explicitly unsupported. |
-| `Polygon` | `PolygonAdapter` | S M Z N C | Vertex M/Z; preview/commit; N; `.set_xy` replay | **PASS*** | Generic patch bounds omit visible stroke width. R is explicitly unsupported. |
-| `PathPatch` | `PathPatchAdapter` | S M Z N C | Path/codes M/Z; preview/commit; N; `Path` replay | **PASS*** | Generic patch bounds omit visible stroke width. R is explicitly unsupported. |
-| `PathCollection` | `PathCollectionAdapter` | S M N C | Offset M in affine and log transforms; marker padding; N; `.set_offsets` replay | **PASS*** | Selection uses the largest marker/stroke padding around every extreme offset, rather than each item's actual visible envelope. Z and appearance scaling are explicitly denied. |
-| `LineCollection` | `LineCollectionAdapter` | S M N C | Multi-segment M in affine and log transforms; group shape preservation; N; `.set_segments` replay | **PASS*** | Selection applies the largest linewidth to every segment rather than a per-segment visible envelope. Z and appearance scaling are denied. |
-| `PolyCollection` | `PolyCollectionAdapter` | S M N C | Multi-path M in affine and log transforms; codes/group preservation; N; `.set_verts_and_codes` replay | **PASS*** | Selection applies the largest linewidth to every polygon rather than a per-item visible envelope. Z and appearance scaling are denied. |
+| `FancyBboxPatch` | `FancyBboxPatchAdapter` | S M N C when affine | Visible-stroke bounds; affine M/N/replay; non-affine denial and zero mutation | **PASS** | Geometry resize is unsupported. A non-affine data transform disables the editable contract. |
+| `RegularPolygon` | `RegularPolygonAdapter` | S M N C | Visible-stroke bounds; center M; preview/commit; N; `.xy` replay | **PASS** | Z is denied until it changes semantic radius rather than stretching its center point. |
+| `Wedge` | `WedgeAdapter` | S M N C | Visible-stroke bounds; center M; preview/commit; N; `.set_center` replay | **PASS** | Z/R are explicitly unsupported. |
+| `Polygon` | `PolygonAdapter` | S M Z N C | Visible-stroke bounds; fixed-stroke vertex M/Z; preview/commit; N; `.set_xy` replay | **PASS** | R is explicitly unsupported. |
+| `PathPatch` | `PathPatchAdapter` | S M Z N C | Visible-stroke bounds; fixed-stroke path/codes M/Z; preview/commit; N; `Path` replay | **PASS** | R is explicitly unsupported. |
+| `PathCollection` | `PathCollectionAdapter` | S M N C | Renderer item-count semantics; per-item marker-path/size/stroke envelopes; masked offsets; affine/log offset M; N; `.set_offsets` replay | **PASS** | Z and appearance scaling are explicitly denied. |
+| `LineCollection` | `LineCollectionAdapter` | S M N C without explicit offsets | Per-segment linewidth envelopes; NaN path-break preservation; affine/log multi-segment M; N; `.set_segments` replay | **PASS** | Z and appearance scaling are denied. Explicit `offsets`/`transOffset` dynamically deny editing until path x offset renderer semantics are modeled. |
+| `PolyCollection` | `PolyCollectionAdapter` | S M N C without explicit offsets | Per-polygon visible-edge envelopes; affine/log multi-path M; N; `.set_verts_and_codes` replay | **PASS** | Invisible edges add no padding. Z and appearance scaling are denied. Explicit `offsets`/`transOffset` dynamically deny editing. |
 
-The shared generic patch selection defect is proven with Rectangle as the
-minimal reproduction.  Rectangle, Ellipse, FancyArrowPatch, FancyBboxPatch,
-RegularPolygon, Wedge, Polygon, and PathPatch all inherit the same
-`ArtistAdapter.selection_points()` window-extent behavior; the table therefore
-marks the shared limitation for every affected type without duplicating eight
-identical strict xfails.
+Patch adapters share one common-stroke envelope implementation. Resizable
+patches additionally separate transformable geometry from fixed display-space
+appearance outsets, so a thick stroke does not scale during geometry resize and
+the committed visible box remains at the preview handle position.
 
 ## Cross-cutting contract results
 
@@ -76,8 +75,10 @@ The following behavior passes for every type that advertises it:
 - Display-space translation moves control points and final selection bounds by
   the preview delta within 0.25 px.  The selected object is the object mutated;
   parent Axes and unrelated figure-level sentinel text do not move.
-- Geometry resize matches preview controls and final bounds within 0.25 px for
-  EditorGroup, Axes, AxesImage, Rectangle, Ellipse, Polygon, and PathPatch.
+- Geometry resize matches preview controls and final visible bounds within
+  0.25 px for EditorGroup, Axes, AxesImage, Rectangle, Ellipse, Polygon, and
+  PathPatch. Thick patch strokes remain fixed in display pixels; both direct
+  resize and deferred drag land on the preview box.
 - Native rotation renders and records correctly for Text, Annotation,
   Rectangle, and Ellipse. Explicit old/new-value Undo/Redo restores the angle
   and generated-change dictionary.
@@ -87,10 +88,17 @@ The following behavior passes for every type that advertises it:
 - Real `ChangeTracker` commands replay translated rendered bounds for all 18
   serializable registry types. Axis-label replay additionally covers both
   label position and `labelpad`.
+- Generated numeric literals preserve exact finite-float round trips, qualify
+  NaN/Inf through `np`, and import NumPy in saved blocks. Tiny log coordinates,
+  masked scatter, NaN line breaks, and a line on a `1e-12`-wide axis replay
+  without display-space amplification.
 - AxesImage operations preserve x/y limits. Logical-group member operations do
   not move their parent Axes.
 - Legend bounds follow visible handles, text, and title; the invisible layout
   frame contributes no padding, while a visible frame is included.
+- Annotation bounds include the visible arrow stroke as well as text/bbox
+  artwork. Nested Legend and EditorGroup measurements reuse one immutable
+  geometry value per Artist and selection action.
 
 Rotation has a `native_rotation` preview strategy, not a detached control-point
 preview. The native render, selection overlay, snapshot, rollback, and explicit
@@ -128,55 +136,79 @@ groups have the same atomicity guarantee as drag gestures.
 
 Test: `test_logical_group_failure_restores_generated_change_bookkeeping`.
 
-## Confirmed remaining defects retained as strict xfails
+### Preview, renderer-count, and replay edge cases are closed
 
-### P1: selection bounds mix geometric, visible, and conservative bounds
+The follow-up type-by-type QA closed cases that ordinary examples did not
+exercise: Bezier PathPatch geometry, a 180-degree `xy`-anchored Rectangle,
+nonuniform fixed-aspect Axes resize, masked PathCollection items, style arrays
+longer than the rendered marker count, and NaN separators inside a
+LineCollection. Preview and commit now share one constrained native plan where
+needed, and serializer literals are exact rather than fixed-decimal.
 
-The documented adapter contract says selection bounds are visible bounds, but
-the implementations are inconsistent:
+This precision rule is deliberate. Quantizing finite values to 13 significant
+digits looked stable on ordinary plots but produced roughly 90 px replay error
+for a Line2D on `xlim=[1, 1+1e-12]`. Finite values therefore use Python's exact
+round-trip `repr`; transaction undo restores the captured change-recording
+state instead of relying on lossy source canonicalization. New generated blocks
+also qualify non-finite values as `np.nan`/`np.inf` and import NumPy.
 
-- generic Patch bounds omit stroke width;
-- Line2D includes markers but omits line stroke width;
-- collections pad all items using global maxima, which can overestimate the
-  opposite edge when sizes or linewidths differ.
+### Ambiguous public transforms and offset collections fail safely
 
-This does not break translation preview/commit equality—the same inaccurate
-bounds move consistently—but it can make the selection box disagree with the
-actual artwork before and after the gesture. That is directly relevant to
-alignment and hit-testing.
+The legacy `apply_display_transform()` entrypoint accepts pure translation
+matrices only. Scale/shear/rotation matrices must enter through a semantic
+operation and its capability preflight. LineCollection and PolyCollection with
+explicit `offsets`/`transOffset` now dynamically deny editing: their rendered
+path x offset product was previously ignored, yielding selection boxes near the
+origin. Denial preserves geometry and generated state until a renderer-faithful
+adapter exists.
 
-Tests:
+## P1/P2 findings fixed after the independent audit
 
-- `test_rectangle_selection_bounds_include_visible_stroke_width`
-- `test_line_selection_bounds_include_visible_stroke_width`
-- `test_path_collection_selection_bounds_use_each_marker_size`
-- `test_line_collection_selection_bounds_use_each_segment_linewidth`
-- `test_poly_collection_selection_bounds_use_each_polygon_linewidth`
+### P1: visible bounds and transformable geometry are now separate
 
-The product should first choose one explicit Illustrator-style policy:
-geometric bounds, visible/preview bounds, or a user preference equivalent to
-Illustrator's preview-bounds setting. The current code and roadmap claim
-visible bounds, so the xfails enforce that stated policy.
+The editor uses Illustrator-style visible/preview bounds for selection,
+alignment, and handles. Adapters now also expose transformable geometry bounds
+and fixed display-space appearance outsets. The split is essential: blindly
+scaling a visible box would scale its stroke padding during preview even though
+Matplotlib linewidth remains fixed at commit time.
 
-### P1: EditorGroup records successful member mutations twice
+- Patch bounds include visible stroke width.
+- Line2D bounds include line stroke, marker path, and marker-edge stroke.
+- PathCollection evaluates each marker path, size transform, offset, and edge
+  stroke separately.
+- LineCollection and PolyCollection broadcast linewidth/color per item before
+  unioning envelopes; an invisible PolyCollection edge adds no padding.
+- Patch and EditorGroup resize transform geometry to the requested visible box,
+  then reapply each leaf's fixed appearance outsets. Numeric match-size uses the
+  same contract.
 
-`EditorGroupAdapter._apply_native_control_points()` delegates to each member's
-recording adapter. The inherited outer `apply_native_control_points()` then
-serializes every member again through the group adapter. A dictionary-backed
-ChangeTracker hides duplicate final keys, but expensive or side-effectful
-record generation still runs twice.
+Passing tests include the five original strict reproductions plus
+`test_line_marker_selection_bounds_include_visible_edge_stroke`,
+`test_poly_collection_invisible_edges_add_no_selection_padding`,
+`test_thick_patch_resize_keeps_stroke_fixed_and_preview_matches_commit`,
+`test_deferred_thick_patch_resize_preview_matches_committed_visible_bounds`,
+and `test_match_width_uses_visible_bounds_without_scaling_strokes`.
 
-Test: `test_editor_group_records_each_member_change_once`.
+### P1: EditorGroup has one change-record owner
 
-### P2: fallback translate bypasses its capability guard
+Member adapters apply their native mutations with recording suspended. After
+all members succeed, the outer EditorGroup serializes every leaf exactly once.
+This removes duplicate computation, signals, and side effects while retaining
+atomic rollback. Translate, resize, and mixed-stroke group resize are covered.
 
-The fallback has no control points. `translate()` performs NumPy addition
-before `apply_native_control_points()` checks `can_translate`, producing a
-broadcasting `ValueError` rather than `UnsupportedArtistError`. Geometry and
-bookkeeping remain unchanged, but the rejection is neither stable nor useful
-to the UI.
+Tests: `test_editor_group_records_each_member_change_once` and
+`test_editor_group_resize_reapplies_each_members_fixed_stroke_outset`.
 
-Test: `test_fallback_translate_rejects_with_adapter_contract_error`.
+### P2: unsupported semantic entrypoints gate before geometry arithmetic
+
+Fallback `translate()` and the public display-transform entrypoint now consult
+`OperationSupport` before touching empty controls. Both produce stable
+`UnsupportedArtistError` reasons without geometry or tracker mutation.
+
+Tests: `test_fallback_translate_rejects_with_adapter_contract_error` and
+`test_fallback_display_transform_rejects_with_adapter_contract_error`.
+
+No confirmed product defect remains hidden behind a strict xfail.
 
 ## Explicitly unsupported versus untested
 
@@ -188,6 +220,8 @@ Explicitly unsupported and tested:
 - Line2D resize without affine preflight;
 - FancyArrowPatch, FancyBboxPatch, RegularPolygon, and Wedge resize;
 - resize and appearance scaling for all three collection adapters;
+- every edit operation on LineCollection/PolyCollection instances with explicit
+  offsets, pending a renderer-faithful path x offset model;
 - rotation for every type without a native, saveable angle property;
 - point editing, appearance scaling, and layout reflow wherever no executor
   exists.
@@ -203,6 +237,15 @@ Fixture/test limitations, not confirmed implementation defects:
 - Exotic custom transforms beyond data, axes, figure, display identity, mixed
   Annotation coordinates, and log non-affine data transforms were not
   exhaustively enumerated.
+- Stroke envelopes are a common-case geometry approximation, not a rasterized
+  paint envelope. Miter/cap joins, path effects, and clipping can extend or trim
+  painted pixels beyond the current axial `linewidth / 2` padding; a 30 pt
+  miter triangle raster probe missed as much as about 18.8 px. This is tracked
+  as future paint-envelope policy, not claimed as exact coverage here.
+- Generated blocks saved from this version replay NaN/Inf safely. A historical
+  source block that already contains bare `nan`/`inf` can fail before runtime
+  migration starts and needs a future offline source migration/doctor. The
+  formal Fig2 contains no such token.
 
 ## Reproduction commands
 
@@ -212,8 +255,8 @@ QT_QPA_PLATFORM=offscreen uv run pytest tests -q
 uv run ruff check .
 ```
 
-After the P0 fixes, the dedicated contract file reports 362 passed,
-119 explicitly skipped branches, and 7 strict xfails. The skips are branch
+After the final independent follow-up, the dedicated contract file reports 404 passed,
+119 explicitly skipped branches, and no xfails. The skips are branch
 accounting, not missing Artist types: supported-operation tests skip denied
 types, while rejection tests skip supported types. Registry equality guarantees
 that all 20 built-in registrations are present in the matrix.
@@ -311,10 +354,13 @@ and Text children while also proving that the non-current Legend owner has an
 exact evaluable reference. The real-case artifact retains the original
 inventory categories and confirms that no reference failures remain.
 
-With the three reference xfails closed, the full headless suite reports 502
-passed, 119 explicit capability-branch skips, 7 strict P1/P2 xfails, and the
-same 4 pre-existing log-limit warnings. Ruff passes for the package, reference
-tests, and real-case audit script.
+The visible-bounds follow-up repeats the same 6,279 exhaustive checks and 70
+representative workflows in
+`artifacts/adapter_p1_visible_bounds_contract.json`: all 483/483 references
+resolve, all operations/replays pass, and the formal Fig2 hash is unchanged.
+The final full headless suite reports 549 passed, 119 explicit
+capability-branch skips, no xfails, four pre-existing log-limit warnings, and
+two expected masked-array conversion warnings. Ruff passes.
 
 Run the real audit from `Figures_source`:
 
@@ -323,7 +369,7 @@ QT_QPA_PLATFORM=offscreen \
 PYTHONPATH=figure_workflow/vendor/pylustrator-artist-adapters \
 uv run python \
   figure_workflow/validation/fig2_pylustrator_ab/fig2_artist_contract_audit.py \
-  --commit 447f76c \
+  --commit "$(git -C figure_workflow/vendor/pylustrator-artist-adapters rev-parse --short HEAD)" \
   --output \
-  figure_workflow/validation/fig2_pylustrator_ab/artifacts/adapter_p0_real_contract.json
+  figure_workflow/validation/fig2_pylustrator_ab/artifacts/adapter_p1_visible_bounds_contract.json
 ```

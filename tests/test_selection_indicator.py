@@ -6,6 +6,7 @@ matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
 import numpy as np
+import pytest
 from matplotlib.backend_bases import KeyEvent, MouseEvent
 from matplotlib.collections import LineCollection, PolyCollection
 from matplotlib.patches import (
@@ -20,6 +21,7 @@ from matplotlib.patches import (
 )
 from qtpy import QtCore, QtGui, QtWidgets
 
+from pylustrator.artist_adapters import selection_geometry_snapshot
 from pylustrator.components.plot_layout import (
     scene_point_to_canvas_pixels,
     selection_scene_transform,
@@ -899,13 +901,12 @@ def test_annotation_with_mixed_coordinate_systems_moves_as_one_visual_object() -
 
     after = annotation.get_window_extent(renderer)
     rect = selection_rect_extents(manager.selection)[0]
+    visible_after = selection_target_extents(manager.selection)[0]
     # Arrow clipping/shrink is recomputed from the translated endpoints and may
     # move an extreme by a few thousandths of a pixel.
     assert abs((after.x0 - before.x0) - 19) < 0.02
     assert abs((after.y0 - before.y0) + 11) < 0.02
-    assert all(
-        abs(actual - selected) < 1e-9 for actual, selected in zip(after.extents, rect)
-    )
+    assert np.allclose(rect, visible_after)
     manager.selection.clear_targets()
     plt.close(fig)
     assert app is not None
@@ -928,11 +929,15 @@ def test_text_visible_bbox_is_preserved_and_used_for_selection() -> None:
     manager.select_element(text)
     renderer = fig.canvas.get_renderer()
     patch_bounds = patch.get_window_extent(renderer).extents
+    stroke_radius = patch.get_linewidth() * fig.dpi / 72.0 / 2.0
+    visible_patch_bounds = patch_bounds + np.array(
+        [-stroke_radius, -stroke_radius, stroke_radius, stroke_radius]
+    )
     selection_bounds = np.array(selection_rect_extents(manager.selection)[0])
 
     assert text.get_bbox_patch() is patch
     assert text.get_bbox_patch().get_facecolor() == facecolor
-    assert np.allclose(selection_bounds, patch_bounds)
+    assert np.allclose(selection_bounds, visible_patch_bounds)
     manager.selection.clear_targets()
     plt.close(fig)
     assert app is not None
@@ -1437,6 +1442,78 @@ def test_deferred_drag_updates_overlay_before_artist_and_commits_once() -> None:
     assert app is not None
 
 
+def test_deferred_thick_patch_resize_preview_matches_committed_visible_bounds() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    rectangle = ax.add_patch(
+        Rectangle(
+            (0.2, 0.25),
+            0.35,
+            0.3,
+            facecolor="none",
+            edgecolor="black",
+            linewidth=18,
+            label="qa-thick-resize",
+        )
+    )
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.selection.defer_artist_updates = True
+    manager.selection.add_target(rectangle)
+    geometry_before = (
+        tuple(rectangle.get_xy()),
+        rectangle.get_width(),
+        rectangle.get_height(),
+    )
+    visible_before = np.asarray(
+        TargetWrapper(rectangle).get_selection_points(), dtype=float
+    )
+
+    manager.selection.start_move()
+    manager.selection.move(
+        (40, 0),
+        DIR_X1,
+        [],
+        keep_aspect_ratio=False,
+        ignore_snaps=True,
+    )
+    preview = manager.selection.move_current_selection_points[id(rectangle)]
+    preview_bounds = np.array(
+        [
+            np.min(preview[:, 0]),
+            np.min(preview[:, 1]),
+            np.max(preview[:, 0]),
+            np.max(preview[:, 1]),
+        ]
+    )
+    before_bounds = np.array(
+        [
+            np.min(visible_before[:, 0]),
+            np.min(visible_before[:, 1]),
+            np.max(visible_before[:, 0]),
+            np.max(visible_before[:, 1]),
+        ]
+    )
+
+    assert (
+        tuple(rectangle.get_xy()),
+        rectangle.get_width(),
+        rectangle.get_height(),
+    ) == geometry_before
+    assert preview_bounds[0] == pytest.approx(before_bounds[0])
+    assert preview_bounds[2] == pytest.approx(before_bounds[2] + 40)
+    assert np.allclose(selection_rect_extents(manager.selection)[0], preview_bounds)
+
+    manager.selection.end_move()
+    fig.canvas.draw()
+    committed = selection_target_extents(manager.selection)[0]
+    assert np.allclose(committed, preview_bounds, atol=0.25, rtol=0)
+    assert rectangle.get_linewidth() == pytest.approx(18)
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
 def test_deferred_drag_invalidates_preview_extent_cache() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     fig, ax = plt.subplots(figsize=(4, 2), dpi=100)
@@ -1524,6 +1601,50 @@ def test_match_width_can_preserve_aspect_ratio() -> None:
     pos = axes[1].get_position()
     assert abs(pos.width - 0.4) < 1e-9
     assert abs(pos.height - 0.6) < 1e-9
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_match_width_uses_visible_bounds_without_scaling_strokes() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 2), dpi=100)
+    reference = ax.add_patch(
+        Rectangle(
+            (0.1, 0.2),
+            0.35,
+            0.3,
+            facecolor="none",
+            edgecolor="black",
+            linewidth=4,
+            label="qa-reference",
+        )
+    )
+    target = ax.add_patch(
+        Rectangle(
+            (0.65, 0.25),
+            0.12,
+            0.2,
+            facecolor="none",
+            edgecolor="black",
+            linewidth=20,
+            label="qa-target",
+        )
+    )
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.selection.add_target(reference)
+    manager.selection.add_target(target)
+
+    manager.selection.match_size("width", keep_aspect_ratio=False)
+    fig.canvas.draw()
+    reference_bounds, target_bounds = selection_target_extents(manager.selection)
+
+    assert target_bounds[2] - target_bounds[0] == pytest.approx(
+        reference_bounds[2] - reference_bounds[0], abs=0.25
+    )
+    assert reference.get_linewidth() == pytest.approx(4)
+    assert target.get_linewidth() == pytest.approx(20)
     manager.selection.clear_targets()
     plt.close(fig)
     assert app is not None
@@ -1738,6 +1859,89 @@ def test_drag_rectangle_omits_containing_axes_by_default() -> None:
     manager.selection.clear_targets()
     plt.close(fig)
     assert app is not None
+
+
+def test_marquee_reuses_one_geometry_snapshot_per_artist_and_action() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    rectangle = ax.add_patch(
+        Rectangle((0.2, 0.25), 0.3, 0.35, label="qa-marquee-cache")
+    )
+    fig.canvas.draw()
+    original_get_window_extent = rectangle.get_window_extent
+    calls = 0
+
+    def counted_get_window_extent(renderer=None):
+        nonlocal calls
+        calls += 1
+        return original_get_window_extent(renderer)
+
+    rectangle.get_window_extent = counted_get_window_extent
+    manager = attach_drag_manager(fig)
+    bounds = fig.bbox.extents
+
+    manager.select_elements_in_bbox(*bounds)
+    assert calls == 1
+
+    manager.select_elements_in_bbox(*bounds)
+    assert calls == 2
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_marquee_reuses_nested_legend_child_geometry_per_action() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    ax.plot([0.1, 0.9], [0.2, 0.8], label="first")
+    ax.plot([0.1, 0.9], [0.8, 0.3], label="second")
+    legend = ax.legend(title="Legend title")
+    fig.canvas.draw()
+    children = [*legend.get_texts(), legend.get_title()]
+    calls = {id(child): 0 for child in children}
+    for child in children:
+        original = child.get_window_extent
+
+        def counted_get_window_extent(renderer=None, *, _child=child, _original=original):
+            calls[id(_child)] += 1
+            return _original(renderer)
+
+        child.get_window_extent = counted_get_window_extent
+    manager = attach_drag_manager(fig)
+
+    manager.select_elements_in_bbox(*fig.bbox.extents)
+
+    assert set(calls.values()) == {1}
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_selection_snapshot_reuses_nested_editor_group_member_geometry() -> None:
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    first = ax.add_patch(Rectangle((0.1, 0.2), 0.2, 0.25))
+    second = ax.add_patch(Rectangle((0.6, 0.55), 0.25, 0.2))
+    group = EditorGroup(
+        fig, "qa-cache-group", [first, second], name="QA cache group"
+    )
+    fig.canvas.draw()
+    calls = {id(first): 0, id(second): 0}
+    for member in (first, second):
+        original = member.get_window_extent
+
+        def counted_get_window_extent(renderer=None, *, _member=member, _original=original):
+            calls[id(_member)] += 1
+            return _original(renderer)
+
+        member.get_window_extent = counted_get_window_extent
+
+    with selection_geometry_snapshot():
+        TargetWrapper(group).get_selection_points()
+        TargetWrapper(first).get_selection_points()
+        TargetWrapper(second).get_selection_points()
+
+    assert set(calls.values()) == {1}
+    plt.close(fig)
 
 
 def test_drag_rectangle_container_only_mode_keeps_parent_axes() -> None:

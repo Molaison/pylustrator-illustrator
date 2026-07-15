@@ -222,23 +222,32 @@ class QPosAndSize(QtWidgets.QWidget):
         if np.allclose(delta, 0):
             return
 
+        tracker = self.fig.change_tracker
+        capture = getattr(tracker, "capture_recording_state", None)
+        recording_before = capture() if capture is not None else None
         old_states = [wrapper.get_restore_state() for wrapper in wrappers]
         for wrapper in wrappers:
             wrapper.translate(delta)
         new_states = [wrapper.get_restore_state() for wrapper in wrappers]
+        recording_after = capture() if capture is not None else None
 
-        def apply(states):
+        def apply(states, recording_state):
             for wrapper, state in zip(wrappers, states):
-                wrapper.restore_state(state)
+                wrapper.restore_state(
+                    state, record_changes=recording_state is None
+                )
+            restore_recording = getattr(tracker, "restore_recording_state", None)
+            if recording_state is not None and restore_recording is not None:
+                restore_recording(recording_state)
             selection.update_extent()
             selection.update_selection_rectangles()
             self.fig.canvas.draw()
 
         def redo():
-            apply(new_states)
+            apply(new_states, recording_after)
 
         def undo():
-            apply(old_states)
+            apply(old_states, recording_before)
 
         self.fig.change_tracker.addEdit([undo, redo, "Change position"])
         selection.update_extent()

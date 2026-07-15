@@ -30,6 +30,7 @@ from qtpy import QtCore, QtGui, QtWidgets
 from .artist_adapters import (
     ArtistCapabilities,
     artist_adapter_registry,
+    cached_selection_points,
     checkXLabel,
     checkYLabel,
     get_artist_adapter,
@@ -97,7 +98,7 @@ class TargetWrapper:
         return self.adapter.get_transform()
 
     def get_selection_points(self) -> np.ndarray:
-        return self.adapter.selection_points()
+        return cached_selection_points(self.target, self.adapter.selection_points)
 
     def get_positions(self, use_previous_offset=False, update_offset=False):
         return self.adapter.control_points()
@@ -118,6 +119,24 @@ class TargetWrapper:
 
     def apply_display_transform(self, matrix) -> None:
         self.adapter.apply_display_transform(matrix)
+
+    def preview_resize_control_points(
+        self, matrix, *, control_points=None, selection_points=None
+    ) -> np.ndarray:
+        return self.adapter.preview_resize_control_points(
+            matrix,
+            control_points=control_points,
+            selection_points=selection_points,
+        )
+
+    def preview_resize_selection_points(
+        self, matrix, *, control_points=None, selection_points=None
+    ) -> np.ndarray:
+        return self.adapter.preview_resize_selection_points(
+            matrix,
+            control_points=control_points,
+            selection_points=selection_points,
+        )
 
     def resize(self, matrix) -> None:
         self.adapter.resize(matrix)

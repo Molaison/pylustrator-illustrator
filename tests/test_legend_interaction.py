@@ -444,7 +444,7 @@ def test_extra_axes_legend_saved_move_reopens_on_same_artist() -> None:
 
     assert saved_lines == [
         "plt.figure(1).axes[0].artists[0]._set_loc(1)",
-        "plt.figure(1).axes[0].artists[0].set_bbox_to_anchor((0.8525, 0.7797), transform=plt.figure(1).transFigure)",
+        "plt.figure(1).axes[0].artists[0].set_bbox_to_anchor((0.8525000000000001, 0.7796666666666668), transform=plt.figure(1).transFigure)",
     ]
     assert ax.get_legend() is current
     assert ax.artists[0] is method

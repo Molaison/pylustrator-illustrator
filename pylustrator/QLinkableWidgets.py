@@ -218,6 +218,13 @@ class Linkable:
 
     def updateLink(self):
         """update the linked property"""
+        if isinstance(self.element, mpl.figure.Figure):
+            fig = self.element
+        else:
+            fig = main_figure(self.element)
+        tracker = fig.change_tracker
+        capture = getattr(tracker, "capture_recording_state", None)
+        recording_before = capture() if capture is not None else None
         old_value = self.getLinkedPropertyAll()
 
         try:
@@ -250,23 +257,24 @@ class Linkable:
             def save_change(element):
                 element.figure.change_tracker.addNewAxesChange(element)
 
-        def undo():
-            for elem, property_name, value in old_value:
+        def apply(values, recording_state):
+            for elem, property_name, value in values:
                 getattr(elem, "set_" + property_name, lambda x: None)(value)
-                save_change(elem)
+                if recording_state is None:
+                    save_change(elem)
+            restore_recording = getattr(tracker, "restore_recording_state", None)
+            if recording_state is not None and restore_recording is not None:
+                restore_recording(recording_state)
+
+        def undo():
+            apply(old_value, recording_before)
 
         def redo():
-            for elem, property_name, value in new_value:
-                getattr(elem, "set_" + property_name, lambda x: None)(value)
-                save_change(elem)
+            apply(new_value, recording_after)
 
-        element = elements[0]
-        if isinstance(element, mpl.figure.Figure):
-            fig = element
-        else:
-            fig = main_figure(element)
-
-        save_change(element)
+        for element in elements:
+            save_change(element)
+        recording_after = capture() if capture is not None else None
         fig.change_tracker.addEdit([undo, redo, "Change property"])
         fig.canvas.draw()
         main_figure(self.element).signals.figure_selection_property_changed.emit()

@@ -24,8 +24,8 @@ Implementation order follows architectural dependencies.
 
 Status (2026-07-15): implemented on
 ``refactor/artist-adapter-architecture``.  The P0 implementation is covered by
-502 passing tests, 119 explicit capability-branch skips, 7 strict P1/P2
-xfails, Ruff, the full Fig2 interaction probe, and a read-only smoke replay of
+549 passing tests, 119 explicit capability-branch skips, no xfails, Ruff, the
+full Fig2 interaction probe, and a read-only smoke replay of
 the unmodified formal Fig2.  The formal file retained SHA-256
 ``b0cd72abf3962cd6cd2354467ad57aa37ecc213332645d7cb56e6f4af598ad70``.
 
@@ -42,14 +42,25 @@ recursive wrappers across interactive runs or test cases.
 An independent 20-type adapter contract matrix subsequently found and closed
 two remaining P0 gaps: rotatable snapshots now include native angles, and a
 failed `TransformPlan` restores generated-change bookkeeping together with
-artist geometry.  Remaining strict xfails concern visible stroke/collection
-bounds, duplicate group serialization, and fallback error normalization; they
-are tracked as P1/P2 work rather than hidden by the P0 status.
+artist geometry. Its P1/P2 follow-up also closed visible stroke/collection
+bounds, duplicate group serialization, and fallback error normalization.
 
 The real Fig2 follow-up audited all 483 selectable/serializable instances and
 closed the final P0 replay gap: current, figure-level, and retained
 non-current Axes legends now share one authoritative inventory, so all Legend
 children have exact persistent references and replayable change records.
+
+A final independent type-by-type QA pass then closed renderer and persistence
+edge cases that the ordinary Fig2 paths did not expose: fixed-aspect Axes now
+share one native preview/commit constraint; Annotation includes arrow paint;
+PathCollection follows renderer item counts; LineCollection preserves NaN path
+breaks; and generated code preserves exact finite floats plus qualified
+NaN/Inf. A deliberately attempted 13-significant-digit canonicalization was
+rejected after a `1e-12`-wide axis amplified it to roughly 90 px. Source
+stability is therefore enforced by restoring transaction recording state, not
+by quantizing persisted geometry. Ambiguous non-translation matrices and
+Line/PolyCollection instances with explicit offsets fail capability preflight
+without mutation.
 
 ### P0.1 Selection kernel
 
@@ -119,11 +130,29 @@ Acceptance:
 
 ## P1: Illustrator productivity
 
+Foundation status (2026-07-15): visible/preview bounds are now explicit and
+separate from transformable geometry. Patch, Line2D, and collection adapters
+include common-case per-item stroke/marker envelopes. Geometry
+resize reapplies fixed display-space appearance outsets, so thick-stroke
+deferred previews, commits, groups, alignment, and numeric match-size agree.
+EditorGroup is also the single change-record owner for a group gesture.
+Selection actions share one immutable geometry snapshot, and PathCollection
+envelopes use Matplotlib's vectorized path iterator. On the five-run Fig2 probe,
+whole-canvas marquee improved from 125.6 ms to 61.9 ms; whole-selection move
+and undo remained subsecond with unchanged numerical error.
+
+Remaining feature work:
+
 - Reference-point transform panel and arbitrary rotation handles.
 - Key-object/artboard alignment and numeric distribute spacing.
 - Generic smart guides for edges, centers, baselines, anchors, and equal gaps.
 - Direct path/endpoint editing and inline text editing.
 - Content-following cached drag previews and spatial hit/snap indexes.
+- A renderer-faithful paint-envelope policy for miter/cap joins, path effects,
+  and clipping; current axial stroke padding is intentionally not advertised as
+  exact raster coverage.
+- Path x offset renderer-iterator support for explicit-offset LineCollection
+  and PolyCollection; those variants are currently safely denied.
 
 ## P2: workflow breadth
 

@@ -36,7 +36,7 @@ from matplotlib.artist import Artist
 from matplotlib.figure import Figure
 from matplotlib.ticker import AutoLocator
 
-from pylustrator.artist_adapters import get_artist_adapter
+from pylustrator.artist_adapters import get_artist_adapter, suspend_change_recording
 from pylustrator.change_tracker import getReference
 from pylustrator.QLinkableWidgets import (
     QColorWidget,
@@ -48,7 +48,6 @@ from pylustrator.QLinkableWidgets import (
 )
 from pylustrator.helper_functions import main_figure
 from pylustrator.change_tracker import UndoRedo, add_text_default, add_axes_default
-from pylustrator.snap import legend_anchor_is_point, legend_loc_transform, set_legend_point_anchor_display
 
 
 class TextPropertiesWidget(QtWidgets.QWidget):
@@ -578,12 +577,7 @@ class LegendPropertiesWidget(QtWidgets.QWidget):
             nonlocal target
             handles = target.legend_handles
             labels = [text.get_text() for text in target.get_texts()]
-            old_loc = target._loc
-            old_anchor = target.get_bbox_to_anchor()
-            old_point_anchor = legend_anchor_is_point(target)
-            if old_point_anchor:
-                anchor_point = old_anchor.p0
-            bbox = target.get_frame().get_bbox()
+            legend_state = get_artist_adapter(target).snapshot()
             axes = target.axes
             fig = main_figure(target)
             if axes is None:
@@ -593,15 +587,8 @@ class LegendPropertiesWidget(QtWidgets.QWidget):
             else:
                 axes.legend(handles=handles, labels=labels, **properties)
                 target = axes.get_legend()
-            if old_point_anchor:
-                set_legend_point_anchor_display(target, anchor_point)
-                target._set_loc(old_loc)
-            else:
-                target._set_loc(
-                    tuple(
-                        legend_loc_transform(target).transform(tuple([bbox.x0, bbox.y0]))
-                    )
-                )
+            with suspend_change_recording():
+                get_artist_adapter(target).restore(legend_state)
             fig.change_tracker.addNewLegendChange(target)
             fig.figure_dragger.make_draggable(target)
             fig.figure_dragger.select_element(target)

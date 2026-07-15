@@ -30,7 +30,11 @@ from matplotlib.backend_bases import MouseEvent, KeyEvent
 from typing import Iterable, Sequence
 from qtpy import QtCore, QtGui, QtWidgets
 
-from .artist_adapters import iter_figure_legends, iter_legend_children
+from .artist_adapters import (
+    iter_figure_legends,
+    iter_legend_children,
+    selection_geometry_snapshot,
+)
 from .snap import (
     TargetWrapper,
     getSnaps,
@@ -930,12 +934,20 @@ class GrabbableRectangleSelection(GrabFunctions):
         wrapped_targets = self._unique_wrappers(targets or self.targets)
         restore_targets = [target.target for target in wrapped_targets]
         states = [target.get_restore_state() for target in wrapped_targets]
+        tracker = getattr(self.figure, "change_tracker", None)
+        capture = getattr(tracker, "capture_recording_state", None)
+        recording_state = capture() if capture is not None else None
 
         def undo():
             self.clear_targets()
             for target, state in zip(restore_targets, states):
                 target = TargetWrapper(target)
-                target.restore_state(state)
+                target.restore_state(
+                    state, record_changes=recording_state is None
+                )
+            restore_recording = getattr(tracker, "restore_recording_state", None)
+            if recording_state is not None and restore_recording is not None:
+                restore_recording(recording_state)
             for target in selected_targets:
                 self.add_target(target, update=False)
             if self.targets:
@@ -1149,12 +1161,25 @@ class GrabbableRectangleSelection(GrabFunctions):
             points = start_positions.get(id(target.target))
             if points is None:
                 points = np.array(target.get_positions(), dtype=float)
-            points = self.apply_transform(transform, points)
-            self.move_current_positions[id(target.target)] = points
             selection_points = start_selection_points.get(id(target.target))
             if selection_points is None:
                 selection_points = np.array(target.get_selection_points(), dtype=float)
-            selection_points = self.apply_transform(transform, selection_points)
+            if whole_object:
+                points = self.apply_transform(transform, points)
+                selection_points = self.apply_transform(transform, selection_points)
+            else:
+                resize_selection_points = target.preview_resize_selection_points(
+                    transform,
+                    control_points=points,
+                    selection_points=selection_points,
+                )
+                points = target.preview_resize_control_points(
+                    transform,
+                    control_points=points,
+                    selection_points=selection_points,
+                )
+                selection_points = resize_selection_points
+            self.move_current_positions[id(target.target)] = points
             self.move_current_selection_points[id(target.target)] = selection_points
             if getattr(self, "defer_current_move", False):
                 self._set_preview_positions(target, points, selection_points)
@@ -2360,6 +2385,12 @@ class DragManager:
         return tuple(float(value) for value in bounds)
 
     def select_elements_in_bbox(
+        self, x0: float, y0: float, x1: float, y1: float, additive: bool = False
+    ) -> list[Artist]:
+        with selection_geometry_snapshot():
+            return self._select_elements_in_bbox(x0, y0, x1, y1, additive)
+
+    def _select_elements_in_bbox(
         self, x0: float, y0: float, x1: float, y1: float, additive: bool = False
     ) -> list[Artist]:
         x0, x1 = sorted((float(x0), float(x1)))

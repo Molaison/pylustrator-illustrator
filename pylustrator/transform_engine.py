@@ -50,17 +50,15 @@ class TransformPlan:
         if operation is TransformOperation.TRANSLATE:
             delta = np.asarray(self.intent.delta, dtype=float)
             return tuple(
-                np.asarray(adapter.control_points(), dtype=float) + delta
+                adapter.point_array(adapter.control_points()) + delta
                 for adapter in self.adapters
             )
         if operation is TransformOperation.RESIZE_GEOMETRY:
             matrix = np.asarray(self.intent.matrix, dtype=float)
-            result = []
-            for adapter in self.adapters:
-                points = np.asarray(adapter.control_points(), dtype=float)
-                homogeneous = np.column_stack((points, np.ones(len(points))))
-                result.append((matrix @ homogeneous.T).T[:, :2])
-            return tuple(result)
+            return tuple(
+                adapter.preview_resize_control_points(matrix)
+                for adapter in self.adapters
+            )
         return tuple(
             np.asarray(adapter.control_points(), dtype=float)
             for adapter in self.adapters
