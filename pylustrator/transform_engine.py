@@ -8,7 +8,11 @@ from typing import Iterable
 import numpy as np
 from matplotlib.artist import Artist
 
-from .artist_adapters import ArtistAdapter, get_artist_adapter
+from .artist_adapters import (
+    ArtistAdapter,
+    get_artist_adapter,
+    suspend_change_recording,
+)
 from .operations import OperationSupport, TransformIntent, TransformOperation
 
 
@@ -64,6 +68,21 @@ class TransformPlan:
 
     def commit(self) -> None:
         snapshots = [adapter.snapshot() for adapter in self.adapters]
+        tracker_states = []
+        seen_trackers = set()
+        for adapter in self.adapters:
+            try:
+                tracker = adapter.change_tracker()
+            except AttributeError:
+                continue
+            if id(tracker) in seen_trackers:
+                continue
+            capture = getattr(tracker, "capture_recording_state", None)
+            restore = getattr(tracker, "restore_recording_state", None)
+            if not callable(capture) or not callable(restore):
+                continue
+            seen_trackers.add(id(tracker))
+            tracker_states.append((tracker, capture()))
         try:
             for adapter in self.adapters:
                 if self.intent.operation is TransformOperation.TRANSLATE:
@@ -87,13 +106,18 @@ class TransformPlan:
                         ]
                     )
         except Exception:
-            for adapter, state in zip(reversed(self.adapters), reversed(snapshots)):
-                try:
-                    adapter.restore(state)
-                except Exception:
-                    # Continue restoring earlier targets even when the adapter
-                    # that failed the commit also cannot restore itself.
-                    continue
+            with suspend_change_recording():
+                for adapter, state in zip(
+                    reversed(self.adapters), reversed(snapshots)
+                ):
+                    try:
+                        adapter.restore(state)
+                    except Exception:
+                        # Continue restoring earlier targets even when the adapter
+                        # that failed the commit also cannot restore itself.
+                        continue
+            for tracker, state in tracker_states:
+                tracker.restore_recording_state(state)
             raise
 
 

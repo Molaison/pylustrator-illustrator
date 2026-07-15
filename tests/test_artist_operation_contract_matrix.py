@@ -1457,13 +1457,6 @@ def test_logical_group_failure_rolls_back_every_member_geometry() -> None:
         plt.close(fig)
 
 
-@pytest.mark.xfail(
-    reason=(
-        "confirmed product defect: TransformPlan rollback restores geometry but does "
-        "not restore generated-change bookkeeping"
-    ),
-    strict=True,
-)
 def test_logical_group_failure_restores_generated_change_bookkeeping() -> None:
     fig = plt.figure(figsize=(3, 2), dpi=100)
     tracker = RecordingChangeTracker()
@@ -1487,13 +1480,6 @@ def test_logical_group_failure_restores_generated_change_bookkeeping() -> None:
         plt.close(fig)
 
 
-@pytest.mark.xfail(
-    reason=(
-        "confirmed product defect: rotatable adapter snapshots omit native rotation, "
-        "so a later failure leaves earlier targets rotated"
-    ),
-    strict=True,
-)
 def test_failed_multi_artist_rotation_rolls_back_native_angles() -> None:
     class FailingRotationRectangle(Rectangle):
         fail_rotation = False
@@ -1522,12 +1508,6 @@ def test_failed_multi_artist_rotation_rolls_back_native_angles() -> None:
         plt.close(fig)
 
 
-@pytest.mark.xfail(
-    reason=(
-        "confirmed product defect: rotatable adapter snapshots omit native rotation"
-    ),
-    strict=True,
-)
 def test_rotatable_snapshot_restore_includes_rotation_state(artist_case) -> None:
     adapter = artist_case.adapter
     if not adapter.capabilities.can_rotate:

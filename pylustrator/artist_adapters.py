@@ -453,17 +453,35 @@ class ArtistAdapter:
         self._record_change_records(self.serialize_rotation_changes())
         self.invalidate_geometry_cache()
 
+    def _record_restored_state(self, *, include_rotation: bool = False) -> None:
+        records = list(self.serialize_changes())
+        if include_rotation:
+            for record in self.serialize_rotation_changes():
+                if record not in records:
+                    records.append(record)
+        self._record_change_records(records)
+
     def snapshot(self):
         if not self.capabilities.can_snapshot:
             raise UnsupportedArtistError(
                 f"{type(self.target).__name__} does not support interaction snapshots"
             )
-        return {"type": "positions", "positions": self.local_control_points()}
+        state = {"type": "positions", "positions": self.local_control_points()}
+        if self.capabilities.can_rotate:
+            state["rotation"] = self.rotation()
+        return state
 
     def restore(self, state) -> None:
         if state.get("type") != "positions":
             raise ValueError(f"Unsupported snapshot for {type(self).__name__}: {state!r}")
-        self.apply_native_control_points(state["positions"])
+        self._apply_native_control_points(state["positions"])
+        include_rotation = "rotation" in state and not np.isclose(
+            self.rotation(), float(state["rotation"])
+        )
+        if include_rotation:
+            self._apply_rotation(float(state["rotation"]))
+        self._record_restored_state(include_rotation=include_rotation)
+        self.invalidate_geometry_cache()
 
     def get_extent(self) -> list[float]:
         if not getattr(self.target, "_pylustrator_cached_get_extend_added", False):
@@ -1024,6 +1042,7 @@ class TextAdapter(ArtistAdapter):
             "axis": axis_name,
             "position": tuple(float(value) for value in self.target.get_position()),
             "labelpad": float(axis.labelpad),
+            "rotation": self.rotation(),
         }
 
     def restore(self, state) -> None:
@@ -1046,7 +1065,12 @@ class TextAdapter(ArtistAdapter):
         else:
             self.label_x = self.target.get_position()[0]
             self.target.pad_offset = self.label_x + axis.labelpad * self.label_factor
-        self.record_changes()
+        include_rotation = "rotation" in state and not np.isclose(
+            self.rotation(), float(state["rotation"])
+        )
+        if include_rotation:
+            self._apply_rotation(float(state["rotation"]))
+        self._record_restored_state(include_rotation=include_rotation)
         self.invalidate_geometry_cache()
 
 

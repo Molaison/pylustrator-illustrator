@@ -24,8 +24,9 @@ Implementation order follows architectural dependencies.
 
 Status (2026-07-15): implemented on
 ``refactor/artist-adapter-architecture``.  The P0 implementation is covered by
-136 passing tests, Ruff, the full Fig2 interaction probe, and a read-only smoke
-replay of the unmodified formal Fig2.  The formal file retained SHA-256
+498 passing tests, 119 explicit capability-branch skips, 7 strict P1/P2
+xfails, Ruff, the full Fig2 interaction probe, and a read-only smoke replay of
+the unmodified formal Fig2.  The formal file retained SHA-256
 ``b0cd72abf3962cd6cd2354467ad57aa37ecc213332645d7cb56e6f4af598ad70``.
 
 Manual Fig2 follow-up found two Legend-specific violations and added them to
@@ -37,6 +38,13 @@ restore snapshots with change recording suspended, preventing a serialization
 failure from recursively failing during rollback.  Repeated editor
 initialization is idempotent as well, so Matplotlib methods cannot accumulate
 recursive wrappers across interactive runs or test cases.
+
+An independent 20-type adapter contract matrix subsequently found and closed
+two remaining P0 gaps: rotatable snapshots now include native angles, and a
+failed `TransformPlan` restores generated-change bookkeeping together with
+artist geometry.  Remaining strict xfails concern visible stroke/collection
+bounds, duplicate group serialization, and fallback error normalization; they
+are tracked as P1/P2 work rather than hidden by the P0 status.
 
 ### P0.1 Selection kernel
 

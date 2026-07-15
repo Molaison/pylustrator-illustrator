@@ -40,15 +40,15 @@ absence of edit support is deliberate and the denial contract passes.
 | Registered Artist | Adapter | Advertised | Actually tested | Result | Gap or explicit limitation |
 |---|---|---:|---|---|---|
 | `Artist` fallback | `ArtistAdapter` | none | Registry resolution; all operation descriptors; direct M/Z/R/N rejection and zero mutation | **FAIL** | Deliberately uneditable, but direct M reaches an empty-array NumPy broadcast error instead of the capability guard. |
-| `EditorGroup` | `EditorGroupAdapter` | S M Z N C | Two-member bounds; M/Z preview and commit; parent Axes immobility; N undo/redo state; real generated-command replay; failing-member rollback | **PASS*** | Geometry rollback is atomic. Failed commits do not restore `changes`/`saved`, and a successful group transform applies every member's change records twice. R is explicitly denied because member positions would also need pivot rotation. |
+| `EditorGroup` | `EditorGroupAdapter` | S M Z N C | Two-member bounds; M/Z preview and commit; parent Axes immobility; N undo/redo state; real generated-command replay; failing-member rollback | **PASS*** | Geometry and generated-change rollback are atomic. A successful group transform still applies every member's change records twice. R is explicitly denied because member positions would also need pivot rotation. |
 | `Axes` | `AxesAdapter` | S M Z N C | Bounds; M/Z; parent Figure size; N; real replay; fixed-aspect capability and constraint-respecting resize | **PASS** | R is explicitly unsupported. Fixed-aspect Axes advertise the `fixed_aspect` constraint. |
-| `Text` | `TextAdapter` | S M R N C | Axes/data/figure/display transforms; visible text bounds; M; native R; real replay; explicit Undo/Redo bookkeeping | **PASS*** | N restores position but omits rotation. Geometry resize is correctly denied in favor of future appearance scaling. |
-| `Annotation` | `AnnotationAdapter` | S M R N C | Mixed data/axes endpoint coordinates; two control points; M; R; N; real replay | **PASS*** | N omits rotation. Geometry resize is explicitly denied. |
+| `Text` | `TextAdapter` | S M R N C | Axes/data/figure/display transforms; visible text bounds; M; native R; complete N; real replay; explicit Undo/Redo bookkeeping | **PASS** | Geometry resize is correctly denied in favor of future appearance scaling. |
+| `Annotation` | `AnnotationAdapter` | S M R N C | Mixed data/axes endpoint coordinates; two control points; M; R; complete N; real replay | **PASS** | Geometry resize is explicitly denied. |
 | `Legend` | `LegendAdapter` | S M N C | Visible handles/text/title union; `frameon=False/True`; M; identity preservation during live movement; N; real replay | **PASS** | Geometry resize and layout reflow are explicitly denied. Generated source replay may recreate an Axes legend, while live edits retain identity. |
 | `Line2D` | `Line2DAdapter` | S M N C | Data and log transforms; M preview/commit; N; real `.set_data` replay | **PASS*** | Thick line stroke width is missing from selection bounds, although markers are included by Matplotlib. Geometry resize is explicitly denied pending affine preflight. |
 | `AxesImage` | `AxesImageAdapter` | S M Z N C | M/Z preview/commit; extent replay; N; x/y viewport and Axes position invariance | **PASS** | R is explicitly unsupported. Moving or resizing the image does not autoscale the camera. |
-| `Rectangle` | `RectangleAdapter` | S M Z R N C | M/Z/R; rotated M; rotated-resize denial; N; real replay; parent Axes invariance | **PASS*** | Generic patch bounds omit visible stroke width. N omits rotation. Z is only advertised at angles equivalent to 0 degrees modulo 180. |
-| `Ellipse` | `EllipseAdapter` | S M Z R N C | M/Z/R; rotated M; rotated-resize denial; N; real replay | **PASS*** | Same visible-stroke and rotation-snapshot defects as Rectangle. Z is disabled for rotated ellipses. |
+| `Rectangle` | `RectangleAdapter` | S M Z R N C | M/Z/R; rotated M; rotated-resize denial; complete N; real replay; parent Axes invariance | **PASS*** | Generic patch bounds omit visible stroke width. Z is only advertised at angles equivalent to 0 degrees modulo 180. |
+| `Ellipse` | `EllipseAdapter` | S M Z R N C | M/Z/R; rotated M; rotated-resize denial; complete N; real replay | **PASS*** | Generic patch bounds omit visible stroke width. Z is disabled for rotated ellipses. |
 | `FancyArrowPatch` | `FancyArrowPatchAdapter` | S M N C | Endpoint M; rendered preview/commit; N; real `.set_positions` replay | **PASS*** | Generic patch bounds do not account for all visible stroke appearance. Z/R are explicitly denied. |
 | `ConnectionPatch` | `ConnectionPatchAdapter` | none | Specific MRO resolution; all operation descriptors; direct M/Z/R/N rejection and zero mutation | **DENIED** | Deliberately blocked because its endpoints can occupy unrelated coordinate systems. |
 | `FancyBboxPatch` | `FancyBboxPatchAdapter` | S M N C when affine | Affine M/N/replay; log/non-affine preflight denial and zero mutation | **PASS*** | Generic patch bounds omit stroke. Geometry resize is explicitly unsupported. A non-affine data transform disables the whole editable contract. |
@@ -81,9 +81,9 @@ The following behavior passes for every type that advertises it:
 - Native rotation renders and records correctly for Text, Annotation,
   Rectangle, and Ellipse. Explicit old/new-value Undo/Redo restores the angle
   and generated-change dictionary.
-- Translation snapshots restore before/after geometry and can be used as an
-  Undo/Redo pair without changing the separately restored generated-change
-  state.
+- Snapshots restore before/after geometry and native rotation. Failed
+  multi-target transforms restore both artist state and generated-change
+  bookkeeping atomically.
 - Real `ChangeTracker` commands replay translated rendered bounds for all 18
   serializable registry types. Axis-label replay additionally covers both
   label position and `labelpad`.
@@ -93,44 +93,42 @@ The following behavior passes for every type that advertises it:
   frame contributes no padding, while a visible frame is included.
 
 Rotation has a `native_rotation` preview strategy, not a detached control-point
-preview. The native render and selection overlay are consistent, but the
-generic snapshot protocol is incomplete as described below.
+preview. The native render, selection overlay, snapshot, rollback, and explicit
+Undo/Redo paths are consistent.
 
-## Confirmed defects retained as strict xfails
+## P0 findings fixed after the independent audit
 
-### P0: rotation is not part of adapter snapshots
+### Rotation is now part of adapter snapshots
 
-`ArtistAdapter.snapshot()` stores only local control-point positions. Text,
-Annotation, Rectangle, and Ellipse advertise both N and R, but restoring their
-snapshot leaves the changed native angle in place.
+The QA baseline found that `ArtistAdapter.snapshot()` stored only local
+control-point positions. Text, Annotation, Rectangle, and Ellipse now include
+their native angle in snapshots and restore it only when it changed.
 
-Consequences:
+Verified behavior:
 
-- Single-object snapshot/restore is incomplete for all four rotatable types.
-- If a later target fails during `TransformPlan.commit()`, an earlier target's
-  angle is not rolled back.
-- The current interactive rotation gesture's explicit old/new angle closures
-  do pass Undo/Redo; the defect is confined to snapshot-driven rollback and
-  consumers of the public adapter snapshot contract.
+- Single-object snapshot/restore is complete for all four rotatable types.
+- If a later target fails during `TransformPlan.commit()`, earlier native
+  angles are restored.
+- Existing explicit old/new angle Undo/Redo remains unchanged.
 
-Tests:
+Passing tests:
 
-- `test_rotatable_snapshot_restore_includes_rotation_state` (four xfails)
+- `test_rotatable_snapshot_restore_includes_rotation_state` (four types)
 - `test_failed_multi_artist_rotation_rolls_back_native_angles`
-- Passing gesture/history checks:
+- Gesture/history checks:
   `test_native_rotation_undo_redo_restores_angle_and_bookkeeping` and existing
   `test_rotation_routes_through_artist_capabilities_and_undo`
 
-### P0: failed transforms do not atomically restore generated bookkeeping
+### Failed transforms now restore generated bookkeeping atomically
 
-The logical-group failure test proves that member geometry is restored, but
-the tracker remains dirty: `changes` differs and `saved` changes from `True`
-to `False`. `TransformPlan.commit()` owns geometry snapshots but does not own a
-tracker recording snapshot. The drag layer has a separate tracker rollback,
-so this defect is most directly visible to the public TransformPlan contract
-and any new caller that relies on it for transactionality.
+`TransformPlan.commit()` now captures each unique change tracker alongside its
+artist snapshots. On failure it restores geometry with recording suspended,
+then restores `changes` and `saved`, so public transform plans and logical
+groups have the same atomicity guarantee as drag gestures.
 
 Test: `test_logical_group_failure_restores_generated_change_bookkeeping`.
+
+## Confirmed remaining defects retained as strict xfails
 
 ### P1: selection bounds mix geometric, visible, and conservative bounds
 
@@ -214,8 +212,8 @@ QT_QPA_PLATFORM=offscreen uv run pytest tests -q
 uv run ruff check .
 ```
 
-At the time of this audit, the dedicated contract file reports 356 passed,
-119 explicitly skipped branches, and 13 strict xfails. The skips are branch
+After the P0 fixes, the dedicated contract file reports 362 passed,
+119 explicitly skipped branches, and 7 strict xfails. The skips are branch
 accounting, not missing Artist types: supported-operation tests skip denied
 types, while rejection tests skip supported types. Registry equality guarantees
 that all 20 built-in registrations are present in the matrix.
