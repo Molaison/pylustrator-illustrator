@@ -459,6 +459,19 @@ class ArtistAdapter:
                 return np.array([bounds[:2], bounds[2:]], dtype=float)
         return self.bounds_points(self.control_points())
 
+    def hit_test(self, event) -> bool:
+        """Return whether a canvas event hits the artist's visible paint.
+
+        Matplotlib's native ``contains`` remains authoritative by default.
+        Adapters may add a renderer-faithful fallback for artist classes whose
+        native picker ignores visible degenerate geometry.
+        """
+
+        try:
+            return bool(self.target.contains(event)[0])
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            return False
+
     def geometry_bounds(self, control_points=None) -> np.ndarray:
         """Transformable display-space geometry, excluding paint appearance."""
 
@@ -842,6 +855,71 @@ class PatchAdapter(ArtistAdapter):
             return points
         padding = self.points_to_pixels(max(float(self.target.get_linewidth()), 0.0)) / 2
         return self.bounds_points(points, padding=padding)
+
+    @staticmethod
+    def _point_segment_distance(point, start, end) -> float:
+        point = np.asarray(point, dtype=float)
+        start = np.asarray(start, dtype=float)
+        end = np.asarray(end, dtype=float)
+        segment = end - start
+        length_squared = float(np.dot(segment, segment))
+        if not np.isfinite(length_squared) or length_squared <= 0:
+            return float(np.linalg.norm(point - start))
+        offset = float(np.dot(point - start, segment) / length_squared)
+        closest = start + np.clip(offset, 0.0, 1.0) * segment
+        return float(np.linalg.norm(point - closest))
+
+    def _stroke_hit_test(self, point, tolerance: float) -> bool:
+        """Hit-test the transformed path centerline in display coordinates."""
+
+        try:
+            path = self.target.get_transform().transform_path(self.target.get_path())
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            return False
+
+        current = None
+        start = None
+        try:
+            segments = path.iter_segments(curves=False, simplify=False)
+            for vertices, code in segments:
+                vertex = np.asarray(vertices[-2:], dtype=float)
+                if vertex.shape != (2,) or not np.all(np.isfinite(vertex)):
+                    current = None
+                    start = None
+                    continue
+                if code == Path.MOVETO or current is None:
+                    current = vertex
+                    start = vertex
+                    continue
+                endpoint = start if code == Path.CLOSEPOLY and start is not None else vertex
+                if self._point_segment_distance(point, current, endpoint) <= tolerance:
+                    return True
+                current = endpoint
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            return False
+        return False
+
+    def hit_test(self, event) -> bool:
+        if super().hit_test(event):
+            return True
+        if not self.colors_are_visible(self.target.get_edgecolor()):
+            return False
+        point = np.asarray((event.x, event.y), dtype=float)
+        if not np.all(np.isfinite(point)):
+            return False
+
+        # Three pixels matches the editor's direct-manipulation tolerance while
+        # the stroke half-width keeps thick outlines selectable across their
+        # complete painted envelope. A numeric Matplotlib picker is expressed in
+        # typographic points and may request a larger tolerance.
+        tolerance = max(
+            3.0,
+            self.points_to_pixels(max(float(self.target.get_linewidth()), 0.0)) / 2,
+        )
+        picker = self.target.get_picker()
+        if isinstance(picker, (int, float)) and not isinstance(picker, bool):
+            tolerance = max(tolerance, self.points_to_pixels(float(picker)))
+        return self._stroke_hit_test(point, tolerance)
 
     def preview_resize_control_points(
         self, matrix, *, control_points=None, selection_points=None

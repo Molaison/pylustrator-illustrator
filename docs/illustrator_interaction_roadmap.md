@@ -24,7 +24,7 @@ Implementation order follows architectural dependencies.
 
 Status (2026-07-15): implemented on
 ``refactor/artist-adapter-architecture``.  The P0 implementation is covered by
-568 passing tests, 119 explicit capability-branch skips, no xfails, Ruff, the
+569 passing tests, 119 explicit capability-branch skips, no xfails, Ruff, the
 full Fig2 interaction probe, and a read-only smoke replay of
 the unmodified formal Fig2.  The formal file retained SHA-256
 ``b0cd72abf3962cd6cd2354467ad57aa37ecc213332645d7cb56e6f4af598ad70``.
@@ -74,6 +74,14 @@ edits its renderer-visible base paths.
 Legend property reconstruction uses the same source-handle specification, so
 `markerscale` is applied exactly once and semantic composite handlers are
 preserved or disabled before mutation.
+
+The final click-surface audit also made visible stroked geometry authoritative
+when Matplotlib's native picker rejects a zero-area closed Path. Degenerate
+PathPatch outlines now fall back to transformed centerline distance instead of
+an over-broad bounding-box hit. The real Fig2 probe promotes unclickable
+candidates and missing operation categories to explicit failures: all 423 click
+candidates are cycle-reachable and all 19 represented categories now execute an
+alignment workflow.
 
 ### P0.1 Selection kernel
 

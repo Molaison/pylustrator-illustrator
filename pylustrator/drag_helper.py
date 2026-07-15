@@ -1909,7 +1909,7 @@ class DragManager:
             return False
         if not (child.pickable() or isinstance(child, GrabberGeneric)):
             return False
-        if event is not None and not child.contains(event)[0]:
+        if event is not None and not self._is_interaction_hit(child, event):
             return False
         if isinstance(child, GrabberGeneric):
             return True
@@ -1931,6 +1931,9 @@ class DragManager:
         if scene.is_locked(artist) or scene.is_explicitly_hidden(artist):
             return False
         try:
+            target = TargetWrapper(artist)
+            if target.supported:
+                return target.adapter.hit_test(event)
             return bool(artist.contains(event)[0])
         except (AttributeError, TypeError, ValueError, RuntimeError):
             return False

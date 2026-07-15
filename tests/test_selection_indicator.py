@@ -15,10 +15,12 @@ from matplotlib.patches import (
     FancyArrowPatch,
     FancyBboxPatch,
     Patch,
+    PathPatch,
     Rectangle,
     RegularPolygon,
     Wedge,
 )
+from matplotlib.path import Path
 from qtpy import QtCore, QtGui, QtWidgets
 
 from pylustrator.artist_adapters import selection_geometry_snapshot
@@ -40,6 +42,41 @@ from pylustrator.snap import SnapSamePos, TargetWrapper
 from pylustrator.interaction import SelectionMode
 from pylustrator.editor_model import EditorGroup
 from pylustrator.commands import semantic_equal
+
+
+def test_degenerate_stroked_path_patch_is_reachable_by_click() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    path = Path(
+        [(0.4, 0.2), (0.4, 0.8), (0.4, 0.8), (0.4, 0.2), (0.4, 0.2)],
+        [Path.MOVETO, Path.LINETO, Path.LINETO, Path.LINETO, Path.CLOSEPOLY],
+    )
+    patch = ax.add_patch(
+        PathPatch(path, facecolor="white", edgecolor="black", linewidth=0.65)
+    )
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    display_path = patch.get_transform().transform_path(path)
+    center = np.mean(display_path.vertices[:2], axis=0)
+    event = MouseEvent(
+        "button_press_event", fig.canvas, float(center[0]), float(center[1]), button=1
+    )
+
+    assert patch in manager.get_hit_candidates(event)
+    picked, _finished = manager.get_picked_element(event)
+    assert picked is patch
+
+    miss = MouseEvent(
+        "button_press_event",
+        fig.canvas,
+        float(center[0] + 6),
+        float(center[1]),
+        button=1,
+    )
+    assert patch not in manager.get_hit_candidates(miss)
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
 
 
 class SelectionView:
