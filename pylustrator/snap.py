@@ -29,6 +29,7 @@ from qtpy import QtCore, QtGui, QtWidgets
 
 from .artist_adapters import (
     ArtistCapabilities,
+    RigidRotationPlan,
     artist_adapter_registry,
     cached_selection_points,
     checkXLabel,
@@ -93,6 +94,9 @@ class TargetWrapper:
 
     def supports_operation(self, operation: TransformOperation | str) -> bool:
         return self.adapter.supports_operation(operation)
+
+    def native_rotation_handle_support(self) -> OperationSupport:
+        return self.adapter.native_rotation_handle_support()
 
     def get_transform(self):
         return self.adapter.get_transform()
@@ -176,6 +180,18 @@ class TargetWrapper:
 
     def set_rotation(self, value: float) -> None:
         self.adapter.set_rotation(value)
+
+    def plan_rigid_rotation(
+        self, angle_degrees: float, pivot
+    ) -> RigidRotationPlan:
+        return self.adapter.plan_rigid_rotation(angle_degrees, pivot)
+
+    def apply_rigid_rotation_plan(
+        self, plan: RigidRotationPlan, *, record_changes: bool = True
+    ) -> None:
+        self.adapter.apply_rigid_rotation_plan(
+            plan, record_changes=record_changes
+        )
 
     def get_restore_state(self):
         return self.adapter.snapshot()

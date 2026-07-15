@@ -19,6 +19,9 @@
 # You should have received a copy of the GNU General Public License
 # along with Pylustrator. If not, see <http://www.gnu.org/licenses/>
 
+import sys
+import time
+
 import numpy as np
 from matplotlib.artist import Artist
 from matplotlib.figure import Figure, SubFigure
@@ -51,7 +54,6 @@ from .interaction import HitCandidate, HitStack, SelectionKernel, SelectionMode
 from .operations import OperationSupport, TransformOperation
 from .commands import InteractionState, ObjectLocator, semantic_equal
 from pylustrator.change_tracker import UndoRedo
-import time
 
 DIR_X0 = 1
 DIR_Y0 = 2
@@ -59,6 +61,18 @@ DIR_X1 = 4
 DIR_Y1 = 8
 
 blit = False
+
+
+class InteractionRollbackError(RuntimeError):
+    """Raised when a preview transaction cannot fully restore its start state."""
+
+    def __init__(self, failures):
+        self.failures = tuple(failures)
+        details = "; ".join(
+            f"{type(target).__name__}: {error}"
+            for target, error in self.failures
+        )
+        super().__init__(f"Interaction rollback was incomplete: {details}")
 
 
 def _legend_selectable_children(legend: Legend) -> list[Artist]:
@@ -172,6 +186,19 @@ class GrabFunctions(object):
             except UnsupportedArtistError as error:
                 QtWidgets.QMessageBox.warning(None, "Pylustrator", str(error))
                 self.figure.canvas.draw_idle()
+
+    def cancel_event(self) -> None:
+        """Stop pointer delivery without committing the active gesture."""
+
+        if self.got_artist:
+            self.got_artist = False
+            connection = getattr(self, "_c1", None)
+            if connection is not None:
+                self.figure.canvas.mpl_disconnect(connection)
+        for snap in self.snaps:
+            snap.remove()
+        self.snaps = []
+        self.moved = False
 
     def clickedEvent(self, event: MouseEvent):
         """when the mouse is clicked"""
@@ -692,7 +719,7 @@ class GrabbableRectangleSelection(GrabFunctions):
             self.has_moved = True
             self.end_move(edit_name)
         except Exception:
-            self._restore_move_start()
+            self._restore_move_start(strict=False)
             self.has_moved = False
             self.end_move(edit_name)
             raise
@@ -799,7 +826,7 @@ class GrabbableRectangleSelection(GrabFunctions):
             self.has_moved = True
             self.end_move("Resize")
         except Exception:
-            self._restore_move_start()
+            self._restore_move_start(strict=False)
             self.has_moved = False
             self.end_move("Resize")
             raise
@@ -839,7 +866,7 @@ class GrabbableRectangleSelection(GrabFunctions):
             self.has_moved = True
             self.end_move("Scale")
         except Exception:
-            self._restore_move_start()
+            self._restore_move_start(strict=False)
             self.has_moved = False
             self.end_move("Scale")
             raise
@@ -856,29 +883,64 @@ class GrabbableRectangleSelection(GrabFunctions):
             else None
         )
 
-    def _set_rotation_value(self, target: Artist, value: float) -> None:
-        TargetWrapper(target).set_rotation(value)
+    def rotation_interaction_support(
+        self, operation: TransformOperation | None = None
+    ) -> OperationSupport:
+        if operation is None:
+            operation = self.rotation_operation()
+        if operation is None:
+            return OperationSupport.denied(
+                TransformOperation.ROTATE, "No objects are selected"
+            )
+        if operation is TransformOperation.ROTATE:
+            if len(self.targets) != 1:
+                return OperationSupport.denied(
+                    operation,
+                    "Native visual rotation requires exactly one selected object",
+                )
+            return self.targets[0].native_rotation_handle_support()
+        return self.operation_support(operation)
+
+    def rotation_operation(self) -> TransformOperation | None:
+        if not self.targets:
+            return None
+        if self.operation_support(TransformOperation.RIGID_ROTATE).supported:
+            return TransformOperation.RIGID_ROTATE
+        if (
+            len(self.targets) == 1
+            and self.targets[0].native_rotation_handle_support().supported
+        ):
+            return TransformOperation.ROTATE
+        return (
+            TransformOperation.ROTATE
+            if len(self.targets) == 1
+            else TransformOperation.RIGID_ROTATE
+        )
 
     def rotation_handle_supported(self) -> bool:
-        """Expose a handle only when one exact native rotation pivot exists."""
+        """Expose native single-object or common-pivot multi-object rotation."""
 
-        return bool(
-            len(self.targets) == 1
-            and self.operation_support(TransformOperation.ROTATE).supported
-        )
+        operation = self.rotation_operation()
+        if operation is None:
+            return False
+        return self.rotation_interaction_support(operation).supported
 
     def rotation_pivot(self) -> np.ndarray:
         if not self.rotation_handle_supported():
             raise ValueError(
-                "Rotation handles require one selected object with native rotation support"
+                "Rotation handle requires native single-object rotation or a "
+                "complete common-pivot geometry plan"
             )
-        return np.asarray(self.targets[0].get_rotation_pivot(), dtype=float)
+        if self.rotation_operation() is TransformOperation.ROTATE:
+            return np.asarray(self.targets[0].get_rotation_pivot(), dtype=float)
+        return np.asarray(self.reference_position(), dtype=float)
 
     def start_rotation(self, event: MouseEvent) -> None:
-        """Begin one deferred, atomic native-rotation gesture."""
+        """Begin one deferred native or common-pivot rotation gesture."""
 
         if not self.rotation_handle_supported():
-            support = self.operation_support(TransformOperation.ROTATE)
+            operation = self.rotation_operation() or TransformOperation.ROTATE
+            support = self.rotation_interaction_support(operation)
             raise ValueError(support.reason or "Rotation handle is unavailable")
         pivot = self.rotation_pivot()
         pointer = np.asarray((event.x, event.y), dtype=float)
@@ -887,42 +949,75 @@ class GrabbableRectangleSelection(GrabFunctions):
             raise ValueError("Rotation handle is too close to its native pivot")
 
         self.start_move(save_targets=self.targets)
-        self.rotation_drag_target = self.targets[0]
+        self.rotation_drag_mode = (
+            "native"
+            if self.rotation_operation() is TransformOperation.ROTATE
+            else "rigid"
+        )
         self.rotation_drag_pivot = pivot
         self.rotation_drag_start_pointer_angle = float(
             np.degrees(np.arctan2(vector[1], vector[0]))
         )
-        self.rotation_drag_start_value = self.rotation_drag_target.get_rotation()
-        self.rotation_drag_preview_value = self.rotation_drag_start_value
+        if self.rotation_drag_mode == "native":
+            self.rotation_drag_target = self.targets[0]
+            self.rotation_drag_start_value = self.rotation_drag_target.get_rotation()
+            self.rotation_drag_preview_value = self.rotation_drag_start_value
+        else:
+            self.rotation_drag_preview_delta = 0.0
+            self.rotation_drag_plans = ()
 
     def preview_rotation(self, event: MouseEvent) -> float:
-        """Preview the exact native angle that will be committed on release."""
+        """Preview the exact native or shared rigid rotation destination."""
 
-        target = getattr(self, "rotation_drag_target", None)
-        if target is None:
+        mode = getattr(self, "rotation_drag_mode", None)
+        if mode is None:
             raise RuntimeError("No rotation gesture is active")
         pointer = np.asarray((event.x, event.y), dtype=float)
         vector = pointer - self.rotation_drag_pivot
         if not np.all(np.isfinite(vector)) or np.linalg.norm(vector) <= 1e-9:
-            return self.rotation_drag_preview_value
+            return (
+                self.rotation_drag_preview_value
+                if mode == "native"
+                else self.rotation_drag_preview_delta
+            )
         pointer_angle = float(np.degrees(np.arctan2(vector[1], vector[0])))
         delta = (
             pointer_angle - self.rotation_drag_start_pointer_angle + 180.0
         ) % 360.0 - 180.0
         if _event_has_modifier(event, "shift"):
             delta = round(delta / 15.0) * 15.0
-        value = self.rotation_drag_start_value + delta
         try:
-            with suspend_change_recording():
-                target.set_rotation(value)
+            if mode == "native":
+                value = self.rotation_drag_start_value + delta
+                with suspend_change_recording():
+                    self.rotation_drag_target.set_rotation(value)
+                self.rotation_drag_preview_value = value
+                self.has_moved = not np.isclose(
+                    value, self.rotation_drag_start_value
+                )
+                result = value
+            else:
+                self._restore_move_start()
+                with selection_geometry_snapshot():
+                    plans = tuple(
+                        target.plan_rigid_rotation(delta, self.rotation_drag_pivot)
+                        for target in self.targets
+                    )
+                for target, plan in zip(self.targets, plans):
+                    target.apply_rigid_rotation_plan(
+                        plan, record_changes=False
+                    )
+                self.rotation_drag_plans = plans
+                self.rotation_drag_preview_delta = delta
+                self.has_moved = not np.isclose(delta, 0.0)
+                result = delta
         except Exception:
-            self._restore_move_start()
+            self._restore_move_start(strict=False)
             self.has_moved = False
             self.end_move("Rotate")
             self._clear_rotation_gesture()
+            self.rotation_grabber.cancel_event()
             raise
-        self.rotation_drag_preview_value = value
-        self.has_moved = not np.isclose(value, self.rotation_drag_start_value)
         self.update_extent()
         self.update_selection_rectangles()
         self.hide_grabber()
@@ -931,15 +1026,18 @@ class GrabbableRectangleSelection(GrabFunctions):
             canvas.schedule_draw()
         else:
             canvas.draw_idle()
-        return value
+        return result
 
     def _clear_rotation_gesture(self) -> None:
         for name in (
             "rotation_drag_target",
+            "rotation_drag_mode",
             "rotation_drag_pivot",
             "rotation_drag_start_pointer_angle",
             "rotation_drag_start_value",
             "rotation_drag_preview_value",
+            "rotation_drag_preview_delta",
+            "rotation_drag_plans",
         ):
             try:
                 delattr(self, name)
@@ -949,24 +1047,38 @@ class GrabbableRectangleSelection(GrabFunctions):
     def end_rotation(self) -> bool:
         """Commit one generated change and one undo item for a handle gesture."""
 
-        target = getattr(self, "rotation_drag_target", None)
-        if target is None:
+        mode = getattr(self, "rotation_drag_mode", None)
+        if mode is None:
             return False
-        changed = not np.isclose(
-            self.rotation_drag_preview_value, self.rotation_drag_start_value
+        changed = (
+            not np.isclose(
+                self.rotation_drag_preview_value,
+                self.rotation_drag_start_value,
+            )
+            if mode == "native"
+            else not np.isclose(self.rotation_drag_preview_delta, 0.0)
         )
         try:
             if changed:
-                # The preview was deliberately unrecorded. Reapplying the final
-                # absolute value emits exactly one stable generated change.
-                target.set_rotation(self.rotation_drag_preview_value)
+                if mode == "native":
+                    # The preview was deliberately unrecorded. Reapplying the
+                    # final absolute value emits one stable generated change.
+                    self.rotation_drag_target.set_rotation(
+                        self.rotation_drag_preview_value
+                    )
+                else:
+                    self._restore_move_start()
+                    for target, plan in zip(
+                        self.targets, self.rotation_drag_plans
+                    ):
+                        target.apply_rigid_rotation_plan(plan)
                 self.update_extent()
                 self.has_moved = True
             else:
                 self.has_moved = False
             self.end_move("Rotate")
         except Exception:
-            self._restore_move_start()
+            self._restore_move_start(strict=False)
             self.has_moved = False
             self.end_move("Rotate")
             self._clear_rotation_gesture()
@@ -979,44 +1091,74 @@ class GrabbableRectangleSelection(GrabFunctions):
         self.update_selection_rectangles()
         return changed
 
+    def cancel_rotation(self) -> bool:
+        """Restore the pre-gesture transaction and discard a rotation preview."""
+
+        if getattr(self, "rotation_drag_mode", None) is None:
+            return False
+        rollback_error = None
+        try:
+            try:
+                self._restore_move_start()
+            except InteractionRollbackError as error:
+                rollback_error = error
+            self.has_moved = False
+            self.end_move("Rotate")
+        finally:
+            self._clear_rotation_gesture()
+        self.figure.canvas.draw()
+        self.update_selection_rectangles()
+        if rollback_error is not None:
+            raise rollback_error
+        return True
+
     def rotate_selection(self, angle_degrees: float) -> bool:
-        """Rotate selected objects that have a native saveable rotation property."""
+        """Rotate one native object or a multi-selection around one pivot."""
         if len(self.targets) == 0:
             return False
-        if np.isclose(angle_degrees, 0.0):
+        angle_degrees = float(angle_degrees)
+        if not np.isfinite(angle_degrees):
+            raise ValueError("Rotation angle must be finite")
+        if np.isclose(angle_degrees % 360.0, 0.0, atol=1e-12):
             return False
 
-        support = self.operation_support(TransformOperation.ROTATE)
+        operation = self.rotation_operation()
+        if operation is None:
+            return False
+        support = self.rotation_interaction_support(operation)
         if not support.supported:
-            raise ValueError(support.reason)
+            raise UnsupportedArtistError(support.reason)
 
-        old_values: list[tuple[Artist, float]] = []
-        for target in self.targets:
-            value = self._rotatable_value(target.target)
-            if value is not None:
-                old_values.append((target.target, value))
+        plans = ()
+        if operation is TransformOperation.RIGID_ROTATE:
+            pivot = self.reference_position()
+            with selection_geometry_snapshot():
+                plans = tuple(
+                    target.plan_rigid_rotation(angle_degrees, pivot)
+                    for target in self.targets
+                )
 
-        new_values = [(target, value + angle_degrees) for target, value in old_values]
-
-        def apply(values: list[tuple[Artist, float]]) -> None:
-            for target, value in values:
-                self._set_rotation_value(target, value)
-            self.figure.canvas.draw()
+        self.start_move(save_targets=self.targets)
+        try:
+            if operation is TransformOperation.ROTATE:
+                target = self.targets[0]
+                target.set_rotation(target.get_rotation() + angle_degrees)
+            else:
+                for target, plan in zip(self.targets, plans):
+                    target.apply_rigid_rotation_plan(plan)
             self.update_extent()
-            self.update_selection_rectangles()
-
-        def undo() -> None:
-            apply(old_values)
-
-        def redo() -> None:
-            apply(new_values)
-
-        redo()
-        self.figure.change_tracker.addEdit([undo, redo, "Rotate"])
+            self.has_moved = True
+            self.end_move("Rotate")
+        except Exception:
+            self._restore_move_start(strict=False)
+            self.has_moved = False
+            self.end_move("Rotate")
+            raise
         signal = getattr(self.figure.signals, "figure_selection_property_changed", None)
         if signal is not None:
             signal.emit()
-        self.figure.signals.figure_selection_moved.emit()
+        self.figure.canvas.draw()
+        self.update_selection_rectangles()
         return True
 
     def delete_targets(self):
@@ -1295,7 +1437,7 @@ class GrabbableRectangleSelection(GrabFunctions):
             self.has_moved = True
             self.end_move("Change position")
         except Exception:
-            self._restore_move_start()
+            self._restore_move_start(strict=False)
             self.has_moved = False
             self.end_move("Change position")
             raise
@@ -1382,7 +1524,7 @@ class GrabbableRectangleSelection(GrabFunctions):
             self.has_moved = True
             self.end_move("Resize")
         except Exception:
-            self._restore_move_start()
+            self._restore_move_start(strict=False)
             self.has_moved = False
             self.end_move("Resize")
             raise
@@ -1470,6 +1612,7 @@ class GrabbableRectangleSelection(GrabFunctions):
         self.start_inv_transform = self.get_inv_trans_matrix()
         self.hide_grabber()
         self.has_moved = False
+        self.move_rollback_failures = ()
         self.defer_current_move = bool(self.defer_artist_updates)
         self.save_targets = self._unique_wrappers(save_targets or self.targets)
         for target in self._unique_wrappers(list(self.targets) + self.save_targets):
@@ -1601,21 +1744,54 @@ class GrabbableRectangleSelection(GrabFunctions):
                 return True
         return False
 
-    def _restore_move_start(self) -> None:
+    def _restore_move_start(self, *, strict: bool = True) -> tuple:
+        """Best-effort rollback that never strands earlier targets or previews."""
+
+        failures = []
         start_states = getattr(self, "move_start_states", {})
         for target in reversed(self.save_targets):
             state = start_states.get(id(target.target))
             if state is not None:
-                target.restore_state(state, record_changes=False)
+                try:
+                    target.restore_state(state, record_changes=False)
+                except Exception as error:
+                    failures.append((target.target, error))
         tracker_state = getattr(self, "move_start_tracker_state", None)
         tracker = getattr(self.figure, "change_tracker", None)
         restore = getattr(tracker, "restore_recording_state", None)
         if tracker_state is not None and restore is not None:
-            restore(tracker_state)
-        self.clear_move_previews()
+            try:
+                restore(tracker_state)
+            except Exception as error:
+                failures.append((tracker, error))
+        try:
+            self.clear_move_previews()
+        except Exception as error:
+            failures.append((self, error))
         if self.targets:
-            self.update_extent()
-            self.update_selection_rectangles()
+            try:
+                self.update_extent()
+                self.update_selection_rectangles()
+            except Exception as error:
+                failures.append((self, error))
+
+        self.move_rollback_failures = tuple(failures)
+        active_error = sys.exc_info()[1]
+        if failures and active_error is not None:
+            try:
+                active_error.pylustrator_rollback_failures = tuple(failures)
+            except (AttributeError, TypeError):
+                pass
+            add_note = getattr(active_error, "add_note", None)
+            if callable(add_note):
+                details = "; ".join(
+                    f"{type(target).__name__}: {error}"
+                    for target, error in failures
+                )
+                add_note(f"Pylustrator rollback failures: {details}")
+        if failures and strict:
+            raise InteractionRollbackError(failures)
+        return tuple(failures)
 
     def end_move(self, edit_name: str = "Move", coalesce_key: str = None):
         """a grabber move stopped"""
@@ -1623,7 +1799,7 @@ class GrabbableRectangleSelection(GrabFunctions):
             try:
                 self._commit_deferred_positions()
             except Exception:
-                self._restore_move_start()
+                self._restore_move_start(strict=False)
                 self.has_moved = False
                 raise
             if not self._move_changed_semantically():
@@ -3304,6 +3480,21 @@ class DragManager:
         if event.key == "ctrl+y":
             self.redo()
         if event.key == "escape":
+            rotation_active = (
+                getattr(self.selection, "rotation_drag_mode", None) is not None
+            )
+            if rotation_active:
+                try:
+                    self.selection.cancel_rotation()
+                finally:
+                    self.selection.rotation_grabber.cancel_event()
+                    if self.grab_element is not None:
+                        self.grab_element.cancel_event()
+                    self.grab_element = None
+                    scene = getattr(self.figure, "_pyl_scene", None)
+                    if scene is not None:
+                        scene.grabber_pressed = None
+                return
             if self._ensure_selection_kernel().scope_root is not None:
                 self.exit_isolation()
                 return

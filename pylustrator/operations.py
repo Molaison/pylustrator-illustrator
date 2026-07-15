@@ -14,6 +14,7 @@ class TransformOperation(str, Enum):
     SCALE_APPEARANCE = "scale_appearance"
     REFLOW_LAYOUT = "reflow_layout"
     ROTATE = "rotate"
+    RIGID_ROTATE = "rigid_rotate"
     EDIT_POINTS = "edit_points"
     SNAPSHOT = "snapshot"
     SERIALIZE = "serialize"
@@ -89,6 +90,19 @@ class TransformIntent:
         return cls(
             TransformOperation.ROTATE,
             angle_degrees=float(angle_degrees),
+            label=label,
+        )
+
+    @classmethod
+    def rigid_rotate(
+        cls, angle_degrees, pivot, *, label: str = "Rotate"
+    ) -> "TransformIntent":
+        """Rotate complete display geometry around one shared pivot."""
+
+        return cls(
+            TransformOperation.RIGID_ROTATE,
+            angle_degrees=float(angle_degrees),
+            pivot=(float(pivot[0]), float(pivot[1])),
             label=label,
         )
 

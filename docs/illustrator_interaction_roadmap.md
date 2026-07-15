@@ -24,7 +24,7 @@ Implementation order follows architectural dependencies.
 
 Status (2026-07-15): implemented on
 ``refactor/artist-adapter-architecture``.  The P0 implementation is covered by
-590 passing tests, 119 explicit capability-branch skips, no xfails, Ruff, the
+693 passing tests, 147 explicit capability-branch skips, no xfails, Ruff, the
 full Fig2 interaction probe, and a read-only smoke replay of
 the unmodified formal Fig2.  The formal file retained SHA-256
 ``b0cd72abf3962cd6cd2354467ad57aa37ecc213332645d7cb56e6f4af598ad70``.
@@ -185,16 +185,49 @@ The transform bar now has a 3x3 reference locator. Numeric X/Y addresses that
 point on the exact visible selection bounds, while W/H resizes about the same
 point through one preflighted atomic transaction. Physical units compose in the
 correct order (native coordinates to display pixels, then inches or
-centimeters). A single object with an exact native rotation contract also shows
-an arbitrary-angle handle connected to its real native pivot; Shift snaps the
-preview to 15-degree increments, and release emits one generated change and one
-undo item. Multi-object rotation handles stay hidden until adapters can express
-honest common-pivot geometry instead of merely changing every object's local
-angle in place. Legend-managed Text also hides the handle: Matplotlib's Legend
-packer moves its anchor by about 6.4 px after rotation in the real Fig2, so the
-native Text angle is not an honest stable-pivot object transform. The exhaustive
-Fig2 audit therefore records 81 representative workflows rather than inflating
-the count to 83; all 6,279 instance checks and all 81 workflows pass.
+centimeters). Rotation now distinguishes native angle editing from rigid
+display-space geometry. A supported single object or mixed selection builds an
+absolute plan around the active 3x3 reference point; toolbar buttons and the
+off-object handle consume that same plan, and Shift snaps handle preview to
+15-degree increments. Multi-object rotation therefore changes positions around
+one pivot instead of silently changing every object's local angle in place.
+Release emits one generated transaction and one undo item; 360 degrees is a
+no-op. Escape restores the unrecorded preview and keeps the selection, so a
+second Escape remains available for ordinary deselection/isolation exit.
+
+The first implementation deliberately keeps a strict honesty boundary.
+Polygon/PathPatch, marker-free default Line2D, non-offset Line/PolyCollection,
+anchor-mode Text, similarity-transform Rectangle/Ellipse, and recursively
+complete EditorGroups are eligible only when their appearance, clip, owner,
+active-layout participation, and native/display round trip remain exact within
+0.25 px. Legend descendants and layout-managed text/backgrounds reject before
+mutation even when their leaf geometry is mathematically rotatable. Partial or
+non-rectangular clips, Agg filters, wrapped/bbox/effected Text, hatch/effects,
+rendered offsets, non-affine/singular transforms, and explicit tuple Rectangle
+pivots likewise reject. A single object without a rigid plan may use native R
+only when that separate contract is honest.
+
+Independent synthetic QA exercised ten positive Artist variants at four angles
+(`13`, `-37`, `90`, `360`) around center and external pivots: all 80 plans,
+single/mixed/nested-group handle and toolbar routes, replay, cancellation, and
+undo/redo passed; maximum geometry error was `5.68e-14 px`, selection error was
+zero, and 360 degrees emitted no mutation or record. The read-only Fig2 fork
+then checked 4,830 operation descriptors and 1,816 plans across 227 supported
+instances. It accepted 1,702 destinations and atomically rejected 114
+clip-limited destinations with zero unexpected failures; maximum accepted
+round-trip error was `4.55e-13 px`. Line2D, LineCollection, and PathPatch passed
+nonzero single/mixed handle, undo/redo, snapshot, and replay workflows.
+FillBetweenPolyCollection remained capability-honest but every real nonzero
+destination was already partially clipped, so only its 360-degree no-op was
+accepted. All 115 owner-managed instances rejected without mutation, record,
+or edit.
+
+The same fork rechecked the reported panel-D Legend failures. Drag and key
+alignment errors were at most `2.27e-13 px`, selection indicators matched the
+rendered Legend, and `frameon` toggled in place in about `0.124 s` while
+preserving Legend identity, children, selection, undo/redo, and subsequent
+Line2D dragging. The formal Fig2 remained byte-identical at SHA-256
+`b0cd72abf3962cd6cd2354467ad57aa37ecc213332645d7cb56e6f4af598ad70`.
 
 The Align panel now exposes explicit Selection, Key Object, and Artboard
 references. Selection alignment uses the union of visible bounds and a single
@@ -217,7 +250,7 @@ mutates. Alignment reference/key state is also part of interaction-state and
 geometry undo/redo restoration. The regression suite covers all six alignment
 directions, positive/zero/negative spacing with the key first/middle/last,
 mixed selection lifecycles, exact no-ops, UI control state, clip rejection, and
-undo/redo; the full suite passes 634 tests with 119 skips.
+undo/redo; the current full suite passes 693 tests with 147 skips.
 
 A read-only real-Fig2 fork probe covers all 19 represented categories. Eighteen
 align to key/artboard references with at most `1.14e-13` px error; AxesImage
@@ -232,8 +265,8 @@ Fig2 remains byte-identical at SHA-256
 
 Remaining feature work:
 
-- Common-pivot multi-object rotation and movable pivots for artist types with a
-  complete semantic geometry plan.
+- Freely movable/custom rotation pivots and broader safe coverage such as
+  rotationally symmetric Line2D markers.
 - Generic smart guides for edges, centers, baselines, anchors, and equal gaps.
 - Direct path/endpoint editing and inline text editing.
 - Content-following cached drag previews and spatial hit/snap indexes.
@@ -256,3 +289,10 @@ Fig2 fork validation remains the primary real-world fixture.  Formal
 experiments.  Automated probes should report results separately for object and
 direct selection modes and retain the existing drag, align, resize, reference
 transform, rotation-handle, aspect, undo, replay, and performance checks.
+The parent-project legacy `fig2_artist_contract_audit.py` currently enumerates
+native `_rotatable_value` and then invokes the direct-manipulation toolbar. That
+contract predates the separation between native angle properties,
+`native_rotation_handle_support()`, and `RIGID_ROTATE`; it must be migrated
+before its rotation section is reused. The rigid milestone was validated by a
+separate read-only in-memory fork probe, without changing the legacy script or
+formal validation JSON.

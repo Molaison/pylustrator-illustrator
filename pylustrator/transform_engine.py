@@ -10,6 +10,7 @@ from matplotlib.artist import Artist
 
 from .artist_adapters import (
     ArtistAdapter,
+    RigidRotationPlan,
     get_artist_adapter,
     suspend_change_recording,
 )
@@ -30,6 +31,7 @@ class TransformPreflightError(ValueError):
 class TransformPlan:
     intent: TransformIntent
     adapters: tuple[ArtistAdapter, ...]
+    rigid_rotation_plans: tuple[RigidRotationPlan, ...] = ()
 
     @classmethod
     def preflight(
@@ -37,24 +39,35 @@ class TransformPlan:
     ) -> "TransformPlan":
         adapters = tuple(get_artist_adapter(target) for target in targets)
         failures = []
+        rigid_rotation_plans = []
         for adapter in adapters:
             support = adapter.operation_support(intent.operation)
             if not support.supported:
                 failures.append((adapter.target, support))
                 continue
-            if intent.operation is TransformOperation.TRANSLATE:
-                try:
+            try:
+                if intent.operation is TransformOperation.TRANSLATE:
                     adapter.preflight_translation(intent.delta)
-                except (TypeError, ValueError) as error:
-                    failures.append(
-                        (
-                            adapter.target,
-                            OperationSupport.denied(intent.operation, str(error)),
+                elif intent.operation is TransformOperation.RESIZE_GEOMETRY:
+                    adapter.preflight_resize(
+                        np.asarray(intent.matrix, dtype=float)
+                    )
+                elif intent.operation is TransformOperation.RIGID_ROTATE:
+                    rigid_rotation_plans.append(
+                        adapter.plan_rigid_rotation(
+                            float(intent.angle_degrees), intent.pivot
                         )
                     )
+            except (TypeError, ValueError) as error:
+                failures.append(
+                    (
+                        adapter.target,
+                        OperationSupport.denied(intent.operation, str(error)),
+                    )
+                )
         if failures:
             raise TransformPreflightError(failures)
-        return cls(intent, adapters)
+        return cls(intent, adapters, tuple(rigid_rotation_plans))
 
     def preview_control_points(self) -> tuple[np.ndarray, ...]:
         operation = self.intent.operation
@@ -69,6 +82,10 @@ class TransformPlan:
             return tuple(
                 adapter.preview_resize_control_points(matrix)
                 for adapter in self.adapters
+            )
+        if operation is TransformOperation.RIGID_ROTATE:
+            return tuple(
+                plan.control_array() for plan in self.rigid_rotation_plans
             )
         return tuple(
             np.asarray(adapter.control_points(), dtype=float)
@@ -93,7 +110,7 @@ class TransformPlan:
             seen_trackers.add(id(tracker))
             tracker_states.append((tracker, capture()))
         try:
-            for adapter in self.adapters:
+            for index, adapter in enumerate(self.adapters):
                 if self.intent.operation is TransformOperation.TRANSLATE:
                     adapter.translate(self.intent.delta)
                 elif self.intent.operation is TransformOperation.RESIZE_GEOMETRY:
@@ -101,6 +118,10 @@ class TransformPlan:
                 elif self.intent.operation is TransformOperation.ROTATE:
                     adapter.set_rotation(
                         adapter.rotation() + float(self.intent.angle_degrees)
+                    )
+                elif self.intent.operation is TransformOperation.RIGID_ROTATE:
+                    adapter.apply_rigid_rotation_plan(
+                        self.rigid_rotation_plans[index]
                     )
                 else:
                     raise TransformPreflightError(

@@ -9,6 +9,7 @@ import matplotlib
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
+import matplotlib.patheffects as path_effects
 import numpy as np
 import pytest
 from matplotlib.artist import Artist
@@ -18,6 +19,7 @@ from matplotlib.legend import Legend
 from matplotlib.lines import Line2D
 from matplotlib.path import Path
 from matplotlib.patches import (
+    Circle,
     ConnectionPatch,
     Ellipse,
     FancyArrowPatch,
@@ -54,8 +56,14 @@ from pylustrator.artist_adapters import (
     TextAdapter,
     UnsupportedArtistError,
     WedgeAdapter,
+    active_layout_owner_for_artist,
     artist_adapter_registry,
+    container_owner_for_artist,
     get_artist_adapter,
+    iter_legend_children,
+    iter_legend_managed_artists,
+    layout_owner_for_text,
+    legend_owner_for_artist,
 )
 from pylustrator.editor_model import EditorGroup
 from pylustrator.commands import semantic_equal
@@ -101,7 +109,7 @@ class RecordingChangeTracker:
         self.changes, self.saved = dict(state[0]), bool(state[1])
 
 
-CapabilitiesTuple = tuple[bool, bool, bool, bool, bool, bool, bool]
+CapabilitiesTuple = tuple[bool, bool, bool, bool, bool, bool, bool, bool]
 Builder = Callable[[plt.Figure, plt.Axes], Artist]
 
 
@@ -293,146 +301,147 @@ def _poly_collection(_fig, ax):
 
 
 # Capability tuple order follows ArtistCapabilities field order:
-# select, translate, resize, snapshot, serialize, fixed_aspect, rotate.
+# select, translate, resize, snapshot, serialize, fixed_aspect, rotate,
+# rigid_rotate.
 ARTIST_CASES = (
     ArtistCase(
         "Artist fallback",
         Artist,
         ArtistAdapter,
-        (False, False, False, False, False, False, False),
+        (False, False, False, False, False, False, False, False),
         _fallback,
     ),
     ArtistCase(
         "EditorGroup",
         EditorGroup,
         EditorGroupAdapter,
-        (True, True, True, True, True, False, False),
+        (True, True, True, True, True, False, False, False),
         _editor_group,
     ),
     ArtistCase(
         "Axes",
         plt.Axes,
         AxesAdapter,
-        (True, True, True, True, True, False, False),
+        (True, True, True, True, True, False, False, False),
         _axes,
     ),
     ArtistCase(
         "Text",
         Text,
         TextAdapter,
-        (True, True, False, True, True, False, True),
+        (True, True, False, True, True, False, True, False),
         _text,
     ),
     ArtistCase(
         "Annotation",
         Annotation,
         AnnotationAdapter,
-        (True, True, False, True, True, False, True),
+        (True, True, False, True, True, False, True, False),
         _annotation,
     ),
     ArtistCase(
         "Legend",
         Legend,
         LegendAdapter,
-        (True, True, False, True, True, False, False),
+        (True, True, False, True, True, False, False, False),
         _legend,
     ),
     ArtistCase(
         "Line2D",
         Line2D,
         Line2DAdapter,
-        (True, True, False, True, True, False, False),
+        (True, True, False, True, True, False, False, True),
         _line,
     ),
     ArtistCase(
         "AxesImage",
         AxesImage,
         AxesImageAdapter,
-        (True, True, True, True, True, False, False),
+        (True, True, True, True, True, False, False, False),
         _image,
     ),
     ArtistCase(
         "Rectangle",
         Rectangle,
         RectangleAdapter,
-        (True, True, True, True, True, False, True),
+        (True, True, True, True, True, False, True, False),
         _rectangle,
     ),
     ArtistCase(
         "Ellipse",
         Ellipse,
         EllipseAdapter,
-        (True, True, True, True, True, False, True),
+        (True, True, True, True, True, False, True, False),
         _ellipse,
     ),
     ArtistCase(
         "FancyArrowPatch",
         FancyArrowPatch,
         FancyArrowPatchAdapter,
-        (True, True, False, True, True, False, False),
+        (True, True, False, True, True, False, False, False),
         _arrow,
     ),
     ArtistCase(
         "ConnectionPatch",
         ConnectionPatch,
         ConnectionPatchAdapter,
-        (False, False, False, False, False, False, False),
+        (False, False, False, False, False, False, False, False),
         _connection,
     ),
     ArtistCase(
         "FancyBboxPatch",
         FancyBboxPatch,
         FancyBboxPatchAdapter,
-        (True, True, False, True, True, False, False),
+        (True, True, False, True, True, False, False, False),
         _fancy_bbox,
     ),
     ArtistCase(
         "RegularPolygon",
         RegularPolygon,
         RegularPolygonAdapter,
-        (True, True, False, True, True, False, False),
+        (True, True, False, True, True, False, False, False),
         _regular_polygon,
     ),
     ArtistCase(
         "Wedge",
         Wedge,
         WedgeAdapter,
-        (True, True, False, True, True, False, False),
+        (True, True, False, True, True, False, False, False),
         _wedge,
     ),
     ArtistCase(
         "Polygon",
         Polygon,
         PolygonAdapter,
-        (True, True, True, True, True, False, False),
+        (True, True, True, True, True, False, False, True),
         _polygon,
     ),
     ArtistCase(
         "PathPatch",
         PathPatch,
         PathPatchAdapter,
-        (True, True, True, True, True, False, False),
+        (True, True, True, True, True, False, False, True),
         _path_patch,
     ),
     ArtistCase(
         "PathCollection",
         PathCollection,
         PathCollectionAdapter,
-        (True, True, False, True, True, False, False),
+        (True, True, False, True, True, False, False, False),
         _path_collection,
     ),
     ArtistCase(
         "LineCollection",
         LineCollection,
         LineCollectionAdapter,
-        (True, True, False, True, True, False, False),
+        (True, True, False, True, True, False, False, True),
         _line_collection,
     ),
     ArtistCase(
         "PolyCollection",
         PolyCollection,
         PolyCollectionAdapter,
-        (True, True, False, True, True, False, False),
+        (True, True, False, True, True, False, False, True),
         _poly_collection,
     ),
 )
@@ -476,6 +485,7 @@ def _capabilities_tuple(capabilities: ArtistCapabilities) -> CapabilitiesTuple:
         capabilities.can_serialize,
         capabilities.fixed_aspect,
         capabilities.can_rotate,
+        capabilities.can_rigid_rotate,
     )
 
 
@@ -529,6 +539,7 @@ OPERATION_CAPABILITY = {
     TransformOperation.TRANSLATE: "can_translate",
     TransformOperation.RESIZE_GEOMETRY: "can_resize",
     TransformOperation.ROTATE: "can_rotate",
+    TransformOperation.RIGID_ROTATE: "can_rigid_rotate",
     TransformOperation.SNAPSHOT: "can_snapshot",
     TransformOperation.SERIALIZE: "can_serialize",
 }
@@ -721,6 +732,767 @@ def test_native_rotation_undo_redo_restores_angle_and_bookkeeping(
     assert adapter.rotation() == pytest.approx(new_rotation)
     assert tracker.last_edit == 0
     assert tracker.capture_recording_state()[0] == recording_after[0]
+
+
+def test_rigid_rotation_plan_matches_display_geometry_for_supported_adapters(
+    artist_case,
+) -> None:
+    adapter = artist_case.adapter
+    if not adapter.capabilities.can_rigid_rotate:
+        pytest.skip("common-pivot rotation is explicitly unsupported")
+    controls_before = np.asarray(adapter.control_points(), dtype=float)
+    selection_before = _bounds(adapter.selection_points())
+    pivot = np.array(
+        [
+            (selection_before[0] + selection_before[2]) / 2,
+            (selection_before[1] + selection_before[3]) / 2,
+        ]
+    )
+    matrix = adapter.display_rotation_matrix(13.0, pivot)
+    axes_before = _axis_position(artist_case.axes)
+    plan = TransformPlan.preflight(
+        [artist_case.target],
+        TransformIntent.rigid_rotate(13.0, pivot),
+    )
+
+    preview = plan.preview_control_points()[0]
+    _assert_px_close(preview, _transform_points(matrix, controls_before))
+    plan.commit()
+    artist_case.figure.canvas.draw()
+
+    _assert_px_close(adapter.control_points(), preview)
+    _assert_px_close(
+        _bounds(adapter.selection_points()),
+        _bounds(plan.rigid_rotation_plans[0].selection_array()),
+    )
+    np.testing.assert_allclose(
+        _axis_position(artist_case.axes), axes_before, atol=0, rtol=0
+    )
+    assert len(artist_case.tracker.calls) == len(adapter.serialize_changes())
+
+
+def test_resize_preflight_rejects_rotation_and_shear_matrices(artist_case) -> None:
+    adapter = artist_case.adapter
+    if not adapter.capabilities.can_resize:
+        pytest.skip("resize is explicitly unsupported")
+    bounds = _bounds(adapter.selection_points())
+    pivot = np.array(
+        [(bounds[0] + bounds[2]) / 2, (bounds[1] + bounds[3]) / 2]
+    )
+    rotation = adapter.display_rotation_matrix(13.0, pivot)
+    shear = np.array(
+        [[1.0, 0.2, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    )
+
+    for matrix in (rotation, shear):
+        with pytest.raises(UnsupportedArtistError, match="axis-aligned"):
+            adapter.preflight_resize(matrix)
+
+
+def test_rigid_and_native_rotation_intents_remain_semantically_distinct() -> None:
+    native = TransformIntent.rotate(13.0)
+    rigid = TransformIntent.rigid_rotate(13.0, (41.0, 29.0))
+
+    assert native.operation is TransformOperation.ROTATE
+    assert native.pivot is None
+    assert rigid.operation is TransformOperation.RIGID_ROTATE
+    assert rigid.pivot == (41.0, 29.0)
+
+
+def test_anchor_mode_text_has_exact_common_pivot_rotation_plan() -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    tracker = RecordingChangeTracker()
+    fig.change_tracker = tracker
+    text = ax.text(
+        0.3,
+        0.6,
+        "anchor rotation",
+        transform=ax.transAxes,
+        rotation_mode="anchor",
+    )
+    fig.canvas.draw()
+    adapter = get_artist_adapter(text)
+    controls_before = np.asarray(adapter.control_points(), dtype=float)
+    bounds_before = _bounds(adapter.selection_points())
+    corners_before = np.array(
+        [
+            bounds_before[:2],
+            [bounds_before[0], bounds_before[3]],
+            bounds_before[2:],
+            [bounds_before[2], bounds_before[1]],
+        ]
+    )
+    pivot = controls_before[0] + np.array([47.0, -31.0])
+    matrix = adapter.display_rotation_matrix(13.0, pivot)
+
+    try:
+        assert adapter.capabilities.can_rigid_rotate
+        plan = adapter.plan_rigid_rotation(13.0, pivot)
+        adapter.apply_rigid_rotation_plan(plan)
+        fig.canvas.draw()
+
+        _assert_px_close(
+            adapter.control_points(),
+            _transform_points(matrix, controls_before),
+        )
+        _assert_px_close(
+            _bounds(adapter.selection_points()),
+            _bounds(_transform_points(matrix, corners_before)),
+        )
+        _assert_px_close(
+            _bounds(adapter.selection_points()),
+            _bounds(plan.selection_array()),
+        )
+        assert text.get_rotation() == pytest.approx(13.0)
+        assert len(tracker.calls) == 1
+    finally:
+        plt.close(fig)
+
+
+def test_wrapped_anchor_text_is_not_advertised_as_rigid_rotation() -> None:
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    tracker = RecordingChangeTracker()
+    fig.change_tracker = tracker
+    text = ax.text(
+        0.2,
+        0.6,
+        "a long wrapped sentence that would reflow after rotation",
+        rotation_mode="anchor",
+        wrap=True,
+    )
+    fig.canvas.draw()
+    adapter = get_artist_adapter(text)
+    before = adapter.snapshot()
+
+    try:
+        assert not adapter.capabilities.can_rigid_rotate
+        with pytest.raises(UnsupportedArtistError, match="common-pivot"):
+            adapter.plan_rigid_rotation(37.0, (200.0, 150.0))
+        assert semantic_equal(before, adapter.snapshot())
+        assert not tracker.calls
+    finally:
+        plt.close(fig)
+
+
+def test_legend_managed_rotation_leaves_reject_before_plan_or_recording() -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    tracker = RecordingChangeTracker()
+    fig.change_tracker = tracker
+    ax.plot([0.15, 0.45], [0.8, 0.65], label="plain line")
+    ax.bar([0.62], [0.28], width=0.14, label="bar patch")
+    ax.errorbar(
+        [0.25, 0.55],
+        [0.25, 0.42],
+        yerr=[0.08, 0.06],
+        fmt="-",
+        label="composite errorbar",
+    )
+    legend = ax.legend(title="Managed title")
+    for text in legend.findobj(Text):
+        text.set_rotation_mode("anchor")
+    fig.canvas.draw()
+
+    managed = iter_legend_managed_artists(legend)
+    direct = iter_legend_children(legend)
+    rigid_leaf_types = (
+        Text,
+        Line2D,
+        Rectangle,
+        Ellipse,
+        Polygon,
+        PathPatch,
+        LineCollection,
+        PolyCollection,
+    )
+    candidates = [target for target in managed if isinstance(target, rigid_leaf_types)]
+
+    try:
+        assert any(isinstance(target, Text) for target in candidates)
+        assert any(isinstance(target, Rectangle) for target in candidates)
+        assert any(isinstance(target, LineCollection) for target in candidates)
+        assert any(
+            isinstance(target, (Line2D, LineCollection))
+            and all(target is not child for child in direct)
+            for target in candidates
+        )
+
+        for target in candidates:
+            adapter = get_artist_adapter(target)
+            assert adapter.capabilities.can_snapshot
+            before = adapter.snapshot()
+            recording_before = tracker.capture_recording_state()
+
+            assert legend_owner_for_artist(target) is legend
+            assert not adapter.capabilities.can_rigid_rotate
+            if isinstance(target, (Text, Rectangle, Ellipse)):
+                assert not adapter.capabilities.can_rotate
+            support = adapter.operation_support(TransformOperation.RIGID_ROTATE)
+            assert not support.supported
+            assert "Legend layout" in support.reason
+            with pytest.raises(UnsupportedArtistError, match="Legend layout"):
+                adapter.plan_rigid_rotation(13.0, (220.0, 160.0))
+
+            assert semantic_equal(before, adapter.snapshot())
+            assert tracker.capture_recording_state() == recording_before
+    finally:
+        plt.close(fig)
+
+
+def test_legend_owner_inventory_tracks_replacement_retention_and_removal() -> None:
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    first = ax.legend(handles=[Rectangle((0, 0), 1, 1, label="first")])
+    first_child = first.legend_handles[0]
+    fig.canvas.draw()
+
+    try:
+        assert legend_owner_for_artist(first_child) is first
+        first.set_frame_on(not first.get_frame_on())
+        assert legend_owner_for_artist(first_child) is first
+
+        second = ax.legend(handles=[Line2D([], [], label="second")])
+        second_child = second.legend_handles[0]
+        fig.canvas.draw()
+        assert legend_owner_for_artist(first_child) is None
+        assert legend_owner_for_artist(second_child) is second
+
+        ax.add_artist(first)
+        fig.canvas.draw()
+        assert legend_owner_for_artist(first_child) is first
+        first.remove()
+        assert legend_owner_for_artist(first_child) is None
+        assert legend_owner_for_artist(second_child) is second
+    finally:
+        plt.close(fig)
+
+
+def test_layout_managed_text_rotation_rejects_but_ordinary_text_remains_rigid() -> None:
+    fig = plt.figure(figsize=(7, 4), dpi=100, layout="constrained")
+    tracker = RecordingChangeTracker()
+    fig.change_tracker = tracker
+    left, _right = fig.subfigures(1, 2)
+    ax = left.subplots()
+    ax.plot([1.0e6, 1.2e6], [2.0e6, 2.4e6])
+    center_title = ax.set_title("center")
+    left_title = ax.set_title("left", loc="left")
+    right_title = ax.set_title("right", loc="right")
+    xlabel = ax.set_xlabel("x label")
+    ylabel = ax.set_ylabel("y label")
+    ax.set_xticks([1.0e6, 1.2e6])
+    ax.set_xticks([1.1e6], minor=True)
+    ax.set_yticks([2.0e6, 2.4e6])
+    ax.set_yticks([2.2e6], minor=True)
+    figure_sup = (
+        fig.suptitle("figure title"),
+        fig.supxlabel("figure x"),
+        fig.supylabel("figure y"),
+    )
+    subfigure_sup = (
+        left.suptitle("subfigure title"),
+        left.supxlabel("subfigure x"),
+        left.supylabel("subfigure y"),
+    )
+    fig.canvas.draw()
+    managed = [
+        center_title,
+        left_title,
+        right_title,
+        xlabel,
+        ylabel,
+        ax.xaxis.get_major_ticks()[0].label1,
+        ax.xaxis.get_minor_ticks()[0].label1,
+        ax.yaxis.get_major_ticks()[0].label1,
+        ax.yaxis.get_minor_ticks()[0].label1,
+        ax.xaxis.get_offset_text(),
+        ax.yaxis.get_offset_text(),
+        *figure_sup,
+        *subfigure_sup,
+    ]
+    for text in managed:
+        text.set_rotation_mode("anchor")
+
+    ordinary = [
+        ax.text(
+            1.08e6,
+            2.25e6,
+            "axes text",
+            rotation_mode="anchor",
+            in_layout=False,
+        ),
+        fig.text(0.72, 0.78, "figure text", rotation_mode="anchor"),
+        left.text(0.7, 0.18, "subfigure text", rotation_mode="anchor"),
+    ]
+    fig.canvas.draw()
+
+    try:
+        for target in managed:
+            adapter = get_artist_adapter(target)
+            before = adapter.snapshot()
+            recording_before = tracker.capture_recording_state()
+
+            assert layout_owner_for_text(target) is not None
+            assert not adapter.capabilities.can_rotate
+            assert not adapter.capabilities.can_rigid_rotate
+            with pytest.raises(UnsupportedArtistError, match="managed by .* layout"):
+                adapter.plan_rigid_rotation(37.0, (250.0, 175.0))
+            with pytest.raises(UnsupportedArtistError):
+                adapter.set_rotation(adapter.rotation() + 37.0)
+
+            assert semantic_equal(before, adapter.snapshot())
+            assert tracker.capture_recording_state() == recording_before
+
+        for target in ordinary:
+            adapter = get_artist_adapter(target)
+            assert layout_owner_for_text(target) is None
+            assert legend_owner_for_artist(target) is None
+            assert adapter.capabilities.can_rigid_rotate
+            plan = adapter.plan_rigid_rotation(7.0, (250.0, 175.0))
+            assert plan.target is target
+    finally:
+        plt.close(fig)
+
+
+def test_active_layout_bbox_feedback_is_rejected_without_overblocking_collections() -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100, layout="constrained")
+    tracker = RecordingChangeTracker()
+    fig.change_tracker = tracker
+    text = ax.text(
+        1.05,
+        0.5,
+        "layout extra",
+        transform=ax.transAxes,
+        rotation_mode="anchor",
+        clip_on=False,
+    )
+    polygon = ax.add_patch(
+        Polygon(
+            [[1.05, 0.3], [1.2, 0.4], [1.1, 0.6]],
+            transform=ax.transAxes,
+            clip_on=False,
+        )
+    )
+    path_patch = ax.add_patch(
+        PathPatch(
+            Path([[1.05, 0.3], [1.2, 0.4], [1.1, 0.6]]),
+            transform=ax.transAxes,
+            clip_on=False,
+        )
+    )
+    line = Line2D(
+        [1.05, 1.2],
+        [0.3, 0.6],
+        transform=ax.transAxes,
+        clip_on=False,
+    )
+    ax.add_line(line)
+    line_collection = LineCollection(
+        [[[1.05, 0.3], [1.2, 0.6]]],
+        transform=ax.transAxes,
+        clip_on=False,
+    )
+    poly_collection = PolyCollection(
+        [[[1.05, 0.3], [1.2, 0.4], [1.1, 0.6]]],
+        transform=ax.transAxes,
+        clip_on=False,
+    )
+    ax.add_collection(line_collection)
+    ax.add_collection(poly_collection)
+    excluded_text = ax.text(
+        1.05,
+        0.75,
+        "excluded",
+        transform=ax.transAxes,
+        rotation_mode="anchor",
+        clip_on=False,
+        in_layout=False,
+    )
+    fig.canvas.draw()
+
+    try:
+        for target in (text, polygon, path_patch, line):
+            adapter = get_artist_adapter(target)
+            before = adapter.snapshot()
+            recording_before = tracker.capture_recording_state()
+
+            assert active_layout_owner_for_artist(target) is ax
+            assert not adapter.capabilities.can_rigid_rotate
+            with pytest.raises(UnsupportedArtistError, match="active Axes layout"):
+                adapter.plan_rigid_rotation(37.0, (250.0, 175.0))
+            assert semantic_equal(before, adapter.snapshot())
+            assert tracker.capture_recording_state() == recording_before
+
+        assert active_layout_owner_for_artist(excluded_text) is None
+        assert get_artist_adapter(excluded_text).capabilities.can_rigid_rotate
+        for target in (line_collection, poly_collection):
+            assert active_layout_owner_for_artist(target) is None
+            assert get_artist_adapter(target).capabilities.can_rigid_rotate
+    finally:
+        plt.close(fig)
+
+
+def test_container_background_rotation_rejects_without_blocking_user_patches() -> None:
+    fig = plt.figure(figsize=(4, 4), dpi=100)
+    tracker = RecordingChangeTracker()
+    fig.change_tracker = tracker
+    left, _right = fig.subfigures(1, 2)
+    ax = left.subplots()
+    fig.canvas.draw()
+    backgrounds = ((fig.patch, fig), (left.patch, left), (ax.patch, ax))
+
+    ordinary = []
+    for owner, xy in ((fig, (30.0, 40.0)), (left, (90.0, 60.0)), (ax, (150.0, 90.0))):
+        target = Rectangle(
+            xy,
+            28.0,
+            19.0,
+            transform=IdentityTransform(),
+            clip_on=False,
+        )
+        owner.add_artist(target)
+        ordinary.append(target)
+    fig.canvas.draw()
+
+    try:
+        for target, owner in backgrounds:
+            adapter = get_artist_adapter(target)
+            before = adapter.snapshot()
+            recording_before = tracker.capture_recording_state()
+
+            assert container_owner_for_artist(target) is owner
+            assert not adapter.capabilities.can_rotate
+            assert not adapter.capabilities.can_rigid_rotate
+            with pytest.raises(UnsupportedArtistError, match="background"):
+                adapter.plan_rigid_rotation(13.0, (200.0, 200.0))
+            with pytest.raises(UnsupportedArtistError):
+                adapter.set_rotation(adapter.rotation() + 13.0)
+
+            assert semantic_equal(before, adapter.snapshot())
+            assert tracker.capture_recording_state() == recording_before
+
+        for target in ordinary:
+            adapter = get_artist_adapter(target)
+            assert container_owner_for_artist(target) is None
+            assert adapter.capabilities.can_rotate
+            assert adapter.capabilities.can_rigid_rotate
+            assert adapter.plan_rigid_rotation(7.0, (200.0, 200.0)).target is target
+    finally:
+        plt.close(fig)
+
+
+def test_rigid_rotation_predicates_reject_lossy_artist_variants() -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    marker_line = ax.plot([0.2, 0.8], [0.3, 0.7], marker="s")[0]
+    step_line = ax.plot(
+        [0.2, 0.5, 0.8], [0.7, 0.2, 0.65], drawstyle="steps-mid"
+    )[0]
+    hatched = ax.add_patch(
+        Polygon(
+            [[0.25, 0.25], [0.45, 0.28], [0.35, 0.48]],
+            closed=True,
+            hatch="//",
+        )
+    )
+    offset_collection = PolyCollection(
+        [[[0.0, 0.0], [0.08, 0.0], [0.04, 0.08]]],
+        offsets=[[0.4, 0.4], [0.7, 0.65]],
+        transOffset=ax.transData,
+    )
+    ax.add_collection(offset_collection)
+    rectangle = ax.add_patch(Rectangle((0.55, 0.2), 0.18, 0.16))
+    effect_line = ax.plot([0.15, 0.35], [0.9, 0.78])[0]
+    effect_line.set_path_effects([path_effects.withStroke(linewidth=4)])
+    bbox_text = ax.text(
+        0.55,
+        0.88,
+        "bbox",
+        rotation_mode="anchor",
+        bbox={"facecolor": "white"},
+    )
+    transformed_text = ax.text(0.75, 0.82, "relative", rotation_mode="anchor")
+    transformed_text.set_transform_rotates_text(True)
+    log_ax = fig.add_axes((0.68, 0.56, 0.2, 0.2))
+    log_ax.set_xscale("log")
+    non_affine_line = log_ax.plot([0.2, 0.8], [0.25, 0.75])[0]
+    singular_line = Line2D([20.0, 40.0], [30.0, 60.0])
+    singular_line.set_transform(Affine2D().scale(0.0, 1.0))
+    fig.add_artist(singular_line)
+    filtered_polygon = ax.add_patch(
+        Polygon([[0.42, 0.45], [0.5, 0.47], [0.46, 0.56]], closed=True)
+    )
+
+    def offset_filter(image, _dpi):
+        return image, 20, 0
+
+    filtered_polygon.set_agg_filter(offset_filter)
+    filtered_text = ax.text(0.62, 0.48, "filtered", rotation_mode="anchor")
+    filtered_text.set_agg_filter(offset_filter)
+    fig.canvas.draw()
+
+    try:
+        for target in (
+            marker_line,
+            step_line,
+            hatched,
+            offset_collection,
+            rectangle,
+            effect_line,
+            bbox_text,
+            transformed_text,
+            non_affine_line,
+            singular_line,
+            filtered_polygon,
+            filtered_text,
+        ):
+            assert not get_artist_adapter(target).capabilities.can_rigid_rotate
+        filtered_text_adapter = get_artist_adapter(filtered_text)
+        assert not filtered_text_adapter.capabilities.can_rotate
+        assert not filtered_text_adapter.operation_support(
+            TransformOperation.ROTATE
+        ).supported
+    finally:
+        plt.close(fig)
+
+
+def test_explicit_rectangle_rotation_point_requires_a_richer_plan() -> None:
+    fig = plt.figure(figsize=(4, 3), dpi=100)
+    target = Rectangle(
+        (70.0, 80.0),
+        48.0,
+        31.0,
+        rotation_point=(75.0, 85.0),
+        transform=IdentityTransform(),
+    )
+    fig.add_artist(target)
+    fig.canvas.draw()
+
+    try:
+        assert not get_artist_adapter(target).capabilities.can_rigid_rotate
+    finally:
+        plt.close(fig)
+
+
+def test_rigid_rotation_rejects_numerically_unstable_native_round_trip() -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    tracker = RecordingChangeTracker()
+    fig.change_tracker = tracker
+    ax.set_xlim(1.0, 1.0 + 1.0e-14)
+    ax.set_ylim(0.0, 1.0)
+    target = ax.plot(
+        [1.0 + 2.0e-15, 1.0 + 8.0e-15],
+        [0.3, 0.7],
+    )[0]
+    fig.canvas.draw()
+    adapter = get_artist_adapter(target)
+    before = adapter.snapshot()
+    controls = np.asarray(adapter.control_points(), dtype=float)
+    pivot = np.mean(controls, axis=0)
+
+    try:
+        assert adapter.capabilities.can_rigid_rotate
+        with pytest.raises(UnsupportedArtistError, match="round-trip.*0.25 px"):
+            adapter.plan_rigid_rotation(37.0, pivot)
+        assert semantic_equal(before, adapter.snapshot())
+        assert not tracker.calls
+    finally:
+        plt.close(fig)
+
+
+@pytest.mark.parametrize(
+    "builder",
+    [
+        lambda: Rectangle((70.0, 80.0), 48.0, 31.0),
+        lambda: Ellipse((105.0, 95.0), 48.0, 31.0),
+    ],
+    ids=["Rectangle", "Ellipse"],
+)
+def test_native_angle_patch_rotates_rigidly_under_similarity_transform(builder) -> None:
+    fig = plt.figure(figsize=(4, 3), dpi=100)
+    tracker = RecordingChangeTracker()
+    fig.change_tracker = tracker
+    target = builder()
+    target.set_transform(IdentityTransform())
+    fig.add_artist(target)
+    fig.canvas.draw()
+    adapter = get_artist_adapter(target)
+    path_before = target.get_transform().transform_path(target.get_path()).vertices
+    pivot = np.array([190.0, 155.0])
+    matrix = adapter.display_rotation_matrix(29.0, pivot)
+
+    try:
+        assert adapter.capabilities.can_rigid_rotate
+        plan = adapter.plan_rigid_rotation(29.0, pivot)
+        adapter.apply_rigid_rotation_plan(plan)
+        fig.canvas.draw()
+        path_after = target.get_transform().transform_path(target.get_path()).vertices
+
+        _assert_px_close(path_after, _transform_points(matrix, path_before))
+        _assert_px_close(
+            _bounds(adapter.selection_points()),
+            _bounds(plan.selection_array()),
+        )
+        assert target.get_angle() == pytest.approx(29.0)
+    finally:
+        plt.close(fig)
+
+
+def test_partial_clip_rigid_rotation_is_rejected_before_mutation() -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    tracker = RecordingChangeTracker()
+    fig.change_tracker = tracker
+    target = ax.add_patch(
+        Polygon(
+            [[0.72, 0.68], [0.91, 0.7], [0.88, 0.9], [0.75, 0.86]],
+            closed=True,
+        )
+    )
+    fig.canvas.draw()
+    adapter = get_artist_adapter(target)
+    before = adapter.snapshot()
+    bounds = _bounds(adapter.selection_points())
+    pivot = bounds[2:] + np.array([41.0, 29.0])
+
+    try:
+        with pytest.raises(UnsupportedArtistError, match="partially clipped"):
+            adapter.plan_rigid_rotation(-37.0, pivot)
+        assert semantic_equal(before, adapter.snapshot())
+        assert not tracker.calls
+    finally:
+        plt.close(fig)
+
+
+def test_nonrectangular_clip_blocks_group_rigid_rotation_atomically() -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    tracker = RecordingChangeTracker()
+    fig.change_tracker = tracker
+    safe = ax.add_patch(
+        Polygon([[0.18, 0.22], [0.38, 0.25], [0.3, 0.44]], closed=True)
+    )
+    clipped = ax.add_patch(
+        Polygon([[0.55, 0.5], [0.8, 0.54], [0.68, 0.78]], closed=True)
+    )
+    clipped.set_clip_path(Circle((0.68, 0.62), 0.16, transform=ax.transData))
+    group = EditorGroup(
+        fig,
+        "qa-nonrect-rigid-group",
+        [safe, clipped],
+        name="Clipped rigid QA",
+        owner=ax,
+    )
+    fig.canvas.draw()
+    adapters = [get_artist_adapter(target) for target in (safe, clipped)]
+    before = [adapter.snapshot() for adapter in adapters]
+    recording_before = tracker.capture_recording_state()
+    bounds = _bounds(get_artist_adapter(group).selection_points())
+    pivot = np.array(
+        [(bounds[0] + bounds[2]) / 2, (bounds[1] + bounds[3]) / 2]
+    )
+
+    try:
+        assert all(adapter.capabilities.can_rigid_rotate for adapter in adapters)
+        with pytest.raises(TransformPreflightError, match="non-rectangular"):
+            TransformPlan.preflight(
+                [group], TransformIntent.rigid_rotate(17.0, pivot)
+            )
+        assert all(
+            semantic_equal(state, adapter.snapshot())
+            for state, adapter in zip(before, adapters)
+        )
+        assert tracker.capture_recording_state() == recording_before
+    finally:
+        plt.close(fig)
+
+
+def test_editor_group_rigid_rotation_recurses_through_one_transaction_owner() -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    tracker = RecordingChangeTracker()
+    fig.change_tracker = tracker
+    members = [
+        ax.add_patch(
+            Polygon([[0.25, 0.3], [0.37, 0.32], [0.3, 0.44]], closed=True)
+        ),
+        ax.add_patch(
+            Polygon([[0.56, 0.5], [0.7, 0.54], [0.62, 0.68]], closed=True)
+        ),
+    ]
+    group = EditorGroup(fig, "qa-rigid-group", members, name="Rigid QA", owner=ax)
+    adapter = get_artist_adapter(group)
+    before = [
+        np.asarray(get_artist_adapter(member).control_points(), dtype=float)
+        for member in members
+    ]
+    bounds = _bounds(adapter.selection_points())
+    pivot = np.array(
+        [(bounds[0] + bounds[2]) / 2, (bounds[1] + bounds[3]) / 2]
+    )
+    matrix = adapter.display_rotation_matrix(-23.0, pivot)
+
+    try:
+        assert adapter.capabilities.can_rigid_rotate
+        plan = adapter.plan_rigid_rotation(-23.0, pivot)
+        adapter.apply_rigid_rotation_plan(plan)
+        fig.canvas.draw()
+
+        for member, original in zip(members, before):
+            _assert_px_close(
+                get_artist_adapter(member).control_points(),
+                _transform_points(matrix, original),
+            )
+        assert len(tracker.calls) == sum(
+            len(get_artist_adapter(member).serialize_changes())
+            for member in members
+        )
+    finally:
+        plt.close(fig)
+
+
+def test_direct_editor_group_rigid_failure_rolls_back_members_and_records() -> None:
+    class FailingGroupPolygon(Polygon):
+        fail_rotation = False
+
+        def set_xy(self, xy):
+            if self.fail_rotation:
+                raise RuntimeError("QA planned group rigid failure")
+            return super().set_xy(xy)
+
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    tracker = RecordingChangeTracker()
+    fig.change_tracker = tracker
+    first = ax.add_patch(
+        Polygon([[0.2, 0.24], [0.4, 0.27], [0.31, 0.47]], closed=True)
+    )
+    second = ax.add_patch(
+        FailingGroupPolygon(
+            [[0.58, 0.5], [0.78, 0.54], [0.67, 0.76]], closed=True
+        )
+    )
+    group = EditorGroup(
+        fig,
+        "qa-direct-rigid-rollback",
+        [first, second],
+        name="Rigid rollback QA",
+        owner=ax,
+    )
+    fig.canvas.draw()
+    adapter = get_artist_adapter(group)
+    members = [get_artist_adapter(target) for target in (first, second)]
+    before = [member.snapshot() for member in members]
+    recording_before = tracker.capture_recording_state()
+    bounds = _bounds(adapter.selection_points())
+    pivot = np.array(
+        [(bounds[0] + bounds[2]) / 2, (bounds[1] + bounds[3]) / 2]
+    )
+    plan = adapter.plan_rigid_rotation(19.0, pivot)
+    second.fail_rotation = True
+
+    try:
+        with pytest.raises(RuntimeError, match="group rigid failure"):
+            adapter.apply_rigid_rotation_plan(plan)
+        assert all(
+            semantic_equal(state, member.snapshot())
+            for state, member in zip(before, members)
+        )
+        assert tracker.capture_recording_state() == recording_before
+    finally:
+        plt.close(fig)
 
 
 def test_snapshot_restore_round_trip_and_generated_change_replay(
@@ -2462,6 +3234,59 @@ def test_failed_multi_artist_rotation_rolls_back_native_angles() -> None:
             plan.commit()
         assert first.get_angle() == pytest.approx(0.0)
         assert second.get_angle() == pytest.approx(0.0)
+    finally:
+        plt.close(fig)
+
+
+def test_failed_rigid_rotation_rolls_back_geometry_and_recording() -> None:
+    class FailingRigidPolygon(Polygon):
+        fail_rotation = False
+
+        def set_xy(self, xy):
+            if self.fail_rotation:
+                raise RuntimeError("QA planned rigid rotation failure")
+            return super().set_xy(xy)
+
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    tracker = RecordingChangeTracker()
+    fig.change_tracker = tracker
+    first = ax.add_patch(
+        Polygon([[0.2, 0.25], [0.38, 0.27], [0.3, 0.48]], closed=True)
+    )
+    second = ax.add_patch(
+        FailingRigidPolygon(
+            [[0.58, 0.5], [0.78, 0.54], [0.68, 0.75]], closed=True
+        )
+    )
+    fig.canvas.draw()
+    adapters = [get_artist_adapter(target) for target in (first, second)]
+    before = [adapter.snapshot() for adapter in adapters]
+    bounds = np.array(
+        [
+            _bounds(adapters[0].selection_points()),
+            _bounds(adapters[1].selection_points()),
+        ]
+    )
+    pivot = np.array(
+        [
+            (np.min(bounds[:, 0]) + np.max(bounds[:, 2])) / 2,
+            (np.min(bounds[:, 1]) + np.max(bounds[:, 3])) / 2,
+        ]
+    )
+    plan = TransformPlan.preflight(
+        [first, second], TransformIntent.rigid_rotate(17.0, pivot)
+    )
+    recording_before = tracker.capture_recording_state()
+    second.fail_rotation = True
+
+    try:
+        with pytest.raises(RuntimeError, match="QA planned rigid rotation failure"):
+            plan.commit()
+        assert all(
+            semantic_equal(state, adapter.snapshot())
+            for state, adapter in zip(before, adapters)
+        )
+        assert tracker.capture_recording_state() == recording_before
     finally:
         plt.close(fig)
 

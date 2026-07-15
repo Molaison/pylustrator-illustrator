@@ -22,10 +22,11 @@ Advertised operations are abbreviated as:
 - `M`: display-space translate
 - `Z`: geometry resize
 - `R`: native rotation
+- `Q`: rigid display-space rotation around a shared reference pivot
 - `N`: snapshot/restore
 - `C`: serialize to generated changes
 
-Every row was also tested against all nine `TransformOperation` values.
+Every row was also tested against all ten `TransformOperation` values.
 Unsupported operations must return `OperationSupport.supported == False` with
 a nonempty reason.  Direct translate, resize, rotate, and snapshot entrypoints
 must reject without geometry or generated-change mutation.  `scale_appearance`,
@@ -36,30 +37,41 @@ adapter.
 contract. `DENIED` means the absence of edit support is deliberate and the
 denial contract passes.
 
+`R` is deliberately a native property contract, not by itself permission to
+show a direct-manipulation handle. The handle/toolbar additionally requires
+`native_rotation_handle_support()`: complete visible geometry must rotate
+rigidly around the displayed pivot. Default-mode Text, Annotation arrows,
+anisotropic or reflected Patch transforms, hatch, path effects, Agg filters,
+and layout-owned targets do not expose a misleading object-rotation control.
+Default-mode Text through path-effect cases may retain saveable native angle
+properties for explicit property editing; Agg-filter/layout-owned cases deny
+rotation entirely.
+Anchor-mode Text and ordinary similarity Patches use Q preferentially.
+
 ## Per-type matrix
 
 | Registered Artist | Adapter | Advertised | Actually tested | Result | Gap or explicit limitation |
 |---|---|---:|---|---|---|
 | `Artist` fallback | `ArtistAdapter` | none | Registry resolution; all operation descriptors; direct M/display-transform/Z/R/N rejection and zero mutation | **PASS** | Deliberately uneditable. Semantic entrypoints reject through `UnsupportedArtistError` before geometry arithmetic. |
-| `EditorGroup` | `EditorGroupAdapter` | S M Z N C | Bounds; M/Z preview and commit; per-leaf fixed-stroke resize; N; replay; failing-member rollback; single-emission recording | **PASS** | R is explicitly denied because member positions would also need pivot rotation. |
+| `EditorGroup` | `EditorGroupAdapter` | S M Z Q N C | Bounds; M/Z/Q preview and commit; recursive shared-pivot plan; per-leaf fixed-stroke resize; N; replay; direct and outer-plan failing-member rollback; single-emission recording | **PASS** | Native R is denied; Q is advertised only when every leaf has a complete rigid plan. |
 | `Axes` | `AxesAdapter` | S M Z N C | Bounds; M/Z; parent Figure size; N; real replay; nonuniform fixed-aspect preview/commit | **PASS** | R is explicitly unsupported. Fixed-aspect Axes advertise the `fixed_aspect` constraint and normalize preview/commit through the same native-space rule. |
-| `Text` | `TextAdapter` | S M R N C | Axes/data/figure/display transforms; visible text bounds; M; native R; complete N; real replay; explicit Undo/Redo bookkeeping | **PASS** | Geometry resize is correctly denied in favor of future appearance scaling. |
+| `Text` | `TextAdapter` | S M R Q N C conditionally | Axes/data/figure/display transforms; visible text bounds; M; native R; anchor-mode Q; complete N; real replay; explicit Undo/Redo bookkeeping | **PASS** | Q requires `rotation_mode='anchor'`, an invertible affine position transform, and no wrap/bbox/path effect/transform-relative angle. Legend and layout-owned Text deny R/Q because Matplotlib rewrites their position. Geometry resize remains denied. |
 | `Annotation` | `AnnotationAdapter` | S M R N C | Mixed data/axes endpoint coordinates; text and arrow-stroke bounds; two control points; M; R; complete N; real replay | **PASS** | Geometry resize is explicitly denied. |
 | `Legend` | `LegendAdapter` | S M N C | Visible handles/text/title union; `frameon=False/True`; M; logical-owner persistence; self-contained single-glyph proxy replay; N; real replay | **PASS** | Geometry resize and layout reflow are explicitly denied. Explicit composite handlers without a frozen entry specification remain selectable but dynamically deny transform/replay. |
-| `Line2D` | `Line2DAdapter` | S M N C | Data/log transforms; visible line, marker-path, and marker-edge bounds; M; N; real `.set_data` replay | **PASS** | Geometry resize is explicitly denied pending affine preflight. |
+| `Line2D` | `Line2DAdapter` | S M Q N C conditionally | Data/log transforms; visible line, marker-path, and marker-edge bounds; M; affine shared-pivot Q; N; real `.set_data` replay | **PASS** | Q requires default drawstyle, no marker/path effect, an invertible affine transform, and no Legend layout owner. Geometry resize remains denied. |
 | `AxesImage` | `AxesImageAdapter` | S M Z N C | M/Z preview/commit; extent replay; N; x/y viewport and Axes position invariance | **PASS** | R is explicitly unsupported. Moving or resizing the image does not autoscale the camera. |
-| `Rectangle` | `RectangleAdapter` | S M Z R N C | Visible-stroke bounds; fixed-stroke M/Z; R; rotated M; rotated-resize denial; N; replay | **PASS** | Z is only advertised at angles equivalent to 0 degrees modulo 360; a default `xy`-anchored 180-degree Rectangle is not equivalent and is denied. |
-| `Ellipse` | `EllipseAdapter` | S M Z R N C | Visible-stroke bounds; fixed-stroke M/Z; R; rotated M; rotated-resize denial; N; replay | **PASS** | Z is disabled for rotated ellipses. |
+| `Rectangle` | `RectangleAdapter` | S M Z R Q N C conditionally | Visible-stroke bounds; fixed-stroke M/Z; native R; common-pivot Q under similarity/reflection transforms; rotated M; rotated-resize denial; N; replay | **PASS** | Q additionally requires `rotation_point` `xy`/`center`, no hatch/effect, and no Legend/container owner. Tuple pivots need a richer plan. Z is only advertised at angles equivalent to 0 degrees modulo 360. |
+| `Ellipse` | `EllipseAdapter` | S M Z R Q N C conditionally | Visible-stroke bounds; fixed-stroke M/Z; native R; common-pivot Q under similarity/reflection transforms; rotated M; rotated-resize denial; N; replay | **PASS** | Q denies non-similarity transforms, hatch/effects, and Legend/container owners. Z is disabled for rotated ellipses. |
 | `FancyArrowPatch` | `FancyArrowPatchAdapter` | S M N C | Visible-stroke bounds; endpoint M; rendered preview/commit; N; real `.set_positions` replay | **PASS** | Z/R are explicitly denied. |
 | `ConnectionPatch` | `ConnectionPatchAdapter` | none | Specific MRO resolution; all operation descriptors; direct M/Z/R/N rejection and zero mutation | **DENIED** | Deliberately blocked because its endpoints can occupy unrelated coordinate systems. |
 | `FancyBboxPatch` | `FancyBboxPatchAdapter` | S M N C when affine | Visible-stroke bounds; affine M/N/replay; non-affine denial and zero mutation | **PASS** | Geometry resize is unsupported. A non-affine data transform disables the editable contract. |
 | `RegularPolygon` | `RegularPolygonAdapter` | S M N C | Visible-stroke bounds; center M; preview/commit; N; `.xy` replay | **PASS** | Z is denied until it changes semantic radius rather than stretching its center point. |
 | `Wedge` | `WedgeAdapter` | S M N C | Visible-stroke bounds; center M; preview/commit; N; `.set_center` replay | **PASS** | Z/R are explicitly unsupported. |
-| `Polygon` | `PolygonAdapter` | S M Z N C | Visible-stroke bounds; fixed-stroke vertex M/Z; preview/commit; N; `.set_xy` replay | **PASS** | R is explicitly unsupported. |
-| `PathPatch` | `PathPatchAdapter` | S M Z N C | Visible-stroke bounds; fixed-stroke path/codes M/Z; preview/commit; N; `Path` replay | **PASS** | R is explicitly unsupported. |
+| `Polygon` | `PolygonAdapter` | S M Z Q N C conditionally | Visible-stroke bounds; fixed-stroke vertex M/Z; affine vertex Q; preview/commit; N; `.set_xy` replay | **PASS** | Native R is unsupported; Q requires invertible affine geometry with no hatch/effect or Legend owner. |
+| `PathPatch` | `PathPatchAdapter` | S M Z Q N C conditionally | Visible-stroke bounds; fixed-stroke path/codes M/Z; affine control-path Q; preview/commit; N; `Path` replay | **PASS** | Native R is unsupported; Q requires invertible affine geometry with no hatch/effect or Legend owner. |
 | `PathCollection` | `PathCollectionAdapter` | S M N C | Renderer item-count semantics; per-item marker-path/size/stroke envelopes; masked offsets; affine/log offset M; empty-path and singular-transform preflight; N; `.set_offsets` replay | **PASS** | Z and appearance scaling are explicitly denied. A singular offset transform remains selectable/serializable but cannot be moved or snapshotted. |
-| `LineCollection` | `LineCollectionAdapter` | S M N C | Per-segment linewidth envelopes; NaN path-break preservation; affine/log multi-segment and explicit-offset M; empty-offset path M; N; path/offset replay | **PASS** | Z and appearance scaling are denied. Nonempty offsets translate without rewriting paths; an empty offset array edits base paths at the renderer's zero offset. |
-| `PolyCollection` | `PolyCollectionAdapter` | S M N C | Per-polygon visible-edge envelopes; affine/log multi-path and explicit-offset M; empty-offset path M; N; path/offset replay | **PASS** | Invisible edges add no padding. Z and appearance scaling are denied. |
+| `LineCollection` | `LineCollectionAdapter` | S M Q N C conditionally | Per-segment linewidth envelopes; NaN path-break preservation; affine/log multi-segment and explicit-offset M; non-offset affine Q; N; path/offset replay | **PASS** | Q denies rendered offsets, non-affine/singular transforms, hatch/effects, and Legend owners. Z and appearance scaling remain denied. |
+| `PolyCollection` | `PolyCollectionAdapter` | S M Q N C conditionally | Per-polygon visible-edge envelopes; affine/log multi-path and explicit-offset M; non-offset affine Q; N; path/offset replay | **PASS** | Q has the same strict non-offset/affine/no-effect/no-owner contract. Invisible edges add no padding; Z and appearance scaling remain denied. |
 
 Patch adapters share one common-stroke envelope implementation. Resizable
 patches additionally separate transformable geometry from fixed display-space
@@ -80,8 +92,11 @@ The following behavior passes for every type that advertises it:
   PathPatch. Thick patch strokes remain fixed in display pixels; both direct
   resize and deferred drag land on the preview box.
 - Native rotation renders and records correctly for Text, Annotation,
-  Rectangle, and Ellipse. Explicit old/new-value Undo/Redo restores the angle
-  and generated-change dictionary.
+  Rectangle, and Ellipse. Rigid rotation uses an absolute destination plan for
+  every supported leaf, so a mixed Text/Line2D/Patch/Collection selection
+  shares one 3x3 reference pivot instead of rotating each object in place.
+  Handle preview, toolbar commit, generated changes, and Undo/Redo consume the
+  same plan.
 - Snapshots restore before/after geometry and native rotation. Failed
   multi-target transforms restore both artist state and generated-change
   bookkeeping atomically.
@@ -100,11 +115,76 @@ The following behavior passes for every type that advertises it:
   artwork. Nested Legend and EditorGroup measurements reuse one immutable
   geometry value per Artist and selection action.
 
-Rotation has a `native_rotation` preview strategy, not a detached control-point
-preview. The native render, selection overlay, snapshot, rollback, and explicit
-Undo/Redo paths are consistent.
+Native R retains the `native_rotation` preview strategy. Q has a distinct
+`rigid_rotation` strategy and an immutable `RigidRotationPlan` containing the
+absolute display controls, visible selection envelope, native angle destination
+where needed, and recursive group member plans. Resize rejects off-diagonal
+rotation/shear matrices so callers cannot bypass these semantic contracts.
 
 ## P0 findings fixed after the independent audit
+
+### Common-pivot rotation is now a first-class semantic operation
+
+`RIGID_ROTATE` is intentionally separate from native angle editing. Its plan
+rotates complete display geometry around the active 3x3 point on the selected
+bounds and stores absolute destinations. A single geometry-backed Artist uses
+the same Q path as a mixed selection; only a single object without a complete Q
+plan may fall back to a separately verified stable-visual native R contract.
+Multi-selection never silently applies equal local angle deltas.
+
+The initial permissive prototype exposed why type checks alone are not enough.
+Resize accepted off-diagonal matrices and reported success for objects whose
+rendered geometry missed by 16--69 px. Partial/non-rectangular clips produced
+errors as large as 148 px, wrapped Text reflowed by about 75 px, and explicit
+tuple Rectangle pivots missed by up to about 92 px. Q therefore uses a strict
+v1 whitelist and typed preflight rejection:
+
+- geometry-backed Polygon/PathPatch/Line2D/LineCollection/PolyCollection must
+  have writable, invertible affine controls and no unsupported appearance or
+  rendered-offset semantics; arbitrary Agg filters reject because their pixel
+  offsets are not guaranteed to rotate with geometry;
+- Text must use stable anchor rotation without wrap, bbox, path effect,
+  transform-relative angle, Annotation semantics, or a Matplotlib layout owner;
+- Rectangle/Ellipse require a display-similarity transform; Rectangle also
+  requires the native `xy` or `center` rotation point;
+- rectangular clipping requires both source and destination envelopes to be
+  fully contained; partial and non-rectangular clips reject before mutation;
+- EditorGroup recursively requires every leaf and is its one recording owner.
+
+Every planned display destination is converted to native coordinates and back
+before mutation. Non-finite structure must be preserved and the maximum
+round-trip error must be at most 0.25 px; the plan stores that representable
+native destination and applies it directly. This rejects numerically singular
+coordinate systems by measured error rather than a fragile global condition-
+number cutoff.
+
+Semantic ownership is checked independently from geometric representability.
+Every recursive Legend descendant—including nested errorbar, stem, and tuple
+handler glyphs—denies independent R/Q even when its raw Line2D/Rectangle/
+Collection geometry could rotate exactly. Axes titles, tick labels, offset
+text, axis labels, Figure/SubFigure super labels, and Figure/SubFigure/Axes
+background patches likewise deny rotation because their owner can rewrite the
+position or lacks an independent replay identity. Ordinary `ax.text`,
+`fig.text`, `subfig.text`, and user-created patches remain supported. A
+Figure-level structural owner inventory makes these checks O(1) within a
+selection snapshot and invalidates on Legend replacement, retention, removal,
+or packer reconstruction.
+
+An active constrained/tight layout introduces a second ownership channel. An
+otherwise ordinary Axes child that is visible, `in_layout=True`, and contributes
+a finite default bbox-extra can move the Axes during draw after it rotates.
+Such Text/Line/Patch targets conservatively deny R/Q in v1; setting
+`in_layout=False` makes the independent-object intent explicit. Collections
+whose tight bbox is Matplotlib's null box are not overblocked. This closes
+observed 10--49 px feedback errors while leaving Figure/SubFigure free text and
+ordinary no-layout figures available.
+
+Both TransformPlan and direct EditorGroup apply paths roll back geometry and
+recording state if a later target/member or serializer fails. A 360-degree
+toolbar request is a semantic no-op. Escape during either native or rigid
+handle preview restores the pre-gesture transaction and preserves selection;
+a second Escape performs the ordinary deselection/isolation action, so an
+unrecorded preview can never survive as a ghost mutation.
 
 ### Rotation is now part of adapter snapshots
 
@@ -252,7 +332,11 @@ Explicitly unsupported and tested:
 - Line2D resize without affine preflight;
 - FancyArrowPatch, FancyBboxPatch, RegularPolygon, and Wedge resize;
 - resize and appearance scaling for all three collection adapters;
-- rotation for every type without a native, saveable angle property;
+- native rotation for every type without a saveable angle property;
+- rigid rotation for Axes, AxesImage, Legend, Annotation, ConnectionPatch,
+  FancyArrowPatch/FancyBboxPatch, PathCollection, RegularPolygon, Wedge,
+  owner-managed leaves, rendered-offset collections, and lossy transform/
+  appearance variants of otherwise supported types;
 - point editing, appearance scaling, and layout reflow wherever no executor
   exists.
 
@@ -260,8 +344,10 @@ Fixture/test limitations, not confirmed implementation defects:
 
 - This is a headless adapter/renderer audit. It does not synthesize every Qt
   mouse-hit path or replace manual Fig2 testing.
-- Rotation uses the advertised native-preview strategy; there is no separate
-  off-object rotation preview surface to compare.
+- Native R and rigid Q have separate preview strategies. The audit covers the
+  off-object handle, toolbar actions, Shift snapping, Escape cancellation, and
+  mixed-type shared-pivot transactions; freely draggable custom pivots remain
+  future work.
 - Arbitrary third-party Matplotlib subclasses are outside the built-in matrix;
   one temporary custom adapter is used only to inject an atomic group failure.
 - Exotic custom transforms beyond data, axes, figure, display identity, mixed
@@ -285,8 +371,8 @@ QT_QPA_PLATFORM=offscreen uv run pytest tests -q
 uv run ruff check .
 ```
 
-After the final independent follow-up, the dedicated contract file reports 416 passed,
-119 explicitly skipped branches, and no xfails. The skips are branch
+After the rigid-rotation follow-up, the dedicated contract file reports 466
+passed, 147 explicitly skipped branches, and no xfails. The skips are branch
 accounting, not missing Artist types: supported-operation tests skip denied
 types, while rejection tests skip supported types. Registry equality guarantees
 that all 20 built-in registrations are present in the matrix.
@@ -298,6 +384,47 @@ A second audit on the long-term refactor worktree builds the disposable fork thr
 `editable/fig2.py` remained byte-identical before and after the audit at
 SHA-256
 `b0cd72abf3962cd6cd2354467ad57aa37ecc213332645d7cb56e6f4af598ad70`.
+
+### Rigid-rotation milestone audit
+
+The current read-only fork enumerates 483 selectable instances, 13 concrete
+types, 12 adapters, and 19 semantic categories. It evaluates 4,830 operation
+descriptors with zero capability-honesty failures. There are 227 Q-supported
+instances across FillBetweenPolyCollection, Line2D, LineCollection, and
+PathPatch. Four angles (`13`, `-37`, `90`, `360`) and center/external pivots
+produce 1,816 plans: 1,702 accepted destinations and 114 typed destination
+rejections, with no unexpected result and maximum accepted round-trip error
+`4.55e-13 px`.
+
+Line2D, LineCollection, and PathPatch pass real nonzero single-handle commit,
+Undo/Redo, snapshot, generated replay, and mixed shared-pivot workflows. The
+successful panel-B three-type transaction has zero commit/indicator/replay
+error, at most `2.27e-13 px` Undo/Redo error, three generated commands, and one
+undo item. A panel-H mixture containing a clip-limited FillBetween rejects
+atomically. Both real FillBetween instances are Q-capable in principle but
+their source/destinations are partially clipped: only 360-degree no-ops accept,
+while every nonzero probe rejects without mutation.
+
+All 115 Legend/layout/container-owned instances reject independently rotating
+their leaves with zero mutation, record, or edit. Panel-D Legend drag and key
+alignment remain within `2.27e-13 px`; its selection indicator error is zero.
+The real property widget toggles `frameon` in about `0.124 s`, preserving
+Legend identity, children, selection, Undo/Redo, and subsequent child dragging.
+The reported freeze was not reproduced. The formal file hash above is unchanged.
+
+The independent synthetic companion covers ten positive Artist variants at
+four angles and two pivots (80 cases), including reflected similarity,
+existing angles, negative sizes, NaN path breaks, mixed/nested groups,
+failure injection, cancellation, and replay. Maximum geometry error is
+`5.68e-14 px`, selection error is zero, and 360 degrees emits no mutation or
+record.
+
+The parent-project `fig2_artist_contract_audit.py` rotation section is now a
+stale probe contract: it enumerates native `_rotatable_value` and then invokes
+the direct-manipulation action, which correctly rejects visually incomplete
+Annotation rotation. The Q audit above uses `OperationSupport(RIGID_ROTATE)`
+and `native_rotation_handle_support()` directly; neither the legacy script nor
+formal validation JSON was modified during this milestone.
 
 The real figure contains 483 selectable and serializable instances, resolving
 13 concrete Matplotlib types through 12 adapters:
@@ -322,7 +449,8 @@ EditorGroup, Ellipse, FancyArrowPatch, ConnectionPatch, FancyBboxPatch, Wedge,
 Polygon, and the fallback Artist adapter have no selectable instance in this
 specific figure. They remain covered by the synthetic 20-type matrix.
 
-All 483 Fig2 instances advertise and pass finite selection bounds, translate,
+The earlier native-operation audit found that all 483 Fig2 instances advertise
+and pass finite selection bounds, translate,
 snapshot construction, and nonempty serialization records. Of these, 102
 advertise resize and 172 advertise rotation. The audit executes 6,279
 instance-level checks: 4,347 `OperationSupport` checks plus 1,932 selection,
@@ -388,18 +516,11 @@ The visible-bounds follow-up repeats the same 6,279 exhaustive checks and 70
 representative workflows in
 `artifacts/adapter_p1_visible_bounds_contract.json`: all 483/483 references
 resolve, all operations/replays pass, and the formal Fig2 hash is unchanged.
-The final full headless suite reports 568 passed, 119 explicit
+The current full headless suite reports 693 passed, 147 explicit
 capability-branch skips, no xfails, four pre-existing log-limit warnings, and
 two expected masked-array conversion warnings. Ruff passes.
 
-Run the real audit from `Figures_source`:
-
-```bash
-QT_QPA_PLATFORM=offscreen \
-PYTHONPATH=figure_workflow/vendor/pylustrator-artist-adapters \
-uv run python \
-  figure_workflow/validation/fig2_pylustrator_ab/fig2_artist_contract_audit.py \
-  --commit "$(git -C figure_workflow/vendor/pylustrator-artist-adapters rev-parse --short HEAD)" \
-  --output \
-  figure_workflow/validation/fig2_pylustrator_ab/artifacts/adapter_p1_visible_bounds_contract.json
-```
+Do not reuse the parent-project legacy audit's rotation section until it is
+migrated to the Q/native-handle split described above. The package-level
+reproduction commands remain authoritative for this commit; the real Q probe
+must continue to run against an in-memory Fig2 fork and a disposable output.

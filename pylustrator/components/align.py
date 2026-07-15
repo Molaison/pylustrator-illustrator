@@ -66,6 +66,7 @@ class Align(QtWidgets.QWidget):
         }
         columns = 4
         self.buttons = []
+        self.buttons_by_action = {}
         align_group = QtWidgets.QButtonGroup(self)
         for index, act in enumerate(actions):
             icon_name = icons[index]
@@ -86,6 +87,7 @@ class Align(QtWidgets.QWidget):
             self.layout_main.addWidget(button, index // columns, index % columns)
             button.clicked.connect(lambda x, act=act: self.execute_action(act))
             self.buttons.append(button)
+            self.buttons_by_action[act] = button
             align_group.addButton(button)
 
         self.reference_combo = QtWidgets.QComboBox(self)
@@ -131,8 +133,15 @@ class Align(QtWidgets.QWidget):
             self.reference_combo.setEnabled(False)
             self.spacing_enabled.setEnabled(False)
             self.spacing_input.setEnabled(False)
+            self.buttons_by_action["rotate_left"].setEnabled(False)
+            self.buttons_by_action["rotate_right"].setEnabled(False)
             return
         self.reference_combo.setEnabled(True)
+        rotation_enabled = bool(
+            getattr(selection, "rotation_handle_supported", lambda: False)()
+        )
+        self.buttons_by_action["rotate_left"].setEnabled(rotation_enabled)
+        self.buttons_by_action["rotate_right"].setEnabled(rotation_enabled)
         mode = getattr(selection, "alignment_reference_mode", "selection")
         index = self.reference_combo.findData(mode)
         self._updating_reference = True

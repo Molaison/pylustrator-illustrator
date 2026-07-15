@@ -14,9 +14,10 @@ order of ``isinstance`` branches.
 
 from __future__ import annotations
 
+from copy import copy
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from threading import RLock
 from typing import Iterable, Optional, Sequence
 
@@ -66,7 +67,9 @@ _CHANGE_RECORDING_ENABLED = ContextVar(
 _SELECTION_GEOMETRY_CACHE = ContextVar(
     "pylustrator_selection_geometry_cache", default=None
 )
-_LEGEND_OWNER_UNKNOWN = object()
+_LEGEND_OWNER_INVENTORY_ATTR = "_pylustrator_legend_owner_inventory"
+_LEGEND_OWNER_SNAPSHOT_KEY = object()
+_ACTIVE_LAYOUT_OWNER_SNAPSHOT_KEY = object()
 
 
 @contextmanager
@@ -331,6 +334,32 @@ def iter_legend_children(legend: Legend) -> tuple[Artist, ...]:
     return tuple(dict.fromkeys(child for child in children if child is not None))
 
 
+def iter_legend_managed_artists(legend: Legend) -> tuple[Artist, ...]:
+    """Return every Artist whose geometry is owned by a Legend packer.
+
+    ``legend_handles`` only exposes the top-level proxy for each entry.  Error
+    bars, stem plots, tuple handlers, and similar composite entries contain
+    additional Line2D/Collection/Patch leaves below private OffsetBox nodes.
+    Those leaves are reachable by Direct Selection, but cannot be transformed
+    or serialized independently of the Legend that lays them out.
+    """
+
+    managed = []
+    seen = {id(legend)}
+    stack = [*iter_legend_children(legend), *legend.get_children()]
+    while stack:
+        child = stack.pop()
+        if not isinstance(child, Artist) or id(child) in seen:
+            continue
+        seen.add(id(child))
+        managed.append(child)
+        try:
+            stack.extend(child.get_children())
+        except (AttributeError, TypeError, RuntimeError):
+            continue
+    return tuple(managed)
+
+
 def iter_figure_legends(figure) -> tuple[Legend, ...]:
     """Return one authoritative inventory of live Legends below *figure*.
 
@@ -363,32 +392,193 @@ def iter_figure_legends(figure) -> tuple[Legend, ...]:
     return tuple(legends)
 
 
-def legend_owner_for_text(target: Text) -> Legend | None:
-    """Return and cache whether a Text is managed by a live Legend packer."""
+def _legend_inventory_signature(legends: Sequence[Legend]) -> tuple:
+    """Cheaply detect public Legend replacement and packer reconstruction."""
 
-    cached = getattr(target, "_pylustrator_legend_owner", _LEGEND_OWNER_UNKNOWN)
-    if cached is None:
-        return None
-    if cached is not _LEGEND_OWNER_UNKNOWN:
-        if (
-            isinstance(cached, Legend)
-            and cached.figure is getattr(target, "figure", None)
-            and target in iter_legend_children(cached)
-        ):
-            return cached
-        try:
-            delattr(target, "_pylustrator_legend_owner")
-        except AttributeError:
-            pass
+    return tuple(
+        (
+            id(legend),
+            id(getattr(legend, "_legend_box", None)),
+            id(legend.get_frame()),
+            tuple(id(handle) for handle in getattr(legend, "legend_handles", ())),
+            tuple(id(text) for text in legend.get_texts()),
+            id(legend.get_title()),
+        )
+        for legend in legends
+    )
+
+
+def _legend_owner_inventory(figure) -> dict[int, tuple[Artist, Legend]]:
+    """Map every managed descendant to its live Legend once per structure."""
+
+    snapshot = _SELECTION_GEOMETRY_CACHE.get()
+    snapshot_key = (_LEGEND_OWNER_SNAPSHOT_KEY, id(figure))
+    if snapshot is not None:
+        snapshot_entry = snapshot.get(snapshot_key)
+        if snapshot_entry is not None and snapshot_entry[0] is figure:
+            return snapshot_entry[1]
+
+    legends = iter_figure_legends(figure)
+    signature = _legend_inventory_signature(legends)
+    cached = getattr(figure, _LEGEND_OWNER_INVENTORY_ATTR, None)
+    if cached is not None and cached[0] == signature:
+        inventory = cached[1]
+        if snapshot is not None:
+            snapshot[snapshot_key] = (figure, inventory)
+        return inventory
+
+    inventory = {}
+    for legend in legends:
+        for child in iter_legend_managed_artists(legend):
+            inventory[id(child)] = (child, legend)
+    setattr(figure, _LEGEND_OWNER_INVENTORY_ATTR, (signature, inventory))
+    if snapshot is not None:
+        snapshot[snapshot_key] = (figure, inventory)
+    return inventory
+
+
+def legend_owner_for_artist(target: Artist) -> Legend | None:
+    """Return whether an Artist is managed by a live Legend packer."""
 
     figure = getattr(target, "figure", None)
     if figure is not None:
-        for legend in iter_figure_legends(figure):
-            if target in iter_legend_children(legend):
-                target._pylustrator_legend_owner = legend
-                return legend
+        entry = _legend_owner_inventory(figure).get(id(target))
+        if entry is not None and entry[0] is target:
+            target._pylustrator_legend_owner = entry[1]
+            return entry[1]
     target._pylustrator_legend_owner = None
     return None
+
+
+def legend_owner_for_text(target: Text) -> Legend | None:
+    """Backward-compatible Text-specific legend ownership query."""
+
+    return legend_owner_for_artist(target)
+
+
+def layout_owner_for_text(target: Text) -> Artist | None:
+    """Return a Matplotlib layout owner that may rewrite Text position."""
+
+    figure = getattr(target, "figure", None)
+    for axes in getattr(figure, "axes", []):
+        if any(
+            target is title
+            for title in (axes.title, axes._left_title, axes._right_title)
+        ):
+            return axes
+        axis_map = getattr(axes, "_axis_map", None)
+        axes_axes = (
+            tuple(dict.fromkeys(axis_map.values()))
+            if isinstance(axis_map, dict)
+            else tuple(
+                dict.fromkeys(
+                    axis
+                    for name in ("xaxis", "yaxis", "zaxis")
+                    if (axis := getattr(axes, name, None)) is not None
+                )
+            )
+        )
+        for axis in axes_axes:
+            if target is getattr(axis, "label", None) or target is getattr(
+                axis, "offsetText", None
+            ):
+                return axis
+            ticks = (
+                *getattr(axis, "majorTicks", ()),
+                *getattr(axis, "minorTicks", ()),
+            )
+            for tick in ticks:
+                if target is tick.label1 or target is tick.label2:
+                    return axis
+
+    def visit(owner):
+        for name in ("_suptitle", "_supxlabel", "_supylabel"):
+            if target is getattr(owner, name, None):
+                return owner
+        for subfigure in getattr(owner, "subfigs", []):
+            found = visit(subfigure)
+            if found is not None:
+                return found
+        return None
+
+    return visit(figure) if figure is not None else None
+
+
+def active_layout_owner_for_artist(target: Artist) -> Artist | None:
+    """Return an Axes whose active layout can feed back through *target*."""
+
+    figure = getattr(target, "figure", None)
+    if figure is None:
+        return None
+    get_layout_engine = getattr(figure, "get_layout_engine", None)
+    if callable(get_layout_engine):
+        layout_active = get_layout_engine() is not None
+    else:
+        layout_active = bool(
+            getattr(figure, "get_constrained_layout", lambda: False)()
+            or getattr(figure, "get_tight_layout", lambda: False)()
+        )
+    if not layout_active:
+        return None
+    if not target.get_visible() or not getattr(
+        target, "get_in_layout", lambda: True
+    )():
+        return None
+    axes = getattr(target, "axes", None)
+    if axes is None:
+        return None
+
+    snapshot = _SELECTION_GEOMETRY_CACHE.get()
+    snapshot_key = (_ACTIVE_LAYOUT_OWNER_SNAPSHOT_KEY, id(target))
+    if snapshot is not None:
+        entry = snapshot.get(snapshot_key)
+        if entry is not None and entry[0] is target:
+            return entry[1]
+
+    try:
+        extras = axes.get_default_bbox_extra_artists()
+    except (AttributeError, TypeError, ValueError, RuntimeError):
+        owner = axes
+    else:
+        owner = None
+        if any(target is artist for artist in extras):
+            try:
+                bbox = target.get_tightbbox(figure.canvas.get_renderer())
+                bounds = np.asarray(bbox.extents, dtype=float)
+            except (AttributeError, TypeError, ValueError, RuntimeError):
+                owner = axes
+            else:
+                if (
+                    bounds.shape == (4,)
+                    and np.all(np.isfinite(bounds))
+                    and (bbox.width != 0 or bbox.height != 0)
+                ):
+                    owner = axes
+    if snapshot is not None:
+        snapshot[snapshot_key] = (target, owner)
+    return owner
+
+
+def container_owner_for_artist(target: Artist) -> Artist | None:
+    """Return a Figure/SubFigure/Axes whose background patch is *target*."""
+
+    figure = getattr(target, "figure", None)
+    if figure is None:
+        return None
+
+    def visit(owner):
+        if target is getattr(owner, "patch", None):
+            return owner
+        for axes in getattr(owner, "axes", []):
+            if target is getattr(axes, "patch", None):
+                return axes
+        for subfigure in getattr(owner, "subfigs", []):
+            found = visit(subfigure)
+            if found is not None:
+                return found
+        return None
+
+    return visit(figure)
 
 
 def legend_display_loc(legend: Legend) -> np.ndarray:
@@ -411,10 +601,34 @@ class ArtistCapabilities:
     can_serialize: bool = False
     fixed_aspect: bool = False
     can_rotate: bool = False
+    can_rigid_rotate: bool = False
 
     @property
     def editable(self) -> bool:
         return self.can_select and self.can_translate
+
+
+@dataclass(frozen=True)
+class RigidRotationPlan:
+    """Absolute destination for one display-space rigid rotation."""
+
+    target: Artist
+    angle_degrees: float
+    pivot: tuple[float, float]
+    control_points: tuple[tuple[float, float], ...]
+    native_control_points: tuple[tuple[float, float], ...]
+    selection_points: tuple[tuple[float, float], ...]
+    rotation_value: Optional[float] = None
+    member_plans: tuple["RigidRotationPlan", ...] = ()
+
+    def control_array(self) -> np.ndarray:
+        return np.asarray(self.control_points, dtype=float)
+
+    def native_array(self) -> np.ndarray:
+        return np.asarray(self.native_control_points, dtype=float)
+
+    def selection_array(self) -> np.ndarray:
+        return np.asarray(self.selection_points, dtype=float)
 
 
 @dataclass(frozen=True)
@@ -508,12 +722,55 @@ class ArtistAdapter:
         self, operation: TransformOperation | str
     ) -> OperationSupport:
         operation = TransformOperation.coerce(operation)
+        if operation in {
+            TransformOperation.ROTATE,
+            TransformOperation.RIGID_ROTATE,
+        }:
+            if self.target.get_agg_filter() is not None:
+                return OperationSupport.denied(
+                    operation,
+                    f"{type(self.target).__name__} has an Agg filter whose pixel "
+                    "offset is not guaranteed to rotate with its geometry",
+                )
+            legend_owner = legend_owner_for_artist(self.target)
+            if legend_owner is not None:
+                return OperationSupport.denied(
+                    operation,
+                    f"{type(self.target).__name__} is managed by Legend layout "
+                    "and has no stable native pivot or independent replay identity",
+                )
+            if isinstance(self.target, Text):
+                layout_owner = layout_owner_for_text(self.target)
+                if layout_owner is not None:
+                    return OperationSupport.denied(
+                        operation,
+                        "Text position is managed by "
+                        f"{type(layout_owner).__name__} layout and has no stable "
+                        "native pivot",
+                    )
+            container_owner = container_owner_for_artist(self.target)
+            if container_owner is not None:
+                return OperationSupport.denied(
+                    operation,
+                    f"{type(self.target).__name__} is the background of "
+                    f"{type(container_owner).__name__} and cannot rotate "
+                    "independently",
+                )
+            active_layout_owner = active_layout_owner_for_artist(self.target)
+            if active_layout_owner is not None:
+                return OperationSupport.denied(
+                    operation,
+                    f"{type(self.target).__name__} participates in active "
+                    f"{type(active_layout_owner).__name__} layout; rotation could "
+                    "move its coordinate system during draw",
+                )
         capabilities = self.capabilities
         legacy_support = {
             TransformOperation.SELECT: capabilities.can_select,
             TransformOperation.TRANSLATE: capabilities.can_translate,
             TransformOperation.RESIZE_GEOMETRY: capabilities.can_resize,
             TransformOperation.ROTATE: capabilities.can_rotate,
+            TransformOperation.RIGID_ROTATE: capabilities.can_rigid_rotate,
             TransformOperation.SNAPSHOT: capabilities.can_snapshot,
             TransformOperation.SERIALIZE: capabilities.can_serialize,
             TransformOperation.SCALE_APPEARANCE: False,
@@ -528,7 +785,11 @@ class ArtistAdapter:
             preview_strategy = (
                 "native_rotation"
                 if operation is TransformOperation.ROTATE
-                else "control_points"
+                else (
+                    "rigid_rotation"
+                    if operation is TransformOperation.RIGID_ROTATE
+                    else "control_points"
+                )
             )
             return OperationSupport.allowed(
                 operation,
@@ -543,6 +804,19 @@ class ArtistAdapter:
 
     def supports_operation(self, operation: TransformOperation | str) -> bool:
         return self.operation_support(operation).supported
+
+    def native_rotation_handle_support(self) -> OperationSupport:
+        """Whether native angle editing is an honest visual handle operation."""
+
+        operation = TransformOperation.ROTATE
+        support = self.operation_support(operation)
+        if not support.supported:
+            return support
+        return OperationSupport.denied(
+            operation,
+            f"{type(self.target).__name__} exposes a native angle property but "
+            "does not guarantee rigid visual rotation around a stable pivot",
+        )
 
     def get_transform(self) -> Transform:
         getter = getattr(self.target, "get_transform", None)
@@ -950,6 +1224,13 @@ class ArtistAdapter:
         matrix = np.asarray(matrix, dtype=float)
         if matrix.shape != (3, 3) or not np.all(np.isfinite(matrix)):
             raise ValueError("Display-space resize requires a finite 3x3 matrix")
+        if not np.allclose(matrix[2], (0.0, 0.0, 1.0)) or not np.allclose(
+            matrix[[0, 1], [1, 0]], 0.0
+        ):
+            raise UnsupportedArtistError(
+                "Resize only accepts axis-aligned scale/translation matrices; "
+                "use rigid rotation for off-diagonal geometry transforms"
+            )
         if control_points is None:
             control_points = self.control_points()
         if selection_points is None:
@@ -999,6 +1280,308 @@ class ArtistAdapter:
             )
         self.preflight_resize(matrix)
         self.apply_control_points(self.preview_resize_control_points(matrix))
+
+    @staticmethod
+    def display_rotation_matrix(angle_degrees: float, pivot) -> np.ndarray:
+        angle_degrees = float(angle_degrees)
+        pivot = np.asarray(pivot, dtype=float)
+        if not np.isfinite(angle_degrees):
+            raise ValueError("Rotation angle must be finite")
+        if pivot.shape != (2,) or not np.all(np.isfinite(pivot)):
+            raise ValueError("Rotation pivot must contain two finite display values")
+        angle = np.deg2rad(angle_degrees)
+        cosine = float(np.cos(angle))
+        sine = float(np.sin(angle))
+        linear = np.array([[cosine, -sine], [sine, cosine]], dtype=float)
+        translation = pivot - linear @ pivot
+        return np.array(
+            [
+                [linear[0, 0], linear[0, 1], translation[0]],
+                [linear[1, 0], linear[1, 1], translation[1]],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=float,
+        )
+
+    @staticmethod
+    def transform_is_invertible_affine(transform: Transform) -> bool:
+        if not bool(getattr(transform, "is_affine", False)) or not bool(
+            getattr(transform, "has_inverse", True)
+        ):
+            return False
+        try:
+            transform.inverted()
+        except (
+            AttributeError,
+            TypeError,
+            ValueError,
+            NotImplementedError,
+            RuntimeError,
+            np.linalg.LinAlgError,
+        ):
+            return False
+        return True
+
+    @staticmethod
+    def transform_is_similarity(transform: Transform) -> bool:
+        """Whether native rotations remain rigid rotations in display space."""
+
+        if not bool(getattr(transform, "is_affine", False)):
+            return False
+        try:
+            linear = np.asarray(
+                transform.get_affine().get_matrix(), dtype=float
+            )[:2, :2]
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            return False
+        gram = linear.T @ linear
+        scale_squared = float(np.trace(gram) / 2.0)
+        return bool(
+            np.isfinite(scale_squared)
+            and scale_squared > np.finfo(float).eps
+            and np.allclose(
+                gram,
+                np.eye(2) * scale_squared,
+                atol=max(scale_squared, 1.0) * 1e-10,
+                rtol=1e-10,
+            )
+        )
+
+    def rigid_rotation_uses_native_angle(self) -> bool:
+        return False
+
+    def rigid_rotation_angle_delta(self, angle_degrees: float) -> float:
+        return float(angle_degrees)
+
+    def preview_rigid_rotation_control_points(
+        self, matrix, *, control_points
+    ) -> np.ndarray:
+        control_points = self.point_array(control_points)
+        if not self.rigid_rotation_uses_native_angle():
+            return self._transform_points(matrix, control_points)
+        current_pivot = np.asarray(self.rotation_pivot(), dtype=float)
+        destination_pivot = self._transform_points(matrix, [current_pivot])[0]
+        return control_points + destination_pivot - current_pivot
+
+    def preview_rigid_rotation_selection_points(
+        self,
+        matrix,
+        *,
+        control_points,
+        selection_points,
+        planned_control_points,
+        planned_native_control_points,
+        rotation_value: float | None,
+    ) -> np.ndarray:
+        """Predict the visible envelope for geometry-backed rigid rotation."""
+
+        geometry = self.geometry_bounds(planned_control_points)
+        if not len(geometry):
+            return np.empty((0, 2), dtype=float)
+        outsets = self.appearance_outsets(
+            control_points=control_points,
+            selection_points=selection_points,
+        )
+        left, bottom, right, top = outsets
+        return np.array(
+            [
+                [geometry[0, 0] - left, geometry[0, 1] - bottom],
+                [geometry[1, 0] + right, geometry[1, 1] + top],
+            ],
+            dtype=float,
+        )
+
+    def preflight_rigid_rotation_clip(
+        self, source_selection, destination_selection
+    ) -> None:
+        """Require v1 rigid rotation to remain wholly inside a rectangular clip."""
+
+        clip_box, clip_path = _display_clip_components(self.target)
+        if clip_path is not None:
+            raise UnsupportedArtistError(
+                f"{type(self.target).__name__} rigid rotation inside a "
+                "non-rectangular clip path is not exact yet"
+            )
+        if clip_box is None:
+            return
+        source = self.bounds_points(source_selection)
+        destination = self.bounds_points(destination_selection)
+        if not len(source) or not len(destination):
+            raise UnsupportedArtistError(
+                f"{type(self.target).__name__} has no finite rigid-rotation bounds"
+            )
+        clip = np.asarray(clip_box, dtype=float).reshape(2, 2)
+
+        def contained(bounds) -> bool:
+            return bool(
+                np.all(bounds[0] >= clip[0] - 0.25)
+                and np.all(bounds[1] <= clip[1] + 0.25)
+            )
+
+        if not contained(source) or not contained(destination):
+            raise UnsupportedArtistError(
+                f"{type(self.target).__name__} rigid rotation cannot preserve a "
+                "partially clipped visible envelope"
+            )
+
+    def plan_rigid_rotation(
+        self,
+        angle_degrees: float,
+        pivot,
+        *,
+        control_points=None,
+        selection_points=None,
+    ) -> RigidRotationPlan:
+        """Preflight one absolute display-space rotation destination."""
+
+        support = self.operation_support(TransformOperation.RIGID_ROTATE)
+        if not support.supported:
+            raise UnsupportedArtistError(support.reason)
+        angle_degrees = (
+            float(angle_degrees) + 180.0
+        ) % 360.0 - 180.0
+        if np.isclose(angle_degrees, 0.0, atol=1e-12):
+            angle_degrees = 0.0
+        matrix = self.display_rotation_matrix(angle_degrees, pivot)
+        if control_points is None:
+            control_points = np.asarray(self.control_points(), dtype=float)
+        else:
+            control_points = np.asarray(control_points, dtype=float)
+        if selection_points is None:
+            selection_points = np.asarray(self.selection_points(), dtype=float)
+        else:
+            selection_points = np.asarray(selection_points, dtype=float)
+        planned_control = self.preview_rigid_rotation_control_points(
+            matrix, control_points=control_points
+        )
+        try:
+            planned_native = self.point_array(
+                self.display_to_native(planned_control)
+            )
+            representable_control = self.point_array(
+                self.native_to_display(planned_native)
+            )
+        except (
+            AttributeError,
+            TypeError,
+            ValueError,
+            NotImplementedError,
+            RuntimeError,
+            np.linalg.LinAlgError,
+        ) as error:
+            raise UnsupportedArtistError(
+                f"{type(self.target).__name__} rigid rotation cannot convert its "
+                "display destination through native coordinates"
+            ) from error
+        self.validate_native_control_points(planned_native)
+        expected = self.point_array(planned_control)
+        expected_finite = np.isfinite(expected)
+        actual_finite = np.isfinite(representable_control)
+        nonfinite_matches = bool(
+            expected.shape == representable_control.shape
+            and np.array_equal(expected_finite, actual_finite)
+            and np.array_equal(np.isnan(expected), np.isnan(representable_control))
+            and np.array_equal(np.isposinf(expected), np.isposinf(representable_control))
+            and np.array_equal(np.isneginf(expected), np.isneginf(representable_control))
+        )
+        if expected.shape == representable_control.shape and np.any(expected_finite):
+            round_trip_error = float(
+                np.max(
+                    np.abs(
+                        expected[expected_finite]
+                        - representable_control[expected_finite]
+                    )
+                )
+            )
+        else:
+            round_trip_error = float("inf")
+        if not nonfinite_matches or round_trip_error > 0.25:
+            raise UnsupportedArtistError(
+                f"{type(self.target).__name__} rigid rotation cannot round-trip "
+                "its display destination through native coordinates within "
+                f"0.25 px (error {round_trip_error:.6g} px)"
+            )
+        planned_control = representable_control
+        rotation_value = (
+            self.rotation() + self.rigid_rotation_angle_delta(angle_degrees)
+            if self.rigid_rotation_uses_native_angle()
+            else None
+        )
+        planned_selection = self.preview_rigid_rotation_selection_points(
+            matrix,
+            control_points=control_points,
+            selection_points=selection_points,
+            planned_control_points=planned_control,
+            planned_native_control_points=planned_native,
+            rotation_value=rotation_value,
+        )
+        self.preflight_rigid_rotation_clip(
+            selection_points, planned_selection
+        )
+        visible = _clip_selection_points(self.target, planned_selection)
+        if not len(self.finite_points(visible)):
+            raise UnsupportedArtistError(
+                f"{type(self.target).__name__} rigid rotation would leave no visible "
+                "geometry inside the active clip region"
+            )
+        return RigidRotationPlan(
+            target=self.target,
+            angle_degrees=float(angle_degrees),
+            pivot=tuple(float(value) for value in np.asarray(pivot, dtype=float)),
+            control_points=tuple(
+                tuple(float(value) for value in point)
+                for point in np.asarray(planned_control, dtype=float)
+            ),
+            native_control_points=tuple(
+                tuple(float(value) for value in point)
+                for point in np.asarray(planned_native, dtype=float)
+            ),
+            selection_points=tuple(
+                tuple(float(value) for value in point)
+                for point in np.asarray(visible, dtype=float)
+            ),
+            rotation_value=(
+                None if rotation_value is None else float(rotation_value)
+            ),
+        )
+
+    def apply_rigid_rotation_plan(
+        self, plan: RigidRotationPlan, *, record_changes: bool = True
+    ) -> None:
+        if plan.target is not self.target:
+            raise ValueError("Rigid-rotation plan belongs to another artist")
+        support = self.operation_support(TransformOperation.RIGID_ROTATE)
+        if not support.supported:
+            raise UnsupportedArtistError(support.reason)
+        if not self.rigid_rotation_plan_changes(plan):
+            return
+        native = plan.native_array()
+        self.validate_native_control_points(native)
+        with suspend_change_recording():
+            self._apply_native_control_points(native)
+            if plan.rotation_value is not None:
+                self._apply_rotation(plan.rotation_value)
+        if record_changes:
+            self._record_restored_state(
+                include_rotation=plan.rotation_value is not None
+            )
+        self.invalidate_geometry_cache()
+
+    def rigid_rotation_plan_changes(self, plan: RigidRotationPlan) -> bool:
+        current = np.asarray(self.control_points(), dtype=float)
+        planned = plan.control_array()
+        if current.shape != planned.shape or not np.allclose(
+            current, planned, equal_nan=True
+        ):
+            return True
+        return bool(
+            plan.rotation_value is not None
+            and not np.isclose(self.rotation(), plan.rotation_value)
+        )
+
+    def rigid_rotate(self, angle_degrees: float, pivot) -> None:
+        plan = self.plan_rigid_rotation(angle_degrees, pivot)
+        self.apply_rigid_rotation_plan(plan)
 
     def rotation(self) -> float:
         raise UnsupportedArtistError(
@@ -1200,6 +1783,12 @@ class ArtistAdapterRegistry:
 
 
 class PatchAdapter(ArtistAdapter):
+    unsupported_operation_reasons = {
+        TransformOperation.RIGID_ROTATE: (
+            "Patch common-pivot rotation requires writable path geometry or a "
+            "similarity transform"
+        )
+    }
     default_capabilities = ArtistCapabilities(
         can_select=True,
         can_translate=True,
@@ -1223,6 +1812,39 @@ class PatchAdapter(ArtistAdapter):
 
     def get_transform(self) -> Transform:
         return self.target.get_data_transform()
+
+    def native_rotation_handle_support(self) -> OperationSupport:
+        operation = TransformOperation.ROTATE
+        support = self.operation_support(operation)
+        if not support.supported:
+            return support
+        transform = self.target.get_data_transform()
+        if not self.transform_is_similarity(transform):
+            return OperationSupport.denied(
+                operation,
+                f"{type(self.target).__name__} native angle is not a rigid "
+                "display rotation under its non-similarity transform",
+            )
+        linear = np.asarray(
+            transform.get_affine().get_matrix(), dtype=float
+        )[:2, :2]
+        if np.linalg.det(linear) <= 0:
+            return OperationSupport.denied(
+                operation,
+                f"{type(self.target).__name__} native angle reverses direction "
+                "under its reflected transform",
+            )
+        if self.target.get_hatch() or self.target.get_path_effects():
+            return OperationSupport.denied(
+                operation,
+                f"{type(self.target).__name__} hatch/path effects do not "
+                "guarantee rigid visual rotation with its native angle",
+            )
+        return OperationSupport.allowed(
+            operation,
+            constraints=("stable_native_pivot",),
+            preview_strategy="native_rotation",
+        )
 
     def selection_points(self) -> np.ndarray:
         preview = self._preview_points("_pylustrator_preview_selection_points")
@@ -1457,6 +2079,54 @@ class PatchAdapter(ArtistAdapter):
             dtype=float,
         )
 
+    def rigid_rotation_uses_native_angle(self) -> bool:
+        return bool(
+            self.capabilities.can_rigid_rotate and self.capabilities.can_rotate
+        )
+
+    def rigid_rotation_angle_delta(self, angle_degrees: float) -> float:
+        if not self.rigid_rotation_uses_native_angle():
+            return super().rigid_rotation_angle_delta(angle_degrees)
+        linear = np.asarray(
+            self.target.get_data_transform().get_affine().get_matrix(),
+            dtype=float,
+        )[:2, :2]
+        orientation = 1.0 if np.linalg.det(linear) >= 0 else -1.0
+        return orientation * float(angle_degrees)
+
+    def preview_rigid_rotation_selection_points(
+        self,
+        matrix,
+        *,
+        control_points,
+        selection_points,
+        planned_control_points,
+        planned_native_control_points,
+        rotation_value: float | None,
+    ) -> np.ndarray:
+        if not self.rigid_rotation_uses_native_angle():
+            return super().preview_rigid_rotation_selection_points(
+                matrix,
+                control_points=control_points,
+                selection_points=selection_points,
+                planned_control_points=planned_control_points,
+                planned_native_control_points=planned_native_control_points,
+                rotation_value=rotation_value,
+            )
+        clone = copy(self.target)
+        for attribute in (
+            "_pylustrator_preview_positions",
+            "_pylustrator_preview_selection_points",
+        ):
+            try:
+                delattr(clone, attribute)
+            except AttributeError:
+                pass
+        adapter = type(self)(clone)
+        adapter._apply_native_control_points(planned_native_control_points)
+        adapter._apply_rotation(float(rotation_value))
+        return np.asarray(adapter.selection_points(), dtype=float)
+
     def rotation(self) -> float:
         return float(self.target.get_angle())
 
@@ -1480,13 +2150,32 @@ class RectangleAdapter(PatchAdapter):
         # controls. Only a true 0-degree equivalent has matching controls and
         # rendered geometry. Ellipse is center-anchored and has different rules.
         can_resize = np.isclose(float(target.get_angle()) % 360.0, 0.0)
+        rotation_point = getattr(
+            target, "rotation_point", getattr(target, "_rotation_point", "xy")
+        )
+        owner_managed = bool(
+            legend_owner_for_artist(target) is not None
+            or container_owner_for_artist(target) is not None
+            or active_layout_owner_for_artist(target) is not None
+            or target.get_agg_filter() is not None
+        )
+        can_rigid_rotate = (
+            not owner_managed
+            and cls.transform_is_similarity(target.get_data_transform())
+            and isinstance(rotation_point, str)
+            and rotation_point in {"xy", "center"}
+            and target.get_agg_filter() is None
+            and not target.get_path_effects()
+            and not target.get_hatch()
+        )
         return ArtistCapabilities(
             can_select=True,
             can_translate=True,
             can_resize=bool(can_resize),
             can_snapshot=True,
             can_serialize=True,
-            can_rotate=True,
+            can_rotate=not owner_managed,
+            can_rigid_rotate=bool(can_rigid_rotate),
         )
 
     def native_control_points(self):
@@ -1538,13 +2227,27 @@ class EllipseAdapter(PatchAdapter):
     @classmethod
     def capabilities_for(cls, target: Ellipse) -> ArtistCapabilities:
         can_resize = np.isclose(float(target.get_angle()) % 180.0, 0.0)
+        owner_managed = bool(
+            legend_owner_for_artist(target) is not None
+            or container_owner_for_artist(target) is not None
+            or active_layout_owner_for_artist(target) is not None
+            or target.get_agg_filter() is not None
+        )
+        can_rigid_rotate = (
+            not owner_managed
+            and cls.transform_is_similarity(target.get_data_transform())
+            and target.get_agg_filter() is None
+            and not target.get_path_effects()
+            and not target.get_hatch()
+        )
         return ArtistCapabilities(
             can_select=True,
             can_translate=True,
             can_resize=bool(can_resize),
             can_snapshot=True,
             can_serialize=True,
-            can_rotate=True,
+            can_rotate=not owner_managed,
+            can_rigid_rotate=bool(can_rigid_rotate),
         )
 
     def native_control_points(self):
@@ -1707,7 +2410,18 @@ class PolygonAdapter(PatchAdapter):
     def capabilities_for(cls, target: Polygon) -> ArtistCapabilities:
         if not len(cls.finite_points(target.get_xy())):
             return ArtistCapabilities()
-        return super().capabilities_for(target)
+        capabilities = super().capabilities_for(target)
+        return replace(
+            capabilities,
+            can_rigid_rotate=bool(
+                legend_owner_for_artist(target) is None
+                and active_layout_owner_for_artist(target) is None
+                and cls.transform_is_invertible_affine(target.get_data_transform())
+                and target.get_agg_filter() is None
+                and not target.get_path_effects()
+                and not target.get_hatch()
+            ),
+        )
 
     def native_control_points(self):
         return [np.asarray(point, dtype=float) for point in self.target.get_xy()]
@@ -1729,7 +2443,18 @@ class PathPatchAdapter(PatchAdapter):
     def capabilities_for(cls, target: PathPatch) -> ArtistCapabilities:
         if not len(cls.finite_points(target.get_path().vertices)):
             return ArtistCapabilities()
-        return super().capabilities_for(target)
+        capabilities = super().capabilities_for(target)
+        return replace(
+            capabilities,
+            can_rigid_rotate=bool(
+                legend_owner_for_artist(target) is None
+                and active_layout_owner_for_artist(target) is None
+                and cls.transform_is_invertible_affine(target.get_data_transform())
+                and target.get_agg_filter() is None
+                and not target.get_path_effects()
+                and not target.get_hatch()
+            ),
+        )
 
     def geometry_bounds(self, control_points=None) -> np.ndarray:
         """Measure the rendered Bezier path, not its off-curve control hull."""
@@ -1778,6 +2503,10 @@ class TextAdapter(ArtistAdapter):
             "Legend-managed Text rotation reflows its layout and cannot preserve "
             "a stable native pivot"
         ),
+        TransformOperation.RIGID_ROTATE: (
+            "Text common-pivot rotation requires rotation_mode='anchor', no "
+            "transform-relative text angle, and no layout-managed owner"
+        ),
     }
     default_capabilities = ArtistCapabilities(
         can_select=True,
@@ -1789,7 +2518,12 @@ class TextAdapter(ArtistAdapter):
 
     @classmethod
     def capabilities_for(cls, target: Text) -> ArtistCapabilities:
-        if legend_owner_for_text(target) is not None:
+        if (
+            legend_owner_for_text(target) is not None
+            or layout_owner_for_text(target) is not None
+            or active_layout_owner_for_artist(target) is not None
+            or target.get_agg_filter() is not None
+        ):
             capabilities = cls.default_capabilities
             return ArtistCapabilities(
                 can_select=capabilities.can_select,
@@ -1800,7 +2534,35 @@ class TextAdapter(ArtistAdapter):
                 fixed_aspect=capabilities.fixed_aspect,
                 can_rotate=False,
             )
-        return cls.default_capabilities
+        capabilities = cls.default_capabilities
+        transform_rotates = bool(
+            getattr(target, "get_transform_rotates_text", lambda: False)()
+        )
+        can_rigid_rotate = bool(
+            not isinstance(target, Annotation)
+            and target.get_rotation_mode() == "anchor"
+            and not transform_rotates
+            and cls.transform_is_invertible_affine(target.get_transform())
+            and target.get_agg_filter() is None
+            and target.get_bbox_patch() is None
+            and not target.get_wrap()
+            and not target.get_path_effects()
+        )
+        return replace(
+            capabilities, can_rigid_rotate=can_rigid_rotate
+        )
+
+    def native_rotation_handle_support(self) -> OperationSupport:
+        operation = TransformOperation.ROTATE
+        support = self.operation_support(operation)
+        if not support.supported:
+            return support
+        return OperationSupport.denied(
+            operation,
+            f"{type(self.target).__name__} native angle does not rotate its "
+            "complete visible bounds rigidly around the displayed pivot; use "
+            "an anchor-mode rigid rotation plan",
+        )
 
     def __init__(self, target: Text):
         super().__init__(target)
@@ -1921,6 +2683,33 @@ class TextAdapter(ArtistAdapter):
 
         add_text_default(self.target)
         self.target.set_rotation(value)
+
+    def rigid_rotation_uses_native_angle(self) -> bool:
+        return self.capabilities.can_rigid_rotate
+
+    def preview_rigid_rotation_selection_points(
+        self,
+        matrix,
+        *,
+        control_points,
+        selection_points,
+        planned_control_points,
+        planned_native_control_points,
+        rotation_value: float | None,
+    ) -> np.ndarray:
+        clone = copy(self.target)
+        for attribute in (
+            "_pylustrator_preview_positions",
+            "_pylustrator_preview_selection_points",
+        ):
+            try:
+                delattr(clone, attribute)
+            except AttributeError:
+                pass
+        adapter = type(self)(clone)
+        adapter._apply_native_control_points(planned_native_control_points)
+        adapter._apply_rotation(float(rotation_value))
+        return np.asarray(adapter.selection_points(), dtype=float)
 
     def serialize_rotation_changes(self):
         return (ChangeRecord.text_change(self.target),)
@@ -2369,6 +3158,34 @@ class EditorGroupAdapter(ArtistAdapter):
             # Rotation of a group also changes member positions around one pivot;
             # native per-member rotation alone is not an equivalent operation.
             can_rotate=False,
+            can_rigid_rotate=all(
+                value.can_rigid_rotate for value in capabilities
+            ),
+        )
+
+    def operation_support(
+        self, operation: TransformOperation | str
+    ) -> OperationSupport:
+        operation = TransformOperation.coerce(operation)
+        if operation is not TransformOperation.RIGID_ROTATE:
+            return super().operation_support(operation)
+        supports = [
+            (adapter.target, adapter.operation_support(operation))
+            for adapter in self._member_adapters()
+        ]
+        failures = [
+            (target, support)
+            for target, support in supports
+            if not support.supported
+        ]
+        if failures:
+            reason = "; ".join(
+                f"{type(target).__name__}: {support.reason}"
+                for target, support in failures
+            )
+            return OperationSupport.denied(operation, reason)
+        return OperationSupport.allowed(
+            operation, preview_strategy="rigid_rotation"
         )
 
     def get_transform(self) -> Transform:
@@ -2513,6 +3330,105 @@ class EditorGroupAdapter(ArtistAdapter):
             raise ValueError("Editor-group control-point count changed during preview")
         return self.bounds_points(planned)
 
+    def plan_rigid_rotation(
+        self,
+        angle_degrees: float,
+        pivot,
+        *,
+        control_points=None,
+        selection_points=None,
+    ) -> RigidRotationPlan:
+        support = self.operation_support(TransformOperation.RIGID_ROTATE)
+        if not support.supported:
+            raise UnsupportedArtistError(support.reason)
+        self.display_rotation_matrix(angle_degrees, pivot)
+        adapters = self._member_adapters()
+        member_plans = tuple(
+            adapter.plan_rigid_rotation(angle_degrees, pivot)
+            for adapter in adapters
+        )
+        control = [
+            point
+            for plan in member_plans
+            for point in plan.control_points
+        ]
+        native = [
+            point
+            for plan in member_plans
+            for point in plan.native_control_points
+        ]
+        visible = [
+            plan.selection_array()
+            for adapter, plan in zip(adapters, member_plans)
+            if adapter.target.get_visible() and len(plan.selection_points)
+        ]
+        if not visible:
+            raise UnsupportedArtistError(
+                "EditorGroup has no visible bounds for rigid rotation"
+            )
+        selection = self.bounds_points(np.concatenate(visible))
+        return RigidRotationPlan(
+            target=self.target,
+            angle_degrees=float(angle_degrees),
+            pivot=tuple(float(value) for value in np.asarray(pivot, dtype=float)),
+            control_points=tuple(control),
+            native_control_points=tuple(native),
+            selection_points=tuple(
+                tuple(float(value) for value in point) for point in selection
+            ),
+            member_plans=member_plans,
+        )
+
+    def apply_rigid_rotation_plan(
+        self, plan: RigidRotationPlan, *, record_changes: bool = True
+    ) -> None:
+        if plan.target is not self.target:
+            raise ValueError("Rigid-rotation plan belongs to another artist")
+        adapters = self._member_adapters()
+        if len(adapters) != len(plan.member_plans):
+            raise ValueError("Editor-group membership changed after rotation preflight")
+        if not any(
+            adapter.rigid_rotation_plan_changes(member_plan)
+            for adapter, member_plan in zip(adapters, plan.member_plans)
+        ):
+            return
+        snapshots = [adapter.snapshot() for adapter in adapters]
+        tracker_states = []
+        seen_trackers = set()
+        for adapter in adapters:
+            try:
+                tracker = adapter.change_tracker()
+            except AttributeError:
+                continue
+            if id(tracker) in seen_trackers:
+                continue
+            capture = getattr(tracker, "capture_recording_state", None)
+            restore = getattr(tracker, "restore_recording_state", None)
+            if not callable(capture) or not callable(restore):
+                continue
+            seen_trackers.add(id(tracker))
+            tracker_states.append((tracker, capture()))
+        try:
+            with suspend_change_recording():
+                for adapter, member_plan in zip(adapters, plan.member_plans):
+                    adapter.apply_rigid_rotation_plan(
+                        member_plan, record_changes=False
+                    )
+            if record_changes:
+                self._record_restored_state()
+        except Exception:
+            with suspend_change_recording():
+                for adapter, state in zip(reversed(adapters), reversed(snapshots)):
+                    try:
+                        adapter.restore(state)
+                    except Exception:
+                        continue
+            for tracker, state in tracker_states:
+                tracker.restore_recording_state(state)
+            self.invalidate_geometry_cache()
+            raise
+        self.invalidate_geometry_cache()
+
     def _apply_native_control_points(self, points) -> None:
         start = 0
         # A logical group is the transaction/serialization boundary.  Member
@@ -2559,7 +3475,11 @@ class Line2DAdapter(ArtistAdapter):
     unsupported_operation_reasons = {
         TransformOperation.RESIZE_GEOMETRY: (
             "Line geometry resize requires an affine coordinate preflight"
-        )
+        ),
+        TransformOperation.RIGID_ROTATE: (
+            "Line common-pivot rotation requires an affine transform, default "
+            "drawstyle, and no marker or path effect"
+        ),
     }
     default_capabilities = ArtistCapabilities(
         can_select=True,
@@ -2572,7 +3492,19 @@ class Line2DAdapter(ArtistAdapter):
     def capabilities_for(cls, target: Line2D) -> ArtistCapabilities:
         if not len(cls.finite_points(target.get_xydata())):
             return ArtistCapabilities()
-        return cls.default_capabilities
+        marker = target.get_marker()
+        can_rigid_rotate = bool(
+            legend_owner_for_artist(target) is None
+            and active_layout_owner_for_artist(target) is None
+            and cls.transform_is_invertible_affine(target.get_transform())
+            and target.get_drawstyle() == "default"
+            and marker in (None, "", " ", "none", "None")
+            and target.get_agg_filter() is None
+            and not target.get_path_effects()
+        )
+        return replace(
+            cls.default_capabilities, can_rigid_rotate=can_rigid_rotate
+        )
 
     def get_transform(self) -> Transform:
         return IdentityTransform()
@@ -2809,6 +3741,10 @@ class CollectionAdapter(ArtistAdapter):
         TransformOperation.SCALE_APPEARANCE: (
             "Collection appearance scaling is not implemented yet"
         ),
+        TransformOperation.RIGID_ROTATE: (
+            "Collection common-pivot rotation requires writable non-offset paths "
+            "with an affine transform and no hatch or path effect"
+        ),
     }
     default_capabilities = ArtistCapabilities(
         can_select=True,
@@ -3041,6 +3977,30 @@ class CollectionAdapter(ArtistAdapter):
                 return self.bounds_points(np.concatenate(envelopes))
         return super().selection_points()
 
+    def preview_rigid_rotation_selection_points(
+        self,
+        matrix,
+        *,
+        control_points,
+        selection_points,
+        planned_control_points,
+        planned_native_control_points,
+        rotation_value: float | None,
+    ) -> np.ndarray:
+        if self.uses_rendered_offsets():
+            return np.empty((0, 2), dtype=float)
+        groups = self.split_points(planned_control_points)
+        paddings = self.selection_paddings(len(groups))
+        envelopes = [
+            self.bounds_points(group, padding=float(padding))
+            for group, padding in zip(groups, paddings)
+            if len(self.finite_points(group))
+        ]
+        envelopes = [points for points in envelopes if len(points)]
+        if envelopes:
+            return self.bounds_points(np.concatenate(envelopes))
+        return np.empty((0, 2), dtype=float)
+
     def split_points(self, points) -> list[np.ndarray]:
         lengths = [len(group) for group in self.local_groups()]
         groups = []
@@ -3073,6 +4033,23 @@ class PathCollectionAdapter(CollectionAdapter):
 
 
 class LineCollectionAdapter(CollectionAdapter):
+    @classmethod
+    def capabilities_for(cls, target: LineCollection) -> ArtistCapabilities:
+        capabilities = super().capabilities_for(target)
+        can_rigid_rotate = bool(
+            capabilities.editable
+            and legend_owner_for_artist(target) is None
+            and active_layout_owner_for_artist(target) is None
+            and not cls.target_uses_rendered_offsets(target)
+            and cls.transform_is_invertible_affine(target.get_transform())
+            and target.get_agg_filter() is None
+            and not target.get_path_effects()
+            and not target.get_hatch()
+        )
+        return replace(
+            capabilities, can_rigid_rotate=can_rigid_rotate
+        )
+
     def local_groups(self):
         if self.uses_rendered_offsets():
             return [self.point_array(self.target.get_offsets())]
@@ -3104,6 +4081,23 @@ class LineCollectionAdapter(CollectionAdapter):
 
 
 class PolyCollectionAdapter(CollectionAdapter):
+    @classmethod
+    def capabilities_for(cls, target: PolyCollection) -> ArtistCapabilities:
+        capabilities = super().capabilities_for(target)
+        can_rigid_rotate = bool(
+            capabilities.editable
+            and legend_owner_for_artist(target) is None
+            and active_layout_owner_for_artist(target) is None
+            and not cls.target_uses_rendered_offsets(target)
+            and cls.transform_is_invertible_affine(target.get_transform())
+            and target.get_agg_filter() is None
+            and not target.get_path_effects()
+            and not target.get_hatch()
+        )
+        return replace(
+            capabilities, can_rigid_rotate=can_rigid_rotate
+        )
+
     def local_groups(self):
         if self.uses_rendered_offsets():
             return [self.point_array(self.target.get_offsets())]
@@ -3215,20 +4209,27 @@ __all__ = [
     "PolygonAdapter",
     "RectangleAdapter",
     "RegularPolygonAdapter",
+    "RigidRotationPlan",
     "TextAdapter",
     "UnsupportedArtistError",
     "WedgeAdapter",
     "artist_adapter_registry",
+    "active_layout_owner_for_artist",
     "cached_selection_points",
     "checkXLabel",
     "checkYLabel",
+    "container_owner_for_artist",
     "get_artist_adapter",
     "iter_figure_legends",
     "iter_legend_children",
+    "iter_legend_managed_artists",
     "legend_anchor_is_point",
     "legend_anchor_transform",
     "legend_display_loc",
     "legend_loc_transform",
+    "legend_owner_for_artist",
+    "legend_owner_for_text",
+    "layout_owner_for_text",
     "register_artist_adapter",
     "set_legend_point_anchor_display",
     "selection_geometry_snapshot",
