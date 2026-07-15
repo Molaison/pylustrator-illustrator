@@ -58,9 +58,10 @@ breaks; and generated code preserves exact finite floats plus qualified
 NaN/Inf. A deliberately attempted 13-significant-digit canonicalization was
 rejected after a `1e-12`-wide axis amplified it to roughly 90 px. Source
 stability is therefore enforced by restoring transaction recording state, not
-by quantizing persisted geometry. Ambiguous non-translation matrices and
-Line/PolyCollection instances with explicit offsets fail capability preflight
-without mutation.
+by quantizing persisted geometry. Ambiguous non-translation matrices fail
+capability preflight. Explicit-offset Line/PolyCollection now share a
+renderer-faithful path x offset extent model and translate offset controls
+without rewriting their base paths.
 
 ### P0.1 Selection kernel
 
@@ -151,8 +152,6 @@ Remaining feature work:
 - A renderer-faithful paint-envelope policy for miter/cap joins, path effects,
   and clipping; current axial stroke padding is intentionally not advertised as
   exact raster coverage.
-- Path x offset renderer-iterator support for explicit-offset LineCollection
-  and PolyCollection; those variants are currently safely denied.
 
 ## P2: workflow breadth
 

@@ -1740,7 +1740,7 @@ def test_line_collection_transform_and_replay_preserve_nan_path_breaks() -> None
 
 
 @pytest.mark.parametrize("kind", ["line", "poly"])
-def test_offset_line_and_poly_collections_are_explicitly_denied(kind) -> None:
+def test_offset_line_and_poly_collections_follow_renderer_items_and_replay(kind) -> None:
     fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
     tracker = RecordingChangeTracker()
     fig.change_tracker = tracker
@@ -1763,21 +1763,38 @@ def test_offset_line_and_poly_collections_are_explicitly_denied(kind) -> None:
     adapter = get_artist_adapter(target)
     paths_before = [path.vertices.copy() for path in target.get_paths()]
     offsets_before = np.asarray(target.get_offsets(), dtype=float).copy()
+    controls_before = np.asarray(adapter.control_points(), dtype=float)
+    groups = adapter.display_groups()
+    paddings = adapter.selection_paddings(len(groups))
+    expected = _bounds(
+        np.concatenate(
+            [adapter.bounds_points(group, float(padding)) for group, padding in zip(groups, paddings)]
+        )
+    )
+    bounds_before = _bounds(adapter.selection_points())
 
     try:
-        assert not adapter.capabilities.editable
-        for operation in TransformOperation:
-            assert not adapter.operation_support(operation).supported
-        with pytest.raises(UnsupportedArtistError):
-            adapter.translate(TRANSLATION)
-        with pytest.raises(UnsupportedArtistError):
-            adapter.snapshot()
-        with pytest.raises(UnsupportedArtistError):
-            adapter.record_changes()
+        assert adapter.capabilities.editable
+        assert len(groups) == len(offsets_before)
+        _assert_px_close(bounds_before, expected)
+
+        adapter.translate(TRANSLATION)
+        fig.canvas.draw()
+        moved_offsets = np.asarray(target.get_offsets(), dtype=float).copy()
+        moved_bounds = _bounds(adapter.selection_points())
+        records = adapter.serialize_changes()
+        _assert_px_close(adapter.control_points(), controls_before + TRANSLATION)
+        _assert_px_close(moved_bounds, bounds_before + np.tile(TRANSLATION, 2))
+        assert any(record.command.startswith(".set_offsets") for record in records)
         for actual, expected in zip(target.get_paths(), paths_before):
             np.testing.assert_array_equal(actual.vertices, expected)
-        np.testing.assert_array_equal(target.get_offsets(), offsets_before)
-        assert tracker.calls == []
+
+        target.set_offsets(offsets_before)
+        for record in records:
+            exec(f"target{record.command}", {"target": target, "np": np})
+        fig.canvas.draw()
+        np.testing.assert_allclose(target.get_offsets(), moved_offsets)
+        _assert_px_close(_bounds(adapter.selection_points()), moved_bounds)
     finally:
         plt.close(fig)
 

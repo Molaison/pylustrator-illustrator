@@ -1195,6 +1195,15 @@ class ChangeTracker:
     def sorted_changes(self):
         """sort the changes by their priority. For example setting to logscale needs to be executed before xlim."""
 
+        def command_dependency_priority(reference_command):
+            """Order object-producing commands before commands that consume them."""
+
+            if reference_command == ".legend":
+                return "0"
+            if reference_command.startswith(".get_legend"):
+                return "2"
+            return "1"
+
         def getRef(obj):
             try:
                 return getReference(obj)
@@ -1209,7 +1218,7 @@ class ChangeTracker:
         for reference_obj, reference_command in self.changes:
             try:
                 if isinstance(reference_obj, Figure):
-                    obj_indices = ("", "", "", "")
+                    obj_indices = ("", "", "", "", "")
                 else:
                     if getattr(
                         reference_obj, "axes", None
@@ -1244,10 +1253,17 @@ class ChangeTracker:
                             getRef(reference_obj.axes),
                             getRef(reference_obj),
                             index,
+                            command_dependency_priority(reference_command),
                             reference_command,
                         )
                     else:
-                        obj_indices = (getRef(reference_obj), "", "", reference_command)
+                        obj_indices = (
+                            getRef(reference_obj),
+                            "",
+                            "",
+                            command_dependency_priority(reference_command),
+                            reference_command,
+                        )
                 indices.append(
                     [
                         (reference_obj, reference_command),

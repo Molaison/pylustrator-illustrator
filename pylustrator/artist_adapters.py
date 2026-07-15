@@ -1702,7 +1702,29 @@ class LegendAdapter(ArtistAdapter):
             )
 
     def serialize_changes(self):
-        return (ChangeRecord.legend_change(self.target),)
+        frame = self.target.get_frame()
+        frame_properties = {
+            "linewidth": float(frame.get_linewidth()),
+            "edgecolor": tuple(float(value) for value in frame.get_edgecolor()),
+            "facecolor": tuple(float(value) for value in frame.get_facecolor()),
+            "alpha": frame.get_alpha(),
+        }
+        frame_command = (
+            ".get_frame().set("
+            + ", ".join(
+                f"{name}={replay_literal(value)}"
+                for name, value in frame_properties.items()
+            )
+            + ")"
+        )
+        frame_target = self.target
+        if self.target.axes is not None and self.target.axes.get_legend() is self.target:
+            frame_target = self.target.axes
+            frame_command = ".get_legend()" + frame_command
+        return (
+            ChangeRecord.legend_change(self.target),
+            ChangeRecord.command_change(frame_target, frame_command),
+        )
 
     def set_frame_on(self, visible: bool) -> bool:
         """Toggle the legend frame without replacing the Legend object."""
@@ -2154,15 +2176,11 @@ class CollectionAdapter(ArtistAdapter):
 
     @classmethod
     def capabilities_for(cls, target) -> ArtistCapabilities:
-        if isinstance(target, (LineCollection, PolyCollection)) and getattr(
-            target, "_offsets", None
-        ) is not None:
-            # These collections render path x offset combinations in two
-            # coordinate systems.  Treating only the base paths as geometry
-            # produces selection boxes at the origin and lossy transforms.
-            # Deny until an adapter models the renderer iterator explicitly.
-            return ArtistCapabilities()
-        if isinstance(target, PathCollection):
+        has_rendered_offsets = isinstance(target, PathCollection) or (
+            isinstance(target, (LineCollection, PolyCollection))
+            and getattr(target, "_offsets", None) is not None
+        )
+        if has_rendered_offsets:
             groups = [target.get_offsets()]
         elif isinstance(target, LineCollection):
             groups = [path.vertices for path in target.get_paths()]
@@ -2175,7 +2193,15 @@ class CollectionAdapter(ArtistAdapter):
     def local_groups(self) -> list[np.ndarray]:
         return []
 
+    def uses_rendered_offsets(self) -> bool:
+        return isinstance(self.target, PathCollection) or (
+            isinstance(self.target, (LineCollection, PolyCollection))
+            and getattr(self.target, "_offsets", None) is not None
+        )
+
     def group_transform(self) -> Transform:
+        if self.uses_rendered_offsets():
+            return self.target.get_offset_transform()
         return self.target.get_transform()
 
     def native_control_points(self):
@@ -2193,12 +2219,109 @@ class CollectionAdapter(ArtistAdapter):
         return [np.asarray(transform.transform(point), dtype=float) for point in points]
 
     def display_groups(self) -> list[np.ndarray]:
+        if self.uses_rendered_offsets():
+            return self._rendered_offset_groups()
         transform = self.group_transform()
         return [
             self.finite_points(transform.transform(group))
             for group in self.local_groups()
             if len(group)
         ]
+
+    @staticmethod
+    def _rendered_item_count(offsets, paths, transforms) -> int:
+        """Match ``RendererBase._iter_collection`` item-count semantics."""
+
+        return max(len(offsets), len(paths), len(transforms))
+
+    def _prepared_offset_items(self):
+        transform, offset_transform, offsets, paths = self.target._prepare_points()
+        offsets = self.point_array(offsets)
+        transforms = np.asarray(self.target.get_transforms(), dtype=float)
+        count = self._rendered_item_count(offsets, paths, transforms)
+        return transform, offset_transform, offsets, paths, transforms, count
+
+    def _rendered_offset_groups(self) -> list[np.ndarray]:
+        """Return every rendered path envelope at its cycled display offset."""
+
+        (
+            transform,
+            offset_transform,
+            offsets,
+            paths,
+            transforms,
+            count,
+        ) = self._prepared_offset_items()
+        if count == 0 or not len(offsets) or not len(paths):
+            return []
+
+        groups = []
+        for index in range(count):
+            offset = offsets[index % len(offsets)]
+            if not np.all(np.isfinite(offset)):
+                continue
+            path_transform = transform
+            if len(transforms):
+                item_transform = transforms[index % len(transforms)]
+                if not np.all(np.isfinite(item_transform)):
+                    continue
+                path_transform = Affine2D(item_transform) + transform
+            path = paths[index % len(paths)]
+            path_bounds = np.asarray(
+                path.get_extents(path_transform).get_points(), dtype=float
+            )
+            offset = np.asarray(offset_transform.transform(offset), dtype=float)
+            if np.all(np.isfinite(path_bounds)) and np.all(np.isfinite(offset)):
+                groups.append(path_bounds + offset)
+        return groups
+
+    def _rendered_offset_selection_points(self) -> np.ndarray:
+        """Union path x offset items through Matplotlib's C renderer iterator."""
+
+        (
+            transform,
+            offset_transform,
+            offsets,
+            paths,
+            transforms,
+            count,
+        ) = self._prepared_offset_items()
+        if count == 0 or not len(offsets) or not len(paths):
+            return np.empty((0, 2), dtype=float)
+
+        item_indices = np.arange(count)
+        paddings = self.selection_paddings(count)
+        item_offsets = offsets[item_indices % len(offsets)]
+        valid_items = np.all(np.isfinite(item_offsets), axis=1) & np.isfinite(paddings)
+        if len(transforms):
+            item_transforms = transforms[item_indices % len(transforms)]
+            valid_items &= np.all(np.isfinite(item_transforms), axis=(1, 2))
+        item_indices = item_indices[valid_items]
+        paddings = paddings[valid_items]
+        if not len(item_indices):
+            return np.empty((0, 2), dtype=float)
+
+        envelopes = []
+        for padding in np.unique(paddings):
+            indices = item_indices[paddings == padding]
+            item_paths = [paths[index % len(paths)] for index in indices]
+            item_transforms = (
+                transforms[indices % len(transforms)] if len(transforms) else []
+            )
+            item_offsets = offsets[indices % len(offsets)]
+            bounds = get_path_collection_extents(
+                transform,
+                item_paths,
+                item_transforms,
+                item_offsets,
+                offset_transform,
+            )
+            points = np.asarray(bounds.get_points(), dtype=float)
+            if np.all(np.isfinite(points)):
+                envelopes.append(self.bounds_points(points, padding=float(padding)))
+        if envelopes:
+            return self.bounds_points(np.concatenate(envelopes))
+        return np.empty((0, 2), dtype=float)
 
     @staticmethod
     def _cycle_values(values, count: int, *, default: float = 0.0) -> np.ndarray:
@@ -2239,6 +2362,8 @@ class CollectionAdapter(ArtistAdapter):
         preview = self._preview_points("_pylustrator_preview_selection_points")
         if preview is not None:
             return preview
+        if self.uses_rendered_offsets():
+            return self._rendered_offset_selection_points()
         groups = self.display_groups()
         if groups:
             envelopes = [
@@ -2259,95 +2384,18 @@ class CollectionAdapter(ArtistAdapter):
             start += length
         return groups
 
+    def serialize_offset_change(self) -> ChangeRecord:
+        offsets = [
+            [float(x), float(y)] for x, y in self.point_array(self.target.get_offsets())
+        ]
+        return ChangeRecord.command_change(
+            self.target, f".set_offsets({replay_literal(offsets)})"
+        )
+
 
 class PathCollectionAdapter(CollectionAdapter):
     def local_groups(self):
         return [self.point_array(self.target.get_offsets())]
-
-    def group_transform(self) -> Transform:
-        return self.target.get_offset_transform()
-
-    @staticmethod
-    def _rendered_item_count(offsets, paths, transforms) -> int:
-        """Match ``RendererBase._iter_collection`` item-count semantics.
-
-        Paths and per-path transforms jointly identify marker geometry, while
-        offsets identify instances.  Paint arrays are cycled over those items;
-        extra colors or linewidths do not create additional rendered markers.
-        """
-
-        return max(len(offsets), len(paths), len(transforms))
-
-    def display_groups(self) -> list[np.ndarray]:
-        """Return each rendered marker envelope at its own display offset."""
-
-        transform, offset_transform, offsets, paths = self.target._prepare_points()
-        offsets = self.point_array(offsets)
-        transforms = np.asarray(self.target.get_transforms(), dtype=float)
-        count = self._rendered_item_count(offsets, paths, transforms)
-        if count == 0 or not len(offsets) or not len(paths):
-            return []
-
-        groups = []
-        for index in range(count):
-            path = paths[index % len(paths)]
-            marker_transform = transform
-            if len(transforms):
-                marker_transform = Affine2D(transforms[index % len(transforms)]) + transform
-            marker_bounds = np.asarray(
-                path.get_extents(marker_transform).get_points(), dtype=float
-            )
-            offset = np.asarray(
-                offset_transform.transform(offsets[index % len(offsets)]), dtype=float
-            )
-            groups.append(marker_bounds + offset)
-        return groups
-
-    def selection_points(self) -> np.ndarray:
-        """Union per-item marker envelopes through Matplotlib's C path iterator."""
-
-        preview = self._preview_points("_pylustrator_preview_selection_points")
-        if preview is not None:
-            return preview
-        transform, offset_transform, offsets, paths = self.target._prepare_points()
-        offsets = self.point_array(offsets)
-        transforms = np.asarray(self.target.get_transforms(), dtype=float)
-        count = self._rendered_item_count(offsets, paths, transforms)
-        if count == 0 or not len(offsets) or not len(paths):
-            return super().selection_points()
-
-        item_indices = np.arange(count)
-        paddings = self.selection_paddings(count)
-        item_offsets = offsets[item_indices % len(offsets)]
-        valid_items = np.all(np.isfinite(item_offsets), axis=1) & np.isfinite(paddings)
-        if len(transforms):
-            item_transforms = transforms[item_indices % len(transforms)]
-            valid_items &= np.all(np.isfinite(item_transforms), axis=(1, 2))
-        item_indices = item_indices[valid_items]
-        paddings = paddings[valid_items]
-        if not len(item_indices):
-            return np.empty((0, 2), dtype=float)
-        envelopes = []
-        for padding in np.unique(paddings):
-            indices = item_indices[paddings == padding]
-            item_paths = [paths[index % len(paths)] for index in indices]
-            item_transforms = (
-                transforms[indices % len(transforms)] if len(transforms) else []
-            )
-            item_offsets = offsets[indices % len(offsets)]
-            bounds = get_path_collection_extents(
-                transform,
-                item_paths,
-                item_transforms,
-                item_offsets,
-                offset_transform,
-            )
-            points = np.asarray(bounds.get_points(), dtype=float)
-            if np.all(np.isfinite(points)):
-                envelopes.append(self.bounds_points(points, padding=float(padding)))
-        if envelopes:
-            return self.bounds_points(np.concatenate(envelopes))
-        return super().selection_points()
 
     def _apply_native_control_points(self, points) -> None:
         groups = self.split_points(points)
@@ -2355,43 +2403,51 @@ class PathCollectionAdapter(CollectionAdapter):
         self.target.set_offsets(offsets)
 
     def serialize_changes(self):
-        offsets = [
-            [float(x), float(y)] for x, y in self.point_array(self.target.get_offsets())
-        ]
-        return (
-            ChangeRecord.command_change(
-                self.target, f".set_offsets({replay_literal(offsets)})"
-            ),
-        )
+        return (self.serialize_offset_change(),)
 
 
 class LineCollectionAdapter(CollectionAdapter):
     def local_groups(self):
+        if self.uses_rendered_offsets():
+            return [self.point_array(self.target.get_offsets())]
         # ``get_segments()`` drops masked and non-finite rows, which are
         # meaningful path separators.  Transform the authoritative Path
         # vertices so a zero-delta edit cannot connect disjoint runs.
         return [self.point_array(path.vertices) for path in self.target.get_paths()]
 
     def _apply_native_control_points(self, points) -> None:
+        if self.uses_rendered_offsets():
+            groups = self.split_points(points)
+            self.target.set_offsets(groups[0] if groups else np.empty((0, 2)))
+            return
         self.target.set_segments(self.split_points(points))
 
     def serialize_changes(self):
         groups = [
-            [[float(x), float(y)] for x, y in group]
-            for group in self.local_groups()
+            [[float(x), float(y)] for x, y in self.point_array(path.vertices)]
+            for path in self.target.get_paths()
         ]
-        return (
+        records = [
             ChangeRecord.command_change(
                 self.target, f".set_segments({replay_literal(groups)})"
-            ),
-        )
+            )
+        ]
+        if self.uses_rendered_offsets():
+            records.append(self.serialize_offset_change())
+        return tuple(records)
 
 
 class PolyCollectionAdapter(CollectionAdapter):
     def local_groups(self):
+        if self.uses_rendered_offsets():
+            return [self.point_array(self.target.get_offsets())]
         return [self.point_array(path.vertices) for path in self.target.get_paths()]
 
     def _apply_native_control_points(self, points) -> None:
+        if self.uses_rendered_offsets():
+            groups = self.split_points(points)
+            self.target.set_offsets(groups[0] if groups else np.empty((0, 2)))
+            return
         codes = [path.codes for path in self.target.get_paths()]
         self.target.set_verts_and_codes(self.split_points(points), codes)
 
@@ -2405,13 +2461,16 @@ class PolyCollectionAdapter(CollectionAdapter):
             None if path.codes is None else [int(code) for code in path.codes]
             for path in paths
         ]
-        return (
+        records = [
             ChangeRecord.command_change(
                 self.target,
                 f".set_verts_and_codes({replay_literal(groups)}, "
                 f"{replay_literal(codes)})",
-            ),
-        )
+            )
+        ]
+        if self.uses_rendered_offsets():
+            records.append(self.serialize_offset_change())
+        return tuple(records)
 
 
 artist_adapter_registry = ArtistAdapterRegistry()

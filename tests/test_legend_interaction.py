@@ -19,6 +19,9 @@ class ChangeTracker:
     def addEdit(self, edit):
         self.edit = edit
 
+    def addChange(self, target, command):
+        self.command = (target, command)
+
     def addNewLegendChange(self, target):
         self.legend = target
 
@@ -444,6 +447,7 @@ def test_extra_axes_legend_saved_move_reopens_on_same_artist() -> None:
 
     assert saved_lines == [
         "plt.figure(1).axes[0].artists[0]._set_loc(1)",
+        "plt.figure(1).axes[0].artists[0].get_frame().set(linewidth=1.0, edgecolor=(0.8, 0.8, 0.8, 0.8), facecolor=(1.0, 1.0, 1.0, 0.8), alpha=0.8)",
         "plt.figure(1).axes[0].artists[0].set_bbox_to_anchor((0.8525000000000001, 0.7796666666666668), transform=plt.figure(1).transFigure)",
     ]
     assert ax.get_legend() is current
@@ -557,6 +561,57 @@ def test_axes_legend_move_records_change_without_transfigure_error() -> None:
     assert commands[0][1].startswith(".legend(")
     assert "bbox_to_anchor=" in commands[0][1]
     plt.close(fig)
+
+
+def test_axes_legend_frame_style_replays_after_legend_creation() -> None:
+    from pylustrator.artist_adapters import get_artist_adapter
+    from pylustrator.change_tracker import ChangeTracker
+
+    def make_figure(*, with_legend):
+        fig, ax = plt.subplots(num=1, clear=True, figsize=(4, 3), dpi=100)
+        ax.plot([0, 1], [0, 1], label="line")
+        legend = ax.legend(frameon=True) if with_legend else None
+        fig.canvas.draw()
+        return fig, ax, legend
+
+    plt.close("all")
+    fig, ax, legend = make_figure(with_legend=True)
+    tracker = ChangeTracker.__new__(ChangeTracker)
+    tracker.figure = fig
+    tracker.changes = {}
+    tracker.saved = True
+    tracker.no_save = False
+    tracker.changeCountChanged = lambda: None
+    fig.change_tracker = tracker
+    legend.get_frame().set(
+        linewidth=0.5,
+        edgecolor=(0.2, 0.3, 0.4, 0.7),
+        facecolor=(0.8, 0.7, 0.6, 0.4),
+        alpha=0.6,
+    )
+    get_artist_adapter(legend).record_changes()
+    saved_lines = tracker.sorted_changes()
+
+    legend_index = next(
+        index for index, line in enumerate(saved_lines) if ".legend(" in line
+    )
+    frame_index = next(
+        index for index, line in enumerate(saved_lines) if ".get_legend().get_frame()" in line
+    )
+    assert legend_index < frame_index
+
+    plt.close(fig)
+    fig2, ax2, _ = make_figure(with_legend=False)
+    for line in saved_lines:
+        exec(line)
+    fig2.canvas.draw()
+
+    replayed_frame = ax2.get_legend().get_frame()
+    assert replayed_frame.get_linewidth() == 0.5
+    assert np.allclose(replayed_frame.get_edgecolor(), (0.2, 0.3, 0.4, 0.6))
+    assert np.allclose(replayed_frame.get_facecolor(), (0.8, 0.7, 0.6, 0.6))
+    assert replayed_frame.get_alpha() == 0.6
+    plt.close(fig2)
 
 
 def test_figure_level_legend_saved_move_reopens_without_duplicate_legend() -> None:

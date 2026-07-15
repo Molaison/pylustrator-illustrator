@@ -58,8 +58,8 @@ denial contract passes.
 | `Polygon` | `PolygonAdapter` | S M Z N C | Visible-stroke bounds; fixed-stroke vertex M/Z; preview/commit; N; `.set_xy` replay | **PASS** | R is explicitly unsupported. |
 | `PathPatch` | `PathPatchAdapter` | S M Z N C | Visible-stroke bounds; fixed-stroke path/codes M/Z; preview/commit; N; `Path` replay | **PASS** | R is explicitly unsupported. |
 | `PathCollection` | `PathCollectionAdapter` | S M N C | Renderer item-count semantics; per-item marker-path/size/stroke envelopes; masked offsets; affine/log offset M; N; `.set_offsets` replay | **PASS** | Z and appearance scaling are explicitly denied. |
-| `LineCollection` | `LineCollectionAdapter` | S M N C without explicit offsets | Per-segment linewidth envelopes; NaN path-break preservation; affine/log multi-segment M; N; `.set_segments` replay | **PASS** | Z and appearance scaling are denied. Explicit `offsets`/`transOffset` dynamically deny editing until path x offset renderer semantics are modeled. |
-| `PolyCollection` | `PolyCollectionAdapter` | S M N C without explicit offsets | Per-polygon visible-edge envelopes; affine/log multi-path M; N; `.set_verts_and_codes` replay | **PASS** | Invisible edges add no padding. Z and appearance scaling are denied. Explicit `offsets`/`transOffset` dynamically deny editing. |
+| `LineCollection` | `LineCollectionAdapter` | S M N C | Per-segment linewidth envelopes; NaN path-break preservation; affine/log multi-segment and explicit-offset M; N; path/offset replay | **PASS** | Z and appearance scaling are denied. Explicit offsets use the shared renderer path x offset iterator and translate offsets without rewriting paths. |
+| `PolyCollection` | `PolyCollectionAdapter` | S M N C | Per-polygon visible-edge envelopes; affine/log multi-path and explicit-offset M; N; path/offset replay | **PASS** | Invisible edges add no padding. Z and appearance scaling are denied. |
 
 Patch adapters share one common-stroke envelope implementation. Resizable
 patches additionally separate transformable geometry from fixed display-space
@@ -152,15 +152,16 @@ round-trip `repr`; transaction undo restores the captured change-recording
 state instead of relying on lossy source canonicalization. New generated blocks
 also qualify non-finite values as `np.nan`/`np.inf` and import NumPy.
 
-### Ambiguous public transforms and offset collections fail safely
+### Ambiguous transforms fail safely; offset collections follow the renderer
 
 The legacy `apply_display_transform()` entrypoint accepts pure translation
 matrices only. Scale/shear/rotation matrices must enter through a semantic
 operation and its capability preflight. LineCollection and PolyCollection with
-explicit `offsets`/`transOffset` now dynamically deny editing: their rendered
-path x offset product was previously ignored, yielding selection boxes near the
-origin. Denial preserves geometry and generated state until a renderer-faithful
-adapter exists.
+explicit `offsets`/`transOffset` now use the same path x offset item-count and
+extent model as Matplotlib's renderer. Translation mutates and serializes the
+offset controls while preserving base paths; ordinary collections continue to
+edit their path vertices. This closes the former origin-centered selection box
+without reducing the 483-object Fig2 editable inventory.
 
 ## P1/P2 findings fixed after the independent audit
 
@@ -220,8 +221,6 @@ Explicitly unsupported and tested:
 - Line2D resize without affine preflight;
 - FancyArrowPatch, FancyBboxPatch, RegularPolygon, and Wedge resize;
 - resize and appearance scaling for all three collection adapters;
-- every edit operation on LineCollection/PolyCollection instances with explicit
-  offsets, pending a renderer-faithful path x offset model;
 - rotation for every type without a native, saveable angle property;
 - point editing, appearance scaling, and layout reflow wherever no executor
   exists.
@@ -263,7 +262,7 @@ that all 20 built-in registrations are present in the matrix.
 
 ## Real Fig2 audit appendix
 
-A second audit at `447f76c` builds the disposable fork through
+A second audit on the long-term refactor worktree builds the disposable fork through
 `figure_workflow/validation/fig2_pylustrator_ab/fig2_fork_common.py`. The formal
 `editable/fig2.py` remained byte-identical before and after the audit at
 SHA-256
@@ -358,7 +357,7 @@ The visible-bounds follow-up repeats the same 6,279 exhaustive checks and 70
 representative workflows in
 `artifacts/adapter_p1_visible_bounds_contract.json`: all 483/483 references
 resolve, all operations/replays pass, and the formal Fig2 hash is unchanged.
-The final full headless suite reports 549 passed, 119 explicit
+The final full headless suite reports 550 passed, 119 explicit
 capability-branch skips, no xfails, four pre-existing log-limit warnings, and
 two expected masked-array conversion warnings. Ruff passes.
 
