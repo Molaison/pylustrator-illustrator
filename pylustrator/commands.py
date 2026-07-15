@@ -11,6 +11,7 @@ import numpy as np
 from matplotlib.artist import Artist
 
 from .editor_model import EditorGroup, EditorScene
+from .legend_replay import axes_handles_reproduce_legend
 
 
 GENERATED_STATE_VERSION = 2
@@ -189,10 +190,13 @@ def install_legacy_legend_replay_compatibility(figure) -> None:
 
         def compatible(self, legend_handler_map=None, _original=original):
             handles, labels = _original(legend_handler_map)
-            if handles:
-                return handles, labels
             legend = self.get_legend()
-            proxies = list(getattr(legend, "legend_handles", [])) if legend else []
+            if legend is None:
+                return handles, labels
+            reproduces = axes_handles_reproduce_legend(legend, handles, labels)
+            if reproduces is not False:
+                return handles, labels
+            proxies = list(getattr(legend, "legend_handles", []))
             if not proxies:
                 return handles, labels
             proxy_labels = [text.get_text() for text in legend.get_texts()]

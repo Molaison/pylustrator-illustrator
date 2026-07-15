@@ -29,7 +29,7 @@ from matplotlib.patches import (
     Wedge,
 )
 from matplotlib.text import Annotation, Text
-from matplotlib.transforms import IdentityTransform
+from matplotlib.transforms import Affine2D, IdentityTransform, Transform
 
 from pylustrator.artist_adapters import (
     AnnotationAdapter,
@@ -1795,6 +1795,159 @@ def test_offset_line_and_poly_collections_follow_renderer_items_and_replay(kind)
         fig.canvas.draw()
         np.testing.assert_allclose(target.get_offsets(), moved_offsets)
         _assert_px_close(_bounds(adapter.selection_points()), moved_bounds)
+    finally:
+        plt.close(fig)
+
+
+@pytest.mark.parametrize("kind", ["path", "line", "poly"])
+@pytest.mark.parametrize("path_state", ["empty", "nan"])
+def test_offset_collections_with_no_finite_paths_deny_editing(
+    kind, path_state
+) -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    fig.change_tracker = RecordingChangeTracker()
+    kwargs = {"offsets": [[0.2, 0.3]], "offset_transform": ax.transData}
+    paths = [] if path_state == "empty" else [[[np.nan, np.nan], [np.nan, np.nan]]]
+    if kind == "path":
+        path_objects = [] if not paths else [Path(paths[0])]
+        target = PathCollection(path_objects, **kwargs)
+    elif kind == "line":
+        target = LineCollection(paths, **kwargs)
+    else:
+        target = PolyCollection(paths, **kwargs)
+    ax.add_collection(target)
+    fig.canvas.draw()
+    adapter = get_artist_adapter(target)
+
+    try:
+        assert not adapter.capabilities.can_select
+        assert not adapter.capabilities.can_translate
+        assert not adapter.capabilities.can_snapshot
+        assert not adapter.capabilities.can_serialize
+        assert adapter.selection_points().shape == (0, 2)
+        with pytest.raises(UnsupportedArtistError):
+            adapter.translate(TRANSLATION)
+    finally:
+        plt.close(fig)
+
+
+@pytest.mark.parametrize("kind", ["line", "poly"])
+def test_empty_explicit_offsets_translate_base_paths(kind) -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    fig.change_tracker = RecordingChangeTracker()
+    paths = [
+        [[0.2, 0.2], [0.4, 0.45]],
+        [[0.6, 0.55], [0.8, 0.8]],
+    ]
+    if kind == "line":
+        target = LineCollection(paths, offsets=np.empty((0, 2)))
+    else:
+        polygons = [
+            [path[0], path[1], [path[0][0], path[1][1]]]
+            for path in paths
+        ]
+        target = PolyCollection(polygons, offsets=np.empty((0, 2)))
+    ax.add_collection(target, autolim=False)
+    fig.canvas.draw()
+    adapter = get_artist_adapter(target)
+    paths_before = [path.vertices.copy() for path in target.get_paths()]
+    bounds_before = _bounds(adapter.selection_points())
+
+    try:
+        assert adapter.capabilities.editable
+        assert not adapter.uses_rendered_offsets()
+        adapter.translate(TRANSLATION)
+        fig.canvas.draw()
+        _assert_px_close(
+            _bounds(adapter.selection_points()),
+            bounds_before + np.tile(TRANSLATION, 2),
+        )
+        assert np.asarray(target._offsets).shape == (0, 2)
+        assert all(
+            not np.array_equal(path.vertices, before)
+            for path, before in zip(target.get_paths(), paths_before)
+        )
+        assert all(
+            not record.command.startswith(".set_offsets")
+            for record in adapter.serialize_changes()
+        )
+    finally:
+        plt.close(fig)
+
+
+@pytest.mark.parametrize("kind", ["path", "line", "poly"])
+def test_singular_collection_offset_transform_fails_capability_preflight(kind) -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    tracker = RecordingChangeTracker()
+    fig.change_tracker = tracker
+    singular = Affine2D().scale(0.0, 2.0).translate(120.0, 40.0)
+    kwargs = {
+        "offsets": [[0.2, 0.3], [0.7, 0.8]],
+        "offset_transform": singular,
+        "transform": IdentityTransform(),
+    }
+    if kind == "path":
+        target = PathCollection([Path.unit_circle()], sizes=[36], **kwargs)
+    elif kind == "line":
+        target = LineCollection([[[-4.0, 0.0], [4.0, 0.0]]], **kwargs)
+    else:
+        target = PolyCollection(
+            [[[-4.0, -2.0], [4.0, -2.0], [4.0, 2.0], [-4.0, 2.0]]],
+            **kwargs,
+        )
+    ax.add_collection(target)
+    fig.canvas.draw()
+    adapter = get_artist_adapter(target)
+
+    try:
+        assert adapter.capabilities.can_select
+        assert not adapter.capabilities.can_translate
+        assert not adapter.capabilities.can_snapshot
+        assert adapter.capabilities.can_serialize
+        assert len(adapter.selection_points())
+        with pytest.raises(UnsupportedArtistError):
+            adapter.translate(TRANSLATION)
+        with pytest.raises(UnsupportedArtistError):
+            adapter.snapshot()
+        adapter.record_changes()
+        assert tracker.calls
+    finally:
+        plt.close(fig)
+
+
+def test_forward_only_collection_transform_fails_capability_preflight() -> None:
+    class ForwardOnlyTransform(Transform):
+        input_dims = 2
+        output_dims = 2
+        is_separable = True
+        has_inverse = False
+
+        def transform_non_affine(self, values):
+            return np.asarray(values, dtype=float) + [120.0, 40.0]
+
+        def inverted(self):
+            raise NotImplementedError("forward-only QA transform")
+
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    fig.change_tracker = RecordingChangeTracker()
+    target = PathCollection(
+        [Path.unit_circle()],
+        sizes=[36],
+        offsets=[[0.2, 0.3]],
+        offset_transform=ForwardOnlyTransform(),
+        transform=IdentityTransform(),
+    )
+    ax.add_collection(target)
+    fig.canvas.draw()
+    adapter = get_artist_adapter(target)
+
+    try:
+        assert adapter.capabilities.can_select
+        assert not adapter.capabilities.can_translate
+        assert not adapter.capabilities.can_snapshot
+        assert adapter.capabilities.can_serialize
+        with pytest.raises(UnsupportedArtistError):
+            adapter.translate(TRANSLATION)
     finally:
         plt.close(fig)
 

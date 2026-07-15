@@ -53,6 +53,11 @@ except ImportError:
 from .exception_swallower import Dummy
 from .jupyter_cells import open
 from .helper_functions import main_figure
+from .legend_replay import (
+    axes_handles_reproduce_legend,
+    frozen_legend_handles_code,
+    original_axes_legend_handles_labels,
+)
 from .replay import replay_literal
 
 
@@ -509,6 +514,17 @@ class ChangeTracker:
         self.saved = False
         self.changeCountChanged()
 
+    def addOwnedChange(
+        self,
+        command_obj: Artist,
+        command: str,
+        reference_obj: Artist,
+        reference_command: str = None,
+    ):
+        """Record a command whose logical owner differs from its call target."""
+
+        self.addChange(command_obj, command, reference_obj, reference_command)
+
     def capture_recording_state(self):
         """Snapshot generated-change bookkeeping for an atomic interaction."""
 
@@ -636,19 +652,18 @@ class ChangeTracker:
             parent = element.figure if element.axes is None else element.axes
             labels = [text.get_text() for text in element.get_texts()]
             if element.axes is not None and element.axes.get_legend() is element:
-                axes_handles, axes_labels = parent.get_legend_handles_labels()
-                if len(axes_handles) == len(labels) and list(axes_labels) == labels:
+                axes_handles, axes_labels = original_axes_legend_handles_labels(parent)
+                if axes_handles_reproduce_legend(
+                    element, axes_handles, axes_labels
+                ):
                     handles = CodeReference(
                         getReference(parent) + ".get_legend_handles_labels()[0]"
                     )
                 else:
-                    # Legends built from explicit proxy handles may have no
-                    # corresponding labelled artists on their Axes.  Resolve
-                    # the proxies before calling Axes.legend(), while the old
-                    # legend is still installed, so replay preserves contents.
-                    handles = CodeReference(
-                        getReference(element) + ".legend_handles"
-                    )
+                    # Explicit proxy handles may have no corresponding Axes
+                    # artists. Freeze each complete, single-glyph entry so the
+                    # creation command never references the Legend it creates.
+                    handles = CodeReference(frozen_legend_handles_code(element))
             else:
                 handles = CodeReference(getReference(element) + ".legend_handles")
 
@@ -881,16 +896,36 @@ class ChangeTracker:
         if not isinstance(desc_strings, list):
             desc_strings = [desc_strings]
 
+        def same_logical_owner(candidate):
+            if candidate is element:
+                return True
+            if not isinstance(candidate, Legend):
+                return False
+            if element.axes is not None and element.axes.get_legend() is element:
+                return (
+                    candidate.axes is element.axes
+                    and candidate not in element.axes.artists
+                )
+            if element.axes is None and element in element.figure.legends:
+                return (
+                    candidate.figure is element.figure
+                    and candidate not in element.figure.legends
+                    and candidate not in element.figure.artists
+                )
+            return False
+
         # make sure there are no old changes to this element
         keys = [k for k in self.changes]
         for reference_obj, reference_command in keys:
-            if reference_obj == element:
+            if same_logical_owner(reference_obj):
                 del self.changes[reference_obj, reference_command]
         # store the changes
         # if not element.get_visible() and getattr(element, "is_new_text", False):
         #    return
         for command_parent, command in desc_strings:
-            main_figure(element).change_tracker.addChange(command_parent, command)
+            main_figure(element).change_tracker.addChange(
+                command_parent, command, element
+            )
 
     def addNewAxesChange(self, element):
         desc_strings = self.get_describtion_string(element)
@@ -1121,6 +1156,17 @@ class ChangeTracker:
                 reference_obj = command_obj
                 reference_command = command
 
+                # Normalize commands addressed through the current Legend to
+                # the Axes call target while retaining the Legend as logical
+                # owner. This makes first-session and reloaded bookkeeping
+                # identical and keeps dependent commands valid after creation.
+                legend_suffix = ".get_legend()"
+                if command_obj.endswith(legend_suffix):
+                    reference_obj = command_obj
+                    reference_command = command
+                    command_obj = command_obj[: -len(legend_suffix)]
+                    command = legend_suffix + command
+
                 if (
                     command == ".set_xticks"
                     or command == ".set_yticks"
@@ -1157,6 +1203,15 @@ class ChangeTracker:
                     reference_command = ".new"
                     if command == ".text":
                         eval(reference_obj).is_new_text = True
+
+                # Axes.legend() creates the object targeted by later Legend
+                # commands. Keep its semantic owner separate from the Axes so
+                # a subsequent Axes serialization cannot discard it.
+                if command == ".legend":
+                    parent = eval(command_obj)
+                    if isinstance(parent, Axes) and parent.get_legend() is not None:
+                        reference_obj = command_obj + ".get_legend()"
+                        reference_command = ".legend"
 
                 command_obj = eval(command_obj)
                 reference_obj_str = reference_obj

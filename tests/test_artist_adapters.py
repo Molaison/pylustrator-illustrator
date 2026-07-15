@@ -62,6 +62,8 @@ def test_extension_contract_is_available_from_the_public_package() -> None:
     assert pylustrator.ArtistCapabilities is ArtistCapabilities
     assert pylustrator.register_artist_adapter is register_artist_adapter
     assert pylustrator.get_artist_adapter is get_artist_adapter
+    assert callable(pylustrator.register_legend_entry_serializer)
+    assert issubclass(pylustrator.UnsupportedLegendEntry, TypeError)
 
 
 def test_registry_resolves_matplotlib_subclasses_by_mro_specificity() -> None:

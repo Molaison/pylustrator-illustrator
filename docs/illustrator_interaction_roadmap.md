@@ -24,7 +24,7 @@ Implementation order follows architectural dependencies.
 
 Status (2026-07-15): implemented on
 ``refactor/artist-adapter-architecture``.  The P0 implementation is covered by
-549 passing tests, 119 explicit capability-branch skips, no xfails, Ruff, the
+568 passing tests, 119 explicit capability-branch skips, no xfails, Ruff, the
 full Fig2 interaction probe, and a read-only smoke replay of
 the unmodified formal Fig2.  The formal file retained SHA-256
 ``b0cd72abf3962cd6cd2354467ad57aa37ecc213332645d7cb56e6f4af598ad70``.
@@ -62,6 +62,18 @@ by quantizing persisted geometry. Ambiguous non-translation matrices fail
 capability preflight. Explicit-offset Line/PolyCollection now share a
 renderer-faithful path x offset extent model and translate offset controls
 without rewriting their base paths.
+
+The final persistence audit separated logical command ownership from call
+targets. Legend creation and frame commands now survive later Axes changes and
+normalize to the same keys after reload. Explicit single-glyph proxy entries
+freeze to self-contained replay specifications instead of referring to the
+Legend being created; composite handlers without a complete specification fail
+capability preflight. Collection preflight also rejects empty/all-nonfinite
+paths and singular move transforms, while empty-offset Line/PolyCollection
+edits its renderer-visible base paths.
+Legend property reconstruction uses the same source-handle specification, so
+`markerscale` is applied exactly once and semantic composite handlers are
+preserved or disabled before mutation.
 
 ### P0.1 Selection kernel
 
@@ -137,10 +149,12 @@ include common-case per-item stroke/marker envelopes. Geometry
 resize reapplies fixed display-space appearance outsets, so thick-stroke
 deferred previews, commits, groups, alignment, and numeric match-size agree.
 EditorGroup is also the single change-record owner for a group gesture.
-Selection actions share one immutable geometry snapshot, and PathCollection
-envelopes use Matplotlib's vectorized path iterator. On the five-run Fig2 probe,
-whole-canvas marquee improved from 125.6 ms to 61.9 ms; whole-selection move
-and undo remained subsecond with unchanged numerical error.
+Selection actions share one immutable geometry snapshot, and offset collections
+use Matplotlib's path iterator. On a recorded five-run Fig2 probe, whole-canvas
+marquee selects 364 targets in 70.5 ms median. This is slightly slower than the
+61.9 ms run before explicit-offset PolyCollection became editable, while still
+well below the earlier 125.6 ms adapter result; whole-selection move and undo
+remain subsecond with unchanged numerical error.
 
 Remaining feature work:
 

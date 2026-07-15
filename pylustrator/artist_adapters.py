@@ -250,10 +250,25 @@ class ChangeRecord:
     kind: str
     target: Artist
     command: Optional[str] = None
+    reference_target: Optional[Artist] = None
+    reference_command: Optional[str] = None
 
     @classmethod
-    def command_change(cls, target: Artist, command: str) -> ChangeRecord:
-        return cls("command", target, command)
+    def command_change(
+        cls,
+        target: Artist,
+        command: str,
+        *,
+        reference_target: Optional[Artist] = None,
+        reference_command: Optional[str] = None,
+    ) -> ChangeRecord:
+        return cls(
+            "command",
+            target,
+            command,
+            reference_target,
+            reference_command,
+        )
 
     @classmethod
     def text_change(cls, target: Text) -> ChangeRecord:
@@ -269,7 +284,16 @@ class ChangeRecord:
 
     def apply(self, tracker) -> None:
         if self.kind == "command":
-            tracker.addChange(self.target, self.command)
+            add_owned = getattr(tracker, "addOwnedChange", None)
+            if self.reference_target is not None and add_owned is not None:
+                add_owned(
+                    self.target,
+                    self.command,
+                    self.reference_target,
+                    self.reference_command,
+                )
+            else:
+                tracker.addChange(self.target, self.command)
         elif self.kind == "text":
             tracker.addNewTextChange(self.target)
         elif self.kind == "legend":
@@ -1632,6 +1656,29 @@ class LegendAdapter(ArtistAdapter):
         can_serialize=True,
     )
 
+    @classmethod
+    def capabilities_for(cls, target) -> ArtistCapabilities:
+        if target.axes is None or target.axes.get_legend() is not target:
+            return cls.default_capabilities
+
+        from .legend_replay import (
+            UnsupportedLegendEntry,
+            axes_handles_reproduce_legend,
+            frozen_legend_handles_code,
+            original_axes_legend_handles_labels,
+        )
+
+        axes_handles, axes_labels = original_axes_legend_handles_labels(target.axes)
+        if axes_handles_reproduce_legend(target, axes_handles, axes_labels):
+            return cls.default_capabilities
+        try:
+            frozen_legend_handles_code(target)
+        except UnsupportedLegendEntry:
+            # The entry remains selectable, but transforms and snapshots would
+            # need to emit a lossy creation command for this composite handler.
+            return ArtistCapabilities(can_select=True)
+        return cls.default_capabilities
+
     def __init__(self, target: Legend):
         super().__init__(target)
         if not hasattr(target, "_pylustrator_original_frameon"):
@@ -1717,13 +1764,17 @@ class LegendAdapter(ArtistAdapter):
             )
             + ")"
         )
-        frame_target = self.target
+        frame_record = ChangeRecord.command_change(self.target, frame_command)
         if self.target.axes is not None and self.target.axes.get_legend() is self.target:
-            frame_target = self.target.axes
-            frame_command = ".get_legend()" + frame_command
+            frame_record = ChangeRecord.command_change(
+                self.target.axes,
+                ".get_legend()" + frame_command,
+                reference_target=self.target,
+                reference_command=".get_frame",
+            )
         return (
             ChangeRecord.legend_change(self.target),
-            ChangeRecord.command_change(frame_target, frame_command),
+            frame_record,
         )
 
     def set_frame_on(self, visible: bool) -> bool:
@@ -1732,6 +1783,9 @@ class LegendAdapter(ArtistAdapter):
         visible = bool(visible)
         if self.target.get_frame_on() == visible:
             return False
+        support = self.operation_support(TransformOperation.SERIALIZE)
+        if not support.supported:
+            raise UnsupportedArtistError(support.reason)
         self.target.set_frame_on(visible)
         self.record_changes()
         self.invalidate_geometry_cache()
@@ -2176,28 +2230,51 @@ class CollectionAdapter(ArtistAdapter):
 
     @classmethod
     def capabilities_for(cls, target) -> ArtistCapabilities:
-        has_rendered_offsets = isinstance(target, PathCollection) or (
-            isinstance(target, (LineCollection, PolyCollection))
-            and getattr(target, "_offsets", None) is not None
-        )
+        paths = target.get_paths()
+        if not any(len(cls.finite_points(path.vertices)) for path in paths):
+            return ArtistCapabilities()
+
+        has_rendered_offsets = cls.target_uses_rendered_offsets(target)
         if has_rendered_offsets:
             groups = [target.get_offsets()]
-        elif isinstance(target, LineCollection):
-            groups = [path.vertices for path in target.get_paths()]
         else:
-            groups = [path.vertices for path in target.get_paths()]
+            groups = [path.vertices for path in paths]
         if not any(len(cls.finite_points(group)) for group in groups):
             return ArtistCapabilities()
+
+        transform = (
+            target.get_offset_transform()
+            if has_rendered_offsets
+            else target.get_transform()
+        )
+        if not getattr(transform, "has_inverse", True):
+            return ArtistCapabilities(can_select=True, can_serialize=True)
+        try:
+            transform.inverted()
+        except (
+            TypeError,
+            ValueError,
+            NotImplementedError,
+            RuntimeError,
+            np.linalg.LinAlgError,
+        ):
+            return ArtistCapabilities(can_select=True, can_serialize=True)
         return cls.default_capabilities
 
     def local_groups(self) -> list[np.ndarray]:
         return []
 
-    def uses_rendered_offsets(self) -> bool:
-        return isinstance(self.target, PathCollection) or (
-            isinstance(self.target, (LineCollection, PolyCollection))
-            and getattr(self.target, "_offsets", None) is not None
+    @classmethod
+    def target_uses_rendered_offsets(cls, target) -> bool:
+        if isinstance(target, PathCollection):
+            return True
+        offsets = getattr(target, "_offsets", None)
+        return isinstance(target, (LineCollection, PolyCollection)) and (
+            offsets is not None and len(cls.point_array(offsets)) > 0
         )
+
+    def uses_rendered_offsets(self) -> bool:
+        return self.target_uses_rendered_offsets(self.target)
 
     def group_transform(self) -> Transform:
         if self.uses_rendered_offsets():

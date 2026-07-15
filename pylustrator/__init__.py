@@ -49,6 +49,7 @@ from .artist_adapters import (
     register_artist_adapter,
 )
 from .interaction import HitCandidate, HitStack, SelectionKernel, SelectionMode
+from .legend_replay import UnsupportedLegendEntry, register_legend_entry_serializer
 from .editor_model import EditorGroup, EditorScene
 from .operations import OperationSupport, TransformIntent, TransformOperation
 from .transform_engine import TransformPlan, TransformPreflightError
@@ -87,6 +88,8 @@ __all__ = [
     "UnsupportedArtistError",
     "get_artist_adapter",
     "register_artist_adapter",
+    "UnsupportedLegendEntry",
+    "register_legend_entry_serializer",
     "HitCandidate",
     "HitStack",
     "SelectionKernel",

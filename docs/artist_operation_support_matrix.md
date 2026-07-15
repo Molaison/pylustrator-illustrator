@@ -45,7 +45,7 @@ denial contract passes.
 | `Axes` | `AxesAdapter` | S M Z N C | Bounds; M/Z; parent Figure size; N; real replay; nonuniform fixed-aspect preview/commit | **PASS** | R is explicitly unsupported. Fixed-aspect Axes advertise the `fixed_aspect` constraint and normalize preview/commit through the same native-space rule. |
 | `Text` | `TextAdapter` | S M R N C | Axes/data/figure/display transforms; visible text bounds; M; native R; complete N; real replay; explicit Undo/Redo bookkeeping | **PASS** | Geometry resize is correctly denied in favor of future appearance scaling. |
 | `Annotation` | `AnnotationAdapter` | S M R N C | Mixed data/axes endpoint coordinates; text and arrow-stroke bounds; two control points; M; R; complete N; real replay | **PASS** | Geometry resize is explicitly denied. |
-| `Legend` | `LegendAdapter` | S M N C | Visible handles/text/title union; `frameon=False/True`; M; identity preservation during live movement; N; real replay | **PASS** | Geometry resize and layout reflow are explicitly denied. Generated source replay may recreate an Axes legend, while live edits retain identity. |
+| `Legend` | `LegendAdapter` | S M N C | Visible handles/text/title union; `frameon=False/True`; M; logical-owner persistence; self-contained single-glyph proxy replay; N; real replay | **PASS** | Geometry resize and layout reflow are explicitly denied. Explicit composite handlers without a frozen entry specification remain selectable but dynamically deny transform/replay. |
 | `Line2D` | `Line2DAdapter` | S M N C | Data/log transforms; visible line, marker-path, and marker-edge bounds; M; N; real `.set_data` replay | **PASS** | Geometry resize is explicitly denied pending affine preflight. |
 | `AxesImage` | `AxesImageAdapter` | S M Z N C | M/Z preview/commit; extent replay; N; x/y viewport and Axes position invariance | **PASS** | R is explicitly unsupported. Moving or resizing the image does not autoscale the camera. |
 | `Rectangle` | `RectangleAdapter` | S M Z R N C | Visible-stroke bounds; fixed-stroke M/Z; R; rotated M; rotated-resize denial; N; replay | **PASS** | Z is only advertised at angles equivalent to 0 degrees modulo 360; a default `xy`-anchored 180-degree Rectangle is not equivalent and is denied. |
@@ -57,9 +57,9 @@ denial contract passes.
 | `Wedge` | `WedgeAdapter` | S M N C | Visible-stroke bounds; center M; preview/commit; N; `.set_center` replay | **PASS** | Z/R are explicitly unsupported. |
 | `Polygon` | `PolygonAdapter` | S M Z N C | Visible-stroke bounds; fixed-stroke vertex M/Z; preview/commit; N; `.set_xy` replay | **PASS** | R is explicitly unsupported. |
 | `PathPatch` | `PathPatchAdapter` | S M Z N C | Visible-stroke bounds; fixed-stroke path/codes M/Z; preview/commit; N; `Path` replay | **PASS** | R is explicitly unsupported. |
-| `PathCollection` | `PathCollectionAdapter` | S M N C | Renderer item-count semantics; per-item marker-path/size/stroke envelopes; masked offsets; affine/log offset M; N; `.set_offsets` replay | **PASS** | Z and appearance scaling are explicitly denied. |
-| `LineCollection` | `LineCollectionAdapter` | S M N C | Per-segment linewidth envelopes; NaN path-break preservation; affine/log multi-segment and explicit-offset M; N; path/offset replay | **PASS** | Z and appearance scaling are denied. Explicit offsets use the shared renderer path x offset iterator and translate offsets without rewriting paths. |
-| `PolyCollection` | `PolyCollectionAdapter` | S M N C | Per-polygon visible-edge envelopes; affine/log multi-path and explicit-offset M; N; path/offset replay | **PASS** | Invisible edges add no padding. Z and appearance scaling are denied. |
+| `PathCollection` | `PathCollectionAdapter` | S M N C | Renderer item-count semantics; per-item marker-path/size/stroke envelopes; masked offsets; affine/log offset M; empty-path and singular-transform preflight; N; `.set_offsets` replay | **PASS** | Z and appearance scaling are explicitly denied. A singular offset transform remains selectable/serializable but cannot be moved or snapshotted. |
+| `LineCollection` | `LineCollectionAdapter` | S M N C | Per-segment linewidth envelopes; NaN path-break preservation; affine/log multi-segment and explicit-offset M; empty-offset path M; N; path/offset replay | **PASS** | Z and appearance scaling are denied. Nonempty offsets translate without rewriting paths; an empty offset array edits base paths at the renderer's zero offset. |
+| `PolyCollection` | `PolyCollectionAdapter` | S M N C | Per-polygon visible-edge envelopes; affine/log multi-path and explicit-offset M; empty-offset path M; N; path/offset replay | **PASS** | Invisible edges add no padding. Z and appearance scaling are denied. |
 
 Patch adapters share one common-stroke envelope implementation. Resizable
 patches additionally separate transformable geometry from fixed display-space
@@ -163,6 +163,37 @@ offset controls while preserving base paths; ordinary collections continue to
 edit their path vertices. This closes the former origin-centered selection box
 without reducing the 483-object Fig2 editable inventory.
 
+Finite offsets no longer advertise editing when there is no finite path to
+paint. Conversely, an empty explicit offset array on LineCollection or
+PolyCollection uses the renderer's zero-offset path semantics and edits the
+base paths. A singular path/offset transform keeps finite selection and source
+serialization available but denies translation and snapshots during capability
+preflight, before any matrix inversion can fail.
+
+### Legend creation and dependent commands have stable logical ownership
+
+Current Axes Legend creation, frame style, and later Axes changes used to share
+the Axes as a coarse change-dictionary owner. An Axes serialization could
+therefore delete the Legend commands; save/load also parsed the same frame line
+under a different key. Creation and dependent commands now retain a logical
+Legend owner while addressing the Axes as their executable target, and the
+loader normalizes the same representation after reopening.
+
+Explicit proxy Legends no longer emit the self-dependent expression
+`ax.legend(handles=ax.get_legend().legend_handles, ...)`. A registry freezes
+complete single-glyph DrawingArea entries into self-contained Patch, Line2D,
+PathCollection, or LineCollection specifications. Composite handlers such as
+Errorbar and tuple entries are detected from all DrawingArea children and fail
+capability preflight until a complete handler specification exists.
+Frozen marker dimensions are normalized by `markerscale` before replay, and
+semantic Axes handles are reused only when their complete handler-glyph
+signature matches the current Legend; matching labels alone are insufficient.
+The property panel consumes the same unscaled source-handle resolver, so layout
+changes cannot double-apply `markerscale` or collapse semantic composites.
+When reconstruction is not lossless, non-frame controls are disabled before
+any object or widget state changes; an in-place replayable `frameon` remains
+available for non-current Axes and Figure Legends.
+
 ## P1/P2 findings fixed after the independent audit
 
 ### P1: visible bounds and transformable geometry are now separate
@@ -254,7 +285,7 @@ QT_QPA_PLATFORM=offscreen uv run pytest tests -q
 uv run ruff check .
 ```
 
-After the final independent follow-up, the dedicated contract file reports 404 passed,
+After the final independent follow-up, the dedicated contract file reports 416 passed,
 119 explicitly skipped branches, and no xfails. The skips are branch
 accounting, not missing Artist types: supported-operation tests skip denied
 types, while rejection tests skip supported types. Registry equality guarantees
@@ -357,7 +388,7 @@ The visible-bounds follow-up repeats the same 6,279 exhaustive checks and 70
 representative workflows in
 `artifacts/adapter_p1_visible_bounds_contract.json`: all 483/483 references
 resolve, all operations/replays pass, and the formal Fig2 hash is unchanged.
-The final full headless suite reports 550 passed, 119 explicit
+The final full headless suite reports 568 passed, 119 explicit
 capability-branch skips, no xfails, four pre-existing log-limit warnings, and
 two expected masked-array conversion warnings. Ruff passes.
 

@@ -36,7 +36,11 @@ from matplotlib.artist import Artist
 from matplotlib.figure import Figure
 from matplotlib.ticker import AutoLocator
 
-from pylustrator.artist_adapters import get_artist_adapter, suspend_change_recording
+from pylustrator.artist_adapters import (
+    UnsupportedArtistError,
+    get_artist_adapter,
+    suspend_change_recording,
+)
 from pylustrator.change_tracker import getReference
 from pylustrator.QLinkableWidgets import (
     QColorWidget,
@@ -47,6 +51,10 @@ from pylustrator.QLinkableWidgets import (
     ComboWidget,
 )
 from pylustrator.helper_functions import main_figure
+from pylustrator.legend_replay import (
+    UnsupportedLegendEntry,
+    replayable_legend_handles,
+)
 from pylustrator.change_tracker import UndoRedo, add_text_default, add_axes_default
 
 
@@ -542,10 +550,21 @@ class LegendPropertiesWidget(QtWidgets.QWidget):
         if self.target is None:
             return
 
+        target = self.target
+        adapter = get_artist_adapter(target)
+        if self.properties.get(name) != value:
+            serialization = adapter.operation_support("serialize")
+            if not serialization.supported:
+                raise UnsupportedArtistError(serialization.reason)
+            if name != "frameon":
+                try:
+                    replayable_legend_handles(target)
+                except UnsupportedLegendEntry as exc:
+                    raise UnsupportedArtistError(str(exc)) from exc
+
         old_properties = self.properties.copy()
         self.properties[name] = value
         new_properties = self.properties.copy()
-        target = self.target
 
         # Frame visibility is an appearance property.  Reconstructing a
         # Legend for it changes object identity, discards direct edits to its
@@ -554,7 +573,6 @@ class LegendPropertiesWidget(QtWidgets.QWidget):
             if old_properties[name] == new_properties[name]:
                 return
             fig = main_figure(target)
-            adapter = get_artist_adapter(target)
 
             def setFrameOn(visible):
                 adapter.set_frame_on(visible)
@@ -575,7 +593,7 @@ class LegendPropertiesWidget(QtWidgets.QWidget):
 
         def setProperties(properties):
             nonlocal target
-            handles = target.legend_handles
+            handles = replayable_legend_handles(target)
             labels = [text.get_text() for text in target.get_texts()]
             legend_state = get_artist_adapter(target).snapshot()
             axes = target.axes
@@ -589,7 +607,7 @@ class LegendPropertiesWidget(QtWidgets.QWidget):
                 target = axes.get_legend()
             with suspend_change_recording():
                 get_artist_adapter(target).restore(legend_state)
-            fig.change_tracker.addNewLegendChange(target)
+            get_artist_adapter(target).record_changes()
             fig.figure_dragger.make_draggable(target)
             fig.figure_dragger.select_element(target)
             fig.canvas.draw()
@@ -614,6 +632,15 @@ class LegendPropertiesWidget(QtWidgets.QWidget):
                 self.target_list = []
             else:
                 self.target_list = [element]
+        serialization = get_artist_adapter(element).operation_support("serialize")
+        try:
+            replayable_legend_handles(element)
+        except UnsupportedLegendEntry as exc:
+            reconstruction_supported = False
+            reconstruction_reason = str(exc)
+        else:
+            reconstruction_supported = True
+            reconstruction_reason = None
         self.target = None
         for name, name2, type_, default_, icon in self.property_names:
             if name2 == "frameon":
@@ -632,6 +659,15 @@ class LegendPropertiesWidget(QtWidgets.QWidget):
                 self.widgets[name].setValue(value)
             except AttributeError:
                 self.widgets[name].set(value)
+            property_supported = serialization.supported and (
+                name2 == "frameon" or reconstruction_supported
+            )
+            self.widgets[name].setEnabled(property_supported)
+            self.widgets[name].setToolTip(
+                name
+                if property_supported
+                else serialization.reason or reconstruction_reason
+            )
             self.properties[name] = value
 
         self.target = element
@@ -1539,8 +1575,11 @@ class QItemProperties(QtWidgets.QWidget):
     def buttonLegendClicked(self):
         """add a legend to the target"""
         self.element.legend()
-        self.fig.change_tracker.addChange(self.element, ".legend()")
-        self.fig.figure_dragger.make_draggable(self.element.get_legend())
+        legend = self.element.get_legend()
+        self.fig.change_tracker.addChange(
+            self.element, ".legend()", legend, ".legend"
+        )
+        self.fig.figure_dragger.make_draggable(legend)
         self.fig.canvas.draw()
         self.signals.figure_element_child_created.emit(self.element)
 
