@@ -39,6 +39,7 @@ from .ax_rasterisation import rasterizeAxes, restoreAxes
 from .change_tracker import setFigureVariableNames
 from .drag_helper import DragManager
 from .exception_swallower import swallow_get_exceptions
+from .interaction import SelectionMode
 
 from .components.qitem_properties import QItemProperties
 from .components.tree_view import MyTreeView
@@ -373,6 +374,8 @@ class PlotWindow(QtWidgets.QWidget):
             dragger.marquee_select_containers_only = (
                 self.marquee_select_containers_only
             )
+            dragger.set_selection_mode(self.selection_mode)
+        self.updateSelectionControls()
         self.signals.figure_changed.emit(figure)
 
     def setCanvas(self, canvas):
@@ -437,6 +440,55 @@ class PlotWindow(QtWidgets.QWidget):
         delete_act.setShortcuts(["Delete", "Backspace"])
         file_menu.addAction(delete_act)
 
+        def interaction_action(label, shortcut, callback):
+            action = QAction(label, self)
+            action.setShortcut(shortcut)
+
+            def execute():
+                if self.fig is None:
+                    return
+                try:
+                    callback(self.fig.figure_dragger)
+                except ValueError as exc:
+                    QtWidgets.QMessageBox.warning(self, "Pylustrator", str(exc))
+
+            action.triggered.connect(execute)
+            file_menu.addAction(action)
+            return action
+
+        interaction_action("Group", "Ctrl+G", lambda dragger: dragger.group_selection())
+        interaction_action(
+            "Ungroup", "Ctrl+Shift+G", lambda dragger: dragger.ungroup_selection()
+        )
+        interaction_action(
+            "Lock Selection", "Ctrl+2", lambda dragger: dragger.set_selection_locked(True)
+        )
+        interaction_action("Unlock All", "Ctrl+Alt+2", lambda dragger: dragger.unlock_all())
+        interaction_action(
+            "Hide Selection", "Ctrl+3", lambda dragger: dragger.set_selection_visible(False)
+        )
+        interaction_action("Show All", "Ctrl+Alt+3", lambda dragger: dragger.show_all())
+        interaction_action(
+            "Bring Forward",
+            "Ctrl+]",
+            lambda dragger: dragger.change_selection_zorder("forward"),
+        )
+        interaction_action(
+            "Send Backward",
+            "Ctrl+[",
+            lambda dragger: dragger.change_selection_zorder("backward"),
+        )
+        interaction_action(
+            "Bring to Front",
+            "Ctrl+Shift+]",
+            lambda dragger: dragger.change_selection_zorder("front"),
+        )
+        interaction_action(
+            "Send to Back",
+            "Ctrl+Shift+[",
+            lambda dragger: dragger.change_selection_zorder("back"),
+        )
+
         self.menuBar.addAction(info_act)
 
         layout_parent.addWidget(self.menuBar)
@@ -463,6 +515,7 @@ class PlotWindow(QtWidgets.QWidget):
         self._initial_layout_applied = False
         self.fast_drag_preview = True
         self.marquee_select_containers_only = False
+        self.selection_mode = SelectionMode.OBJECT
 
         self.signals = Signals()
         self.signals.canvas_changed.connect(self.setCanvas)
@@ -517,6 +570,36 @@ class PlotWindow(QtWidgets.QWidget):
 
         self.update_changes_signal.connect(updateChangesSignal)
 
+        selection_group = QtWidgets.QButtonGroup(self)
+        selection_group.setExclusive(True)
+        self.button_object_selection = QtWidgets.QPushButton("V")
+        self.button_object_selection.setCheckable(True)
+        self.button_object_selection.setChecked(True)
+        self.button_object_selection.setFixedWidth(22)
+        self.button_object_selection.setToolTip("Object Selection (V)")
+        self.button_object_selection.setShortcut("V")
+        self.button_object_selection.clicked.connect(
+            lambda checked: checked and self.setSelectionMode(SelectionMode.OBJECT)
+        )
+        selection_group.addButton(self.button_object_selection)
+
+        self.button_direct_selection = QtWidgets.QPushButton("A")
+        self.button_direct_selection.setCheckable(True)
+        self.button_direct_selection.setFixedWidth(22)
+        self.button_direct_selection.setToolTip("Direct Selection (A)")
+        self.button_direct_selection.setShortcut("A")
+        self.button_direct_selection.clicked.connect(
+            lambda checked: checked and self.setSelectionMode(SelectionMode.DIRECT)
+        )
+        selection_group.addButton(self.button_direct_selection)
+
+        self.selection_scope_label = QtWidgets.QLabel("")
+        self.selection_scope_label.setToolTip("Isolation scope")
+        self.selection_scope_label.setMinimumWidth(0)
+        self.selection_scope_label.setSizePolicy(
+            QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred
+        )
+
         self.button_fast_drag = QtWidgets.QPushButton(qta.icon("fa5s.bolt"), "")
         self.button_fast_drag.setCheckable(True)
         self.button_fast_drag.setChecked(self.fast_drag_preview)
@@ -555,6 +638,12 @@ class PlotWindow(QtWidgets.QWidget):
         #
         widget = QtWidgets.QWidget()
         self.layout_tools = QtWidgets.QVBoxLayout(widget)
+        selection_tools = QtWidgets.QHBoxLayout()
+        selection_tools.setContentsMargins(0, 0, 0, 0)
+        selection_tools.addWidget(self.button_object_selection)
+        selection_tools.addWidget(self.button_direct_selection)
+        selection_tools.addWidget(self.selection_scope_label, 1)
+        self.layout_tools.addLayout(selection_tools)
         widget.setSizePolicy(
             QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed
         )
@@ -689,6 +778,36 @@ class PlotWindow(QtWidgets.QWidget):
         self.fast_drag_preview = bool(enabled)
         if self.fig is not None and getattr(self.fig, "selection", None) is not None:
             self.fig.selection.defer_artist_updates = self.fast_drag_preview
+
+    def setSelectionMode(self, mode: SelectionMode | str):
+        self.selection_mode = SelectionMode.coerce(mode)
+        if (
+            self.fig is not None
+            and getattr(self.fig, "figure_dragger", None) is not None
+        ):
+            self.fig.figure_dragger.set_selection_mode(self.selection_mode)
+        self.updateSelectionControls()
+
+    def updateSelectionControls(self):
+        mode = self.selection_mode
+        breadcrumbs = ()
+        if (
+            self.fig is not None
+            and getattr(self.fig, "figure_dragger", None) is not None
+        ):
+            mode = self.fig.figure_dragger.selection_mode
+            breadcrumbs = self.fig.figure_dragger.isolation_breadcrumbs
+        self.selection_mode = mode
+        for button, checked in (
+            (self.button_object_selection, mode is SelectionMode.OBJECT),
+            (self.button_direct_selection, mode is SelectionMode.DIRECT),
+        ):
+            old = button.blockSignals(True)
+            button.setChecked(checked)
+            button.blockSignals(old)
+        self.selection_scope_label.setText(
+            " / ".join(breadcrumbs) if breadcrumbs else ""
+        )
 
     def setMarqueeSelectContainersOnly(self, enabled: bool):
         self.marquee_select_containers_only = bool(enabled)

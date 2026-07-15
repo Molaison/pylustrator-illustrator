@@ -171,18 +171,44 @@ class UndoRedo:
 
     def __enter__(self):
         if len(self.elements):
-            self.undo = self.change_tracker.get_element_restore_function(self.elements)
+            self._geometry_undo = self.change_tracker.get_element_restore_function(
+                self.elements
+            )
+            capture = getattr(self.change_tracker, "capture_recording_state", None)
+            self._recording_before = capture() if capture is not None else None
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if len(self.elements):
-            self.redo = self.change_tracker.get_element_restore_function(self.elements)
-            self.redo()
+        if len(self.elements) and exc_type is None:
+            self._geometry_redo = self.change_tracker.get_element_restore_function(
+                self.elements
+            )
+            self._geometry_redo()
+            capture = getattr(self.change_tracker, "capture_recording_state", None)
+            self._recording_after = capture() if capture is not None else None
+
+            def undo():
+                self._geometry_undo()
+                restore = getattr(self.change_tracker, "restore_recording_state", None)
+                if self._recording_before is not None and restore is not None:
+                    restore(self._recording_before)
+
+            def redo():
+                self._geometry_redo()
+                restore = getattr(self.change_tracker, "restore_recording_state", None)
+                if self._recording_after is not None and restore is not None:
+                    restore(self._recording_after)
+
+            self.undo = undo
+            self.redo = redo
             self.figure.canvas.draw()
             self.figure.signals.figure_selection_property_changed.emit()
             self.change_tracker.addEdit([self.undo, self.redo, self.name])
 
 
 def init_figure(fig):
+    from .commands import install_legacy_legend_replay_compatibility
+
+    install_legacy_legend_replay_compatibility(fig)
     for axes in fig.axes:
         add_axes_default(axes)
         add_text_default(axes.title)
@@ -503,6 +529,19 @@ class ChangeTracker:
             (reference_command,) = re.match(r"(\.[^(=]*)", command).groups()
         self.changes[reference_obj, reference_command] = (command_obj, command)
         self.saved = False
+        self.changeCountChanged()
+
+    def capture_recording_state(self):
+        """Snapshot generated-change bookkeeping for an atomic interaction."""
+
+        return dict(self.changes), bool(self.saved)
+
+    def restore_recording_state(self, state) -> None:
+        """Discard partial/no-op generated changes from an interaction."""
+
+        changes, saved = state
+        self.changes = dict(changes)
+        self.saved = bool(saved)
         self.changeCountChanged()
 
     def get_element_restore_function(self, elements):
@@ -936,6 +975,31 @@ class ChangeTracker:
         """add an edit to the stored list of edits"""
         if self.last_edit < len(self.edits) - 1:
             self.edits = self.edits[: self.last_edit + 1]
+        metadata = edit[3] if len(edit) > 3 and isinstance(edit[3], dict) else None
+        if metadata is not None and self.edits and self.last_edit == len(self.edits) - 1:
+            previous = self.edits[-1]
+            previous_metadata = (
+                previous[3]
+                if len(previous) > 3 and isinstance(previous[3], dict)
+                else None
+            )
+            if (
+                previous_metadata is not None
+                and metadata.get("coalesce_key")
+                == previous_metadata.get("coalesce_key")
+                and metadata.get("targets") == previous_metadata.get("targets")
+                and float(metadata.get("timestamp", 0))
+                - float(previous_metadata.get("timestamp", 0))
+                <= 0.75
+            ):
+                # Preserve the first undo closure and use the newest redo/end
+                # state, turning a key-repeat sequence into one command.
+                previous[1] = edit[1]
+                previous[2] = edit[2]
+                previous[3] = metadata
+                self.saved = False
+                self.changeCountChanged()
+                return
         self.edits.append(edit)
         self.last_edit = len(self.edits) - 1
         self.last_edit = len(self.edits) - 1
@@ -969,6 +1033,11 @@ class ChangeTracker:
 
     def load(self):
         """load a set of changes from a script file. The changes are the code that pylustrator generated"""
+        from .commands import GENERATED_STATE_VERSION, migrate_generated_command
+
+        source_version = int(
+            getattr(self.figure, "_pylustrator_generated_version", 0)
+        )
         regex = re.compile(r"(\.[^\(= ]*)(.*)")
         command_obj_regexes = [
             getReference(self.figure),
@@ -987,6 +1056,9 @@ class ChangeTracker:
             r"\.get_[xy]axis\(\)\.get_(major|minor)_ticks\(\)\[\d*\]",
             r"\.get_[xy]axis\(\)\.get_label\(\)",
             r"\.get_legend\(\)",
+            r"\.legend_handles\[\d*\]",
+            r"\.get_texts\(\)\[\d*\]",
+            r"\.get_title\(\)",
         ]
         command_obj_regexes = [re.compile(r) for r in command_obj_regexes]
 
@@ -994,6 +1066,9 @@ class ChangeTracker:
         header = []
         header += ["fig = plt.figure(%s)" % self.figure.number]
         header += ["import matplotlib as mpl"]
+        header += [
+            f"{getReference(self.figure)}._pylustrator_generated_version = {GENERATED_STATE_VERSION}"
+        ]
 
         self.get_reference_cached = {}
 
@@ -1009,10 +1084,13 @@ class ChangeTracker:
                 lineno += 1
                 if line == "" or line in header or line.startswith("#"):
                     continue
+                if "_pylustrator_generated_version" in line:
+                    continue
                 if re.match(r".*\.ax_dict =.*", line):
                     continue
 
                 raw_line = line
+                line = migrate_generated_command(line, source_version)
 
                 # try to identify the command object of the line
                 command_obj = ""
@@ -1191,6 +1269,8 @@ class ChangeTracker:
 
     def save(self):
         """save the changes to the .py file"""
+        from .commands import GENERATED_STATE_VERSION
+
         # if saving is disabled
         if self.no_save is True:
             return
@@ -1201,6 +1281,7 @@ class ChangeTracker:
             + ".axes}",
             "import matplotlib as mpl",
             f"getattr({getReference(self.figure)}, '_pylustrator_init', lambda: ...)()",
+            f"{getReference(self.figure)}._pylustrator_generated_version = {GENERATED_STATE_VERSION}",
         ]
 
         # block = getTextFromFile(header[0], self.stack_position)

@@ -22,6 +22,12 @@ editor must preserve semantic figure structure and reproducible Python output.
 
 Implementation order follows architectural dependencies.
 
+Status (2026-07-15): implemented on
+``refactor/artist-adapter-architecture``.  The P0 implementation is covered by
+131 passing tests, Ruff, the full Fig2 interaction probe, and a read-only smoke
+replay of the unmodified formal Fig2.  The formal file retained SHA-256
+``b0cd72abf3962cd6cd2354467ad57aa37ecc213332645d7cb56e6f4af598ad70``.
+
 ### P0.1 Selection kernel
 
 - Add an ordered hit stack rather than returning only one picked Artist.

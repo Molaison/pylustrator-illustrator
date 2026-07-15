@@ -33,6 +33,8 @@ from pylustrator.artist_adapters import (
     register_artist_adapter,
 )
 from pylustrator.snap import TargetWrapper
+from pylustrator.operations import TransformIntent, TransformOperation
+from pylustrator.transform_engine import TransformPlan, TransformPreflightError
 
 
 class RecordingChangeTracker:
@@ -162,6 +164,95 @@ def test_capabilities_describe_lossless_operations_instead_of_artist_labels() ->
     assert not get_artist_adapter(connection).capabilities.editable
     assert not TargetWrapper.supports_target(connection)
     plt.close(fig)
+
+
+def test_semantic_operation_support_explains_why_ambiguous_resize_is_disabled() -> None:
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    text = ax.text(0.2, 0.8, "text")
+    line = ax.plot([0, 1], [0, 1])[0]
+    legend = ax.legend([line], ["line"])
+    fig.canvas.draw()
+
+    text_support = get_artist_adapter(text).operation_support(
+        TransformOperation.RESIZE_GEOMETRY
+    )
+    line_support = get_artist_adapter(line).operation_support(
+        TransformOperation.RESIZE_GEOMETRY
+    )
+    legend_support = get_artist_adapter(legend).operation_support(
+        TransformOperation.RESIZE_GEOMETRY
+    )
+
+    assert not text_support.supported
+    assert "font metrics" in text_support.reason
+    assert not line_support.supported
+    assert "affine" in line_support.reason
+    assert not legend_support.supported
+    assert "layout" in legend_support.reason
+    plt.close(fig)
+
+
+def test_transform_preflight_rejects_mixed_selection_before_any_mutation() -> None:
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    rectangle = ax.add_patch(Rectangle((0.1, 0.2), 0.3, 0.4))
+    text = ax.text(0.2, 0.8, "text")
+    fig.canvas.draw()
+    before = TargetWrapper(rectangle).get_positions().copy()
+    intent = TransformIntent.resize(
+        [[1.2, 0, 0], [0, 1.2, 0], [0, 0, 1]]
+    )
+
+    with pytest.raises(TransformPreflightError, match="font metrics"):
+        TransformPlan.preflight([rectangle, text], intent)
+
+    assert np.allclose(TargetWrapper(rectangle).get_positions(), before)
+    plt.close(fig)
+
+
+def test_transform_plan_rolls_back_all_targets_when_one_adapter_fails() -> None:
+    class AtomicArtist(Artist):
+        def __init__(self, position, fail=False):
+            super().__init__()
+            self.position = np.asarray(position, dtype=float)
+            self.fail = fail
+
+    @register_artist_adapter(AtomicArtist)
+    class AtomicAdapter(ArtistAdapter):
+        default_capabilities = ArtistCapabilities(
+            can_select=True,
+            can_translate=True,
+            can_resize=True,
+            can_snapshot=True,
+        )
+
+        def get_transform(self):
+            return IdentityTransform()
+
+        def native_control_points(self):
+            return [self.target.position.copy()]
+
+        def _apply_native_control_points(self, points) -> None:
+            if self.target.fail:
+                raise RuntimeError("planned failure")
+            self.target.position = np.asarray(points[0], dtype=float)
+
+    fig = plt.figure(figsize=(2, 2), dpi=100)
+    first = AtomicArtist((10, 20))
+    second = AtomicArtist((30, 40), fail=True)
+    fig.add_artist(first)
+    fig.add_artist(second)
+    plan = TransformPlan.preflight(
+        [first, second], TransformIntent.translate((7, -4))
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="planned failure"):
+            plan.commit()
+        assert np.allclose(first.position, (10, 20))
+        assert np.allclose(second.position, (30, 40))
+    finally:
+        artist_adapter_registry.unregister(AtomicArtist, AtomicAdapter)
+        plt.close(fig)
 
 
 def test_non_affine_box_is_a_blocker_but_uses_the_specific_adapter() -> None:

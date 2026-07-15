@@ -39,6 +39,10 @@ from .snap import (
 )
 from .change_tracker import ChangeTracker, add_text_default
 from .components.plot_layout import scene_point_to_canvas_pixels
+from .editor_model import EditorGroup, EditorScene
+from .interaction import HitCandidate, HitStack, SelectionKernel, SelectionMode
+from .operations import OperationSupport, TransformOperation
+from .commands import InteractionState, ObjectLocator, semantic_equal
 from pylustrator.change_tracker import UndoRedo
 import time
 
@@ -408,6 +412,38 @@ class GrabbableRectangleSelection(GrabFunctions):
             unique.append(wrapper)
         return unique
 
+    def operation_support(
+        self, operation: TransformOperation | str
+    ) -> OperationSupport:
+        operation = TransformOperation.coerce(operation)
+        if not self.targets:
+            return OperationSupport.denied(operation, "No objects are selected")
+        supports = [target.operation_support(operation) for target in self.targets]
+        failures = [
+            (target, support)
+            for target, support in zip(self.targets, supports)
+            if not support.supported
+        ]
+        if failures:
+            reason = "; ".join(
+                f"{type(target.target).__name__}: {support.reason}"
+                for target, support in failures
+            )
+            return OperationSupport.denied(operation, reason)
+        constraints = tuple(
+            dict.fromkeys(
+                constraint
+                for support in supports
+                for constraint in support.constraints
+            )
+        )
+        strategies = {support.preview_strategy for support in supports}
+        return OperationSupport.allowed(
+            operation,
+            constraints=constraints,
+            preview_strategy=(strategies.pop() if len(strategies) == 1 else "mixed"),
+        )
+
     def _resolve_alignment_items(self) -> list[tuple[TargetWrapper, TargetWrapper]]:
         """Measure and move the exact artists selected by the user.
 
@@ -614,12 +650,17 @@ class GrabbableRectangleSelection(GrabFunctions):
         if match_height and reference_height <= 0:
             raise ValueError("Reference object has no height.")
 
-        non_scalable = [
-            target.target for target in self.targets[1:] if not target.do_scale
+        unsupported = [
+            (target.target, target.operation_support(TransformOperation.RESIZE_GEOMETRY))
+            for target in self.targets[1:]
+            if not target.supports_operation(TransformOperation.RESIZE_GEOMETRY)
         ]
-        if non_scalable:
-            names = ", ".join(type(target).__name__ for target in non_scalable)
-            raise ValueError(f"Selected object cannot be resized: {names}")
+        if unsupported:
+            reasons = "; ".join(
+                f"{type(target).__name__}: {support.reason}"
+                for target, support in unsupported
+            )
+            raise ValueError(reasons)
 
         planned: list[tuple[TargetWrapper, np.ndarray]] = []
         for target in self.targets[1:]:
@@ -678,10 +719,9 @@ class GrabbableRectangleSelection(GrabFunctions):
             raise ValueError("Scale factor must be positive.")
         if len(self.targets) == 0:
             return False
-        non_scalable = [target.target for target in self.targets if not target.do_scale]
-        if non_scalable:
-            names = ", ".join(type(target).__name__ for target in non_scalable)
-            raise ValueError(f"Selected object cannot be scaled: {names}")
+        support = self.operation_support(TransformOperation.RESIZE_GEOMETRY)
+        if not support.supported:
+            raise ValueError(support.reason)
         if np.isclose(factor, 1.0):
             return False
 
@@ -709,7 +749,11 @@ class GrabbableRectangleSelection(GrabFunctions):
     @staticmethod
     def _rotatable_value(target: Artist) -> float | None:
         wrapped = TargetWrapper(target)
-        return wrapped.get_rotation() if wrapped.capabilities.can_rotate else None
+        return (
+            wrapped.get_rotation()
+            if wrapped.supports_operation(TransformOperation.ROTATE)
+            else None
+        )
 
     def _set_rotation_value(self, target: Artist, value: float) -> None:
         TargetWrapper(target).set_rotation(value)
@@ -721,17 +765,15 @@ class GrabbableRectangleSelection(GrabFunctions):
         if np.isclose(angle_degrees, 0.0):
             return False
 
+        support = self.operation_support(TransformOperation.ROTATE)
+        if not support.supported:
+            raise ValueError(support.reason)
+
         old_values: list[tuple[Artist, float]] = []
-        unsupported: list[Artist] = []
         for target in self.targets:
             value = self._rotatable_value(target.target)
-            if value is None:
-                unsupported.append(target.target)
-            else:
+            if value is not None:
                 old_values.append((target.target, value))
-        if unsupported:
-            names = ", ".join(type(target).__name__ for target in unsupported)
-            raise ValueError(f"Selected object cannot be rotated: {names}")
 
         new_values = [(target, value + angle_degrees) for target, value in old_values]
 
@@ -839,7 +881,7 @@ class GrabbableRectangleSelection(GrabFunctions):
 
     def do_target_scale(self) -> bool:
         """Only expose resize handles when every selected artist can scale."""
-        return bool(self.targets) and all(target.do_scale for target in self.targets)
+        return self.operation_support(TransformOperation.RESIZE_GEOMETRY).supported
 
     def do_change_aspect_ratio(self) -> bool:
         """if any of the element sin the selection wants to perserve its aspect ratio"""
@@ -927,6 +969,13 @@ class GrabbableRectangleSelection(GrabFunctions):
         }
         self.move_current_positions = {}
         self.move_current_selection_points = {}
+        self.move_start_states = {
+            id(target.target): target.get_restore_state()
+            for target in self.save_targets
+        }
+        tracker = getattr(self.figure, "change_tracker", None)
+        capture = getattr(tracker, "capture_recording_state", None)
+        self.move_start_tracker_state = capture() if capture is not None else None
 
         self.store_start = self.get_save_point(self.save_targets)
 
@@ -971,10 +1020,39 @@ class GrabbableRectangleSelection(GrabFunctions):
             self._clear_preview(target)
             target.set_positions(points)
 
-    def end_move(self, edit_name: str = "Move"):
+    def _move_changed_semantically(self) -> bool:
+        start_states = getattr(self, "move_start_states", {})
+        for target in self.save_targets:
+            before = start_states.get(id(target.target))
+            if before is None or not semantic_equal(before, target.get_restore_state()):
+                return True
+        return False
+
+    def _restore_move_start(self) -> None:
+        start_states = getattr(self, "move_start_states", {})
+        for target in reversed(self.save_targets):
+            state = start_states.get(id(target.target))
+            if state is not None:
+                target.restore_state(state)
+        tracker_state = getattr(self, "move_start_tracker_state", None)
+        tracker = getattr(self.figure, "change_tracker", None)
+        restore = getattr(tracker, "restore_recording_state", None)
+        if tracker_state is not None and restore is not None:
+            restore(tracker_state)
+        self.clear_move_previews()
+
+    def end_move(self, edit_name: str = "Move", coalesce_key: str = None):
         """a grabber move stopped"""
         if self.has_moved is True:
-            self._commit_deferred_positions()
+            try:
+                self._commit_deferred_positions()
+            except Exception:
+                self._restore_move_start()
+                self.has_moved = False
+                raise
+            if not self._move_changed_semantically():
+                self._restore_move_start()
+                self.has_moved = False
         else:
             self.clear_move_previews()
         self.update_grabber()
@@ -982,9 +1060,16 @@ class GrabbableRectangleSelection(GrabFunctions):
         self.store_end = self.get_save_point(self.save_targets)
         if self.has_moved is True:
             self.figure.signals.figure_selection_moved.emit()
-            self.figure.change_tracker.addEdit(
-                [self.store_start, self.store_end, edit_name]
-            )
+            edit = [self.store_start, self.store_end, edit_name]
+            if coalesce_key is not None:
+                edit.append(
+                    {
+                        "coalesce_key": coalesce_key,
+                        "targets": tuple(id(target.target) for target in self.save_targets),
+                        "timestamp": time.monotonic(),
+                    }
+                )
+            self.figure.change_tracker.addEdit(edit)
             if getattr(self, "defer_current_move", False):
                 canvas = getattr(self.figure, "canvas", None)
                 if hasattr(canvas, "schedule_draw"):
@@ -995,14 +1080,25 @@ class GrabbableRectangleSelection(GrabFunctions):
         self.move_start_selection_points = {}
         self.move_current_positions = {}
         self.move_current_selection_points = {}
+        self.move_start_states = {}
+        self.move_start_tracker_state = None
         self.defer_current_move = False
 
     def addOffset(self, pos: Sequence, dir: int, keep_aspect_ratio: bool = True):
         """move the whole selection (e.g. for the use of the arrow keys)"""
         pos = list(pos)
-        if (keep_aspect_ratio or self.do_change_aspect_ratio()) and not (
+        whole_object = bool(
             dir & DIR_X0 and dir & DIR_X1 and dir & DIR_Y0 and dir & DIR_Y1
-        ):
+        )
+        operation = (
+            TransformOperation.TRANSLATE
+            if whole_object
+            else TransformOperation.RESIZE_GEOMETRY
+        )
+        support = self.operation_support(operation)
+        if not support.supported:
+            raise ValueError(support.reason)
+        if (keep_aspect_ratio or self.do_change_aspect_ratio()) and not whole_object:
             if (dir & DIR_X0 and dir & DIR_Y0) or (dir & DIR_X1 and dir & DIR_Y1):
                 dx = pos[1] * self.width() / self.height()
                 dy = pos[0] * self.height() / self.width()
@@ -1109,47 +1205,44 @@ class GrabbableRectangleSelection(GrabFunctions):
 
     def keyPressEvent(self, event: KeyEvent):
         """when a key is pressed. Arrow keys move the selection, Pageup/down movein z"""
+        def schedule_draw():
+            canvas = self.figure.canvas
+            if hasattr(canvas, "schedule_draw"):
+                canvas.schedule_draw()
+            else:
+                canvas.draw_idle()
+
         # if not self.selected:
         #    return
         # move last axis in z order
         if event.key == "pagedown":
-            for target in self.targets:
-                target.target.set_zorder(target.target.get_zorder() - 1)
-                self.figure.change_tracker.addChange(
-                    target.target, ".set_zorder(%d)" % target.target.get_zorder()
-                )
-            self.figure.canvas.draw()
+            self.figure.figure_dragger.change_selection_zorder("backward")
         if event.key == "pageup":
-            for target in self.targets:
-                target.target.set_zorder(target.target.get_zorder() + 1)
-                self.figure.change_tracker.addChange(
-                    target.target, ".set_zorder(%d)" % target.target.get_zorder()
-                )
-            self.figure.canvas.draw()
+            self.figure.figure_dragger.change_selection_zorder("forward")
         if event.key == "left":
             self.start_move()
             self.addOffset((-1, 0), self.dir)
             self.has_moved = True
-            self.end_move()
-            self.figure.canvas.schedule_draw()
+            self.end_move("Nudge", coalesce_key="nudge")
+            schedule_draw()
         if event.key == "right":
             self.start_move()
             self.addOffset((+1, 0), self.dir)
             self.has_moved = True
-            self.end_move()
-            self.figure.canvas.schedule_draw()
+            self.end_move("Nudge", coalesce_key="nudge")
+            schedule_draw()
         if event.key == "down":
             self.start_move()
             self.addOffset((0, -1), self.dir)
             self.has_moved = True
-            self.end_move()
-            self.figure.canvas.schedule_draw()
+            self.end_move("Nudge", coalesce_key="nudge")
+            schedule_draw()
         if event.key == "up":
             self.start_move()
             self.addOffset((0, +1), self.dir)
             self.has_moved = True
-            self.end_move()
-            self.figure.canvas.schedule_draw()
+            self.end_move("Nudge", coalesce_key="nudge")
+            schedule_draw()
         if event.key in ["delete", "backspace"]:
             self.delete_targets()
 
@@ -1171,6 +1264,9 @@ class DragManager:
         self._interaction_artist_ids = set()
         self._selection_parent_by_id = {}
         self._draw_child_orders = {}
+        self.editor_scene = EditorScene(
+            figure, ownership_parent=self._draw_parent
+        )
         self.marquee_select_containers_only = False
         self.marquee_start = None
         self.marquee_rect = None
@@ -1178,6 +1274,14 @@ class DragManager:
         self.marquee_additive = False
         self.marquee_click_element = None
         self._last_pick_blocked = False
+        self.preselection_rect = None
+        self.preselection_artist = None
+        self._candidate_menu = None
+        self.selection_kernel = SelectionKernel(
+            parent_of=self._interaction_parent,
+            is_group=self._interaction_is_group,
+            label_of=self._interaction_label,
+        )
 
         self.figure.canvas.mpl_disconnect(
             self.figure.canvas.manager.key_press_handler_id
@@ -1187,6 +1291,7 @@ class DragManager:
 
         self.make_figure_draggable(self.figure)
         self.make_axes_draggable(self.figure.axes)
+        self.editor_scene.restore_persisted_state()
         self.selection = GrabbableRectangleSelection(figure, figure._pyl_scene)
         self.figure.selection = self.selection
         self.change_tracker = ChangeTracker(figure, no_save)
@@ -1210,6 +1315,423 @@ class DragManager:
             "draw_event", self.invalidate_geometry_cache
         )
 
+    def _draw_parent(self, artist: Artist) -> Artist | None:
+        if isinstance(artist, EditorGroup):
+            return artist.owner
+        parent = getattr(self, "_selection_parent_by_id", {}).get(id(artist))
+        if parent is None and isinstance(artist, SubFigure):
+            parent = getattr(artist, "_parent", None)
+        return parent
+
+    def _ensure_editor_scene(self) -> EditorScene:
+        scene = getattr(self, "editor_scene", None)
+        if scene is None:
+            scene = EditorScene(self.figure, ownership_parent=self._draw_parent)
+            self.editor_scene = scene
+        return scene
+
+    def _interaction_parent(self, artist: Artist) -> Artist | None:
+        """Return editor grouping independently from Matplotlib ownership."""
+
+        return self._ensure_editor_scene().selection_parent(artist)
+
+    def _interaction_is_group(self, artist: Artist) -> bool:
+        return self._ensure_editor_scene().is_group(artist)
+
+    @staticmethod
+    def _interaction_label(artist: Artist) -> str:
+        if isinstance(artist, EditorGroup):
+            return artist.name
+        if isinstance(artist, Legend):
+            title = artist.get_title().get_text()
+            return title or "Legend"
+        label = getattr(artist, "get_label", lambda: "")()
+        if isinstance(label, str) and label and not label.startswith("_"):
+            return label
+        return type(artist).__name__
+
+    @property
+    def selection_mode(self) -> SelectionMode:
+        return self._ensure_selection_kernel().mode
+
+    @property
+    def isolation_breadcrumbs(self) -> tuple[str, ...]:
+        return self._ensure_selection_kernel().breadcrumbs
+
+    def _ensure_selection_kernel(self) -> SelectionKernel:
+        kernel = getattr(self, "selection_kernel", None)
+        if kernel is None:
+            kernel = SelectionKernel(
+                parent_of=self._interaction_parent,
+                is_group=self._interaction_is_group,
+                label_of=self._interaction_label,
+            )
+            self.selection_kernel = kernel
+        return kernel
+
+    def _update_interaction_controls(self) -> None:
+        window = getattr(self.figure, "window", None)
+        if window is not None and hasattr(window, "updateSelectionControls"):
+            window.updateSelectionControls()
+
+    def set_selection_mode(self, mode: SelectionMode | str) -> SelectionMode:
+        result = self._ensure_selection_kernel().set_mode(mode)
+        self._update_interaction_controls()
+        return result
+
+    def enter_isolation(self, element: Artist) -> bool:
+        entered = self._ensure_selection_kernel().enter_isolation(element)
+        if entered:
+            self.selection.clear_targets()
+            self.selected_element = None
+            self.on_select(None, None)
+            self._update_interaction_controls()
+            self.figure.canvas.draw_idle()
+        return entered
+
+    def exit_isolation(self) -> Artist | None:
+        exited = self._ensure_selection_kernel().exit_isolation()
+        if exited is not None:
+            self.select_element(exited)
+            self._update_interaction_controls()
+            self.figure.canvas.draw_idle()
+        return exited
+
+    def _selected_artists(self) -> list[Artist]:
+        return [target.target for target in self.selection.targets]
+
+    @staticmethod
+    def _object_locator(artist: Artist) -> ObjectLocator | None:
+        try:
+            return ObjectLocator.from_artist(artist)
+        except (TypeError, ValueError):
+            return None
+
+    def capture_interaction_state(self) -> InteractionState:
+        selected = tuple(
+            locator
+            for artist in self._selected_artists()
+            if (locator := self._object_locator(artist)) is not None
+        )
+        primary = (
+            self._object_locator(self.selected_element)
+            if self.selected_element is not None
+            else None
+        )
+        scopes = tuple(
+            locator
+            for scope in self._ensure_selection_kernel().scopes
+            if (locator := self._object_locator(scope.root)) is not None
+        )
+        return InteractionState(
+            self.selection_mode.value, selected, primary, scopes
+        )
+
+    def restore_interaction_state(self, state: InteractionState) -> None:
+        scene = self._ensure_editor_scene()
+        kernel = self._ensure_selection_kernel()
+        kernel.clear_isolation()
+        kernel.set_mode(state.mode)
+        for locator in state.scopes:
+            root = locator.resolve(scene)
+            if root is not None:
+                kernel.enter_isolation(root)
+        selected = [
+            artist
+            for locator in state.selected
+            if (artist := locator.resolve(scene)) is not None
+        ]
+        primary = state.primary.resolve(scene) if state.primary is not None else None
+        self.select_elements(selected, primary=primary)
+        self._update_interaction_controls()
+
+    def _notify_editor_scene_changed(self, owner: Artist = None) -> None:
+        signals = getattr(self.figure, "signals", None)
+        signal = getattr(signals, "figure_element_child_created", None)
+        if signal is not None:
+            signal.emit(owner or self.figure)
+        self.invalidate_geometry_cache()
+        self.figure.canvas.draw_idle()
+
+    def _hide_preselection(self) -> None:
+        rect = getattr(self, "preselection_rect", None)
+        if rect is not None:
+            rect.setVisible(False)
+        self.preselection_artist = None
+
+    def _ensure_preselection_rect(self):
+        current = getattr(self, "preselection_rect", None)
+        if current is not None:
+            return current
+        rect = QtWidgets.QGraphicsRectItem(0, 0, 0, 0, self.figure._pyl_scene)
+        pen = QtGui.QPen(QtGui.QColor("#00A8E8"), 2)
+        pen.setStyle(QtCore.Qt.DotLine)
+        rect.setPen(pen)
+        rect.setBrush(QtGui.QBrush(QtCore.Qt.NoBrush))
+        rect.setZValue(898)
+        self.preselection_rect = rect
+        return rect
+
+    def update_preselection(self, event: MouseEvent) -> Artist | None:
+        if event.x is None or event.y is None or getattr(self, "grab_element", None):
+            self._hide_preselection()
+            return None
+        target = self._ensure_selection_kernel().pick(self.get_hit_stack(event))
+        if target is None:
+            self._hide_preselection()
+            return None
+        try:
+            points = np.asarray(TargetWrapper(target).get_selection_points(), dtype=float)
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            self._hide_preselection()
+            return None
+        if points.size == 0:
+            self._hide_preselection()
+            return None
+        x0, y0 = np.min(points[:, :2], axis=0)
+        x1, y1 = np.max(points[:, :2], axis=0)
+        rect = self._ensure_preselection_rect()
+        rect.setRect(float(x0), float(y0), float(x1 - x0), float(y1 - y0))
+        rect.setVisible(True)
+        rect.setToolTip(self._interaction_label(target))
+        self.preselection_artist = target
+        return target
+
+    def _apply_editor_state(self, state: dict) -> None:
+        self.selection.clear_targets()
+        self.selected_element = None
+        self._ensure_selection_kernel().clear_isolation()
+        scene = self._ensure_editor_scene()
+        scene.apply_state(state)
+        scene.record_state()
+        self._notify_editor_scene_changed()
+
+    def group_selection(self, name: str = None) -> EditorGroup:
+        members = self._selected_artists()
+        scene = self._ensure_editor_scene()
+        before = scene.export_state()
+        interaction_before = self.capture_interaction_state()
+        group = scene.create_group(members, name=name)
+        after = scene.export_state()
+        scene.record_state()
+        self.select_element(group)
+        interaction_after = self.capture_interaction_state()
+
+        def undo():
+            self._apply_editor_state(before)
+            self.restore_interaction_state(interaction_before)
+
+        def redo():
+            self._apply_editor_state(after)
+            self.restore_interaction_state(interaction_after)
+
+        self.figure.change_tracker.addEdit([undo, redo, "Group"])
+        self._notify_editor_scene_changed(group.owner)
+        return group
+
+    def ungroup_selection(self) -> list[Artist]:
+        groups = [
+            artist for artist in self._selected_artists() if isinstance(artist, EditorGroup)
+        ]
+        if not groups:
+            raise ValueError("Select an editor group to ungroup.")
+        scene = self._ensure_editor_scene()
+        before = scene.export_state()
+        interaction_before = self.capture_interaction_state()
+        members: list[Artist] = []
+        for group in groups:
+            members.extend(scene.remove_group(group))
+        after = scene.export_state()
+        scene.record_state()
+        self.select_elements(members, primary=members[-1] if members else None)
+        interaction_after = self.capture_interaction_state()
+
+        def undo():
+            self._apply_editor_state(before)
+            self.restore_interaction_state(interaction_before)
+
+        def redo():
+            self._apply_editor_state(after)
+            self.restore_interaction_state(interaction_after)
+
+        self.figure.change_tracker.addEdit([undo, redo, "Ungroup"])
+        self._notify_editor_scene_changed()
+        return members
+
+    def set_selection_locked(self, locked: bool = True) -> bool:
+        artists = self._selected_artists()
+        if not artists:
+            return False
+        scene = self._ensure_editor_scene()
+        before = scene.export_state()
+        interaction_before = self.capture_interaction_state()
+        if not scene.set_locked(artists, locked):
+            return False
+        after = scene.export_state()
+        scene.record_state()
+        if locked:
+            self.select_element(None)
+        interaction_after = self.capture_interaction_state()
+
+        def undo():
+            self._apply_editor_state(before)
+            self.restore_interaction_state(interaction_before)
+
+        def redo():
+            self._apply_editor_state(after)
+            self.restore_interaction_state(interaction_after)
+
+        self.figure.change_tracker.addEdit(
+            [undo, redo, "Lock" if locked else "Unlock"]
+        )
+        self._notify_editor_scene_changed()
+        return True
+
+    def unlock_all(self) -> bool:
+        scene = self._ensure_editor_scene()
+        before = scene.export_state()
+        interaction_before = self.capture_interaction_state()
+        artists = [
+            artist
+            for key in list(scene._locked_ids)
+            if (artist := scene._known_artists.get(key)) is not None
+        ]
+        if not scene.set_locked(artists, False):
+            return False
+        after = scene.export_state()
+        scene.record_state()
+        interaction_after = self.capture_interaction_state()
+
+        def undo():
+            self._apply_editor_state(before)
+            self.restore_interaction_state(interaction_before)
+
+        def redo():
+            self._apply_editor_state(after)
+            self.restore_interaction_state(interaction_after)
+
+        self.figure.change_tracker.addEdit([undo, redo, "Unlock All"])
+        self._notify_editor_scene_changed()
+        return True
+
+    def set_selection_visible(self, visible: bool) -> bool:
+        artists = self._selected_artists()
+        if not artists:
+            return False
+        scene = self._ensure_editor_scene()
+        before = scene.export_state()
+        interaction_before = self.capture_interaction_state()
+        if not scene.set_visible(artists, visible):
+            return False
+        after = scene.export_state()
+        scene.record_state()
+        if not visible:
+            self.select_element(None)
+        interaction_after = self.capture_interaction_state()
+
+        def undo():
+            self._apply_editor_state(before)
+            self.restore_interaction_state(interaction_before)
+
+        def redo():
+            self._apply_editor_state(after)
+            self.restore_interaction_state(interaction_after)
+
+        self.figure.change_tracker.addEdit(
+            [undo, redo, "Show" if visible else "Hide"]
+        )
+        self._notify_editor_scene_changed()
+        return True
+
+    def show_all(self) -> bool:
+        scene = self._ensure_editor_scene()
+        before = scene.export_state()
+        interaction_before = self.capture_interaction_state()
+        artists = [
+            artist
+            for key in list(scene._explicitly_hidden_ids)
+            if (artist := scene._known_artists.get(key)) is not None
+        ]
+        if not scene.set_visible(artists, True):
+            return False
+        after = scene.export_state()
+        scene.record_state()
+        interaction_after = self.capture_interaction_state()
+
+        def undo():
+            self._apply_editor_state(before)
+            self.restore_interaction_state(interaction_before)
+
+        def redo():
+            self._apply_editor_state(after)
+            self.restore_interaction_state(interaction_after)
+
+        self.figure.change_tracker.addEdit([undo, redo, "Show All"])
+        self._notify_editor_scene_changed()
+        return True
+
+    @staticmethod
+    def _zorder_leaves(artists: Iterable[Artist]) -> list[Artist]:
+        leaves: list[Artist] = []
+        seen: set[int] = set()
+
+        def add(artist: Artist):
+            if isinstance(artist, EditorGroup):
+                for member in artist.members:
+                    add(member)
+            elif id(artist) not in seen:
+                seen.add(id(artist))
+                leaves.append(artist)
+
+        for artist in artists:
+            add(artist)
+        return leaves
+
+    def change_selection_zorder(self, mode: str) -> bool:
+        leaves = self._zorder_leaves(self._selected_artists())
+        if not leaves:
+            return False
+        modes = {"forward", "backward", "front", "back"}
+        if mode not in modes:
+            raise ValueError(f"Unknown z-order action: {mode}")
+        old_values = [(artist, float(artist.get_zorder())) for artist in leaves]
+        selected_ids = {id(artist) for artist in leaves}
+        others = [
+            artist
+            for artist in getattr(self, "_selectable_artists", [])
+            if id(artist) not in selected_ids and artist.get_visible()
+        ]
+        if mode == "forward":
+            delta = 1.0
+        elif mode == "backward":
+            delta = -1.0
+        elif mode == "front":
+            target = max((float(artist.get_zorder()) for artist in others), default=0.0) + 1
+            delta = target - max(value for _artist, value in old_values)
+        else:
+            target = min((float(artist.get_zorder()) for artist in others), default=0.0) - 1
+            delta = target - min(value for _artist, value in old_values)
+        new_values = [(artist, value + delta) for artist, value in old_values]
+
+        def apply(values):
+            for artist, value in values:
+                artist.set_zorder(value)
+                self.figure.change_tracker.addChange(
+                    artist, f".set_zorder({value!r})"
+                )
+            self.invalidate_geometry_cache()
+            self.figure.canvas.draw_idle()
+
+        def undo():
+            apply(old_values)
+
+        def redo():
+            apply(new_values)
+
+        redo()
+        self.figure.change_tracker.addEdit([undo, redo, "Change stacking order"])
+        return True
+
     def invalidate_geometry_cache(self, _event=None):
         """Drop visible-bound caches after any render/transform change."""
         for artist in getattr(self, "_selectable_artists", []):
@@ -1230,6 +1752,8 @@ class DragManager:
 
     def make_draggable(self, target: Artist, parent: Artist = None):
         """make an artist draggable"""
+        if getattr(self, "figure", None) is None:
+            self.figure = getattr(target, "figure", None)
         if not hasattr(self, "_selectable_artists"):
             self._selectable_artists = []
             self._selectable_artist_ids = set()
@@ -1254,6 +1778,7 @@ class DragManager:
                 parent = getattr(target, "figure", None)
         if parent is not None and parent is not target:
             self._selection_parent_by_id[id(target)] = parent
+        self._ensure_editor_scene().register_artist(target)
         if id(target) not in self._interaction_artist_ids:
             self._interaction_artists.append(target)
             self._interaction_artist_ids.add(id(target))
@@ -1352,6 +1877,9 @@ class DragManager:
             return False
         if not child.get_visible():
             return False
+        scene = self._ensure_editor_scene()
+        if scene.is_locked(child) or scene.is_explicitly_hidden(child):
+            return False
         if isinstance(child, Text) and child.get_text() == "":
             return False
         if _is_internal_label(child, explicit):
@@ -1366,8 +1894,7 @@ class DragManager:
             return self._artist_has_selection_geometry(child)
         return self._resolve_selectable_artist(child) is not None
 
-    @staticmethod
-    def _is_interaction_hit(artist: Artist, event: MouseEvent) -> bool:
+    def _is_interaction_hit(self, artist: Artist, event: MouseEvent) -> bool:
         """Return whether an explicitly discovered foreground artist was hit.
 
         Unsupported foreground objects must participate in hit ordering even
@@ -1377,13 +1904,18 @@ class DragManager:
         """
         if getattr(artist, "figure", None) is None or not artist.get_visible():
             return False
+        scene = self._ensure_editor_scene()
+        if scene.is_locked(artist) or scene.is_explicitly_hidden(artist):
+            return False
         try:
             return bool(artist.contains(event)[0])
         except (AttributeError, TypeError, ValueError, RuntimeError):
             return False
 
-    @staticmethod
-    def _artist_has_selection_geometry(artist: Artist) -> bool:
+    def _artist_has_selection_geometry(self, artist: Artist) -> bool:
+        scene = self._ensure_editor_scene()
+        if scene.is_locked(artist) or scene.is_explicitly_hidden(artist):
+            return False
         try:
             target = TargetWrapper(artist)
             if not target.supported:
@@ -1417,6 +1949,8 @@ class DragManager:
         return resolved, primary
 
     def _artist_contains_descendant(self, parent: Artist, descendant: Artist) -> bool:
+        if self._ensure_editor_scene().contains(parent, descendant):
+            return True
         parent_map = getattr(self, "_selection_parent_by_id", {})
         if id(descendant) in parent_map:
             current = parent_map.get(id(descendant))
@@ -1447,43 +1981,61 @@ class DragManager:
                 unique.append(element)
 
         unique_by_id = {id(element): element for element in unique}
-        parent_map = getattr(self, "_selection_parent_by_id", {})
+        direct_selection = self.selection_mode is SelectionMode.DIRECT
         remove_ids = set()
         for descendant in unique:
-            current = parent_map.get(id(descendant))
+            current = self._interaction_parent(descendant)
             seen = set()
             while current is not None and id(current) not in seen:
                 current_id = id(current)
                 seen.add(current_id)
                 if current_id in unique_by_id:
-                    if _container_keeps_children(current) or (
+                    if (
+                        _container_keeps_children(current)
+                        and not direct_selection
+                    ) or (
                         prefer_containers and _container_yields_to_children(current)
                     ):
                         remove_ids.add(id(descendant))
+                    elif (
+                        _container_keeps_children(current)
+                        and direct_selection
+                        and not prefer_containers
+                    ):
+                        remove_ids.add(current_id)
                     elif (
                         _container_yields_to_children(current)
                         and not (preserve_axes and isinstance(current, Axes))
                         and not prefer_containers
                     ):
                         remove_ids.add(current_id)
-                current = parent_map.get(current_id)
+                current = self._interaction_parent(current)
 
         # Programmatic callers may submit supported artists before the manager
         # has registered their semantic parent.  Keep the recursive fallback
         # for only those rare objects instead of paying O(n^2) for every marquee.
         for descendant in unique:
-            if id(descendant) in parent_map:
+            if self._interaction_parent(descendant) is not None:
                 continue
             for possible_parent in unique:
                 if possible_parent is descendant or not self._artist_contains_descendant(
                     possible_parent, descendant
                 ):
                     continue
-                if _container_keeps_children(possible_parent) or (
+                if (
+                    _container_keeps_children(possible_parent)
+                    and not direct_selection
+                ) or (
                     prefer_containers
                     and _container_yields_to_children(possible_parent)
                 ):
                     remove_ids.add(id(descendant))
+                elif (
+                    _container_keeps_children(possible_parent)
+                    and direct_selection
+                    and not prefer_containers
+                ):
+                    remove_ids.add(id(possible_parent))
                 elif (
                     _container_yields_to_children(possible_parent)
                     and not (
@@ -1508,6 +2060,108 @@ class DragManager:
                 primary = normalized[-1] if normalized else None
         return normalized, primary
 
+    def get_hit_stack(self, event: MouseEvent) -> HitStack:
+        """Return every visual hit from front to back using one draw-order model."""
+
+        selectable_ids = getattr(self, "_selectable_artist_ids", set())
+        interaction_artists = [
+            (artist, id(artist) in selectable_ids)
+            for artist in getattr(
+                self, "_interaction_artists", getattr(self, "_selectable_artists", [])
+            )
+        ]
+        registration_order = {
+            id(artist): index
+            for index, (artist, _editable) in enumerate(interaction_artists)
+        }
+        child_orders: dict[int, dict[int, int]] = getattr(
+            self, "_draw_child_orders", {}
+        )
+        self._draw_child_orders = child_orders
+
+        def child_order(parent, child, fallback):
+            parent_key = id(parent)
+            if parent_key not in child_orders:
+                try:
+                    children = get_artist_children(parent)
+                except (AttributeError, TypeError, ValueError, RuntimeError):
+                    children = []
+                child_orders[parent_key] = {
+                    id(item): index for index, item in enumerate(children)
+                }
+            return child_orders[parent_key].get(id(child), fallback)
+
+        def pick_order(entry):
+            index, (artist, _editable) = entry
+            path = []
+            current = artist
+            seen = set()
+            while current is not None and not isinstance(current, Figure):
+                current_key = id(current)
+                if current_key in seen:
+                    break
+                seen.add(current_key)
+                parent = self._draw_parent(current)
+                fallback = registration_order.get(current_key, index)
+                order = (
+                    child_order(parent, current, fallback)
+                    if parent is not None
+                    else fallback
+                )
+                path.append((float(current.get_zorder()), order))
+                current = parent
+            return tuple(reversed(path)), index
+
+        hits: list[HitCandidate] = []
+        for index, (candidate, registered_editable) in sorted(
+            enumerate(interaction_artists), key=pick_order, reverse=True
+        ):
+            if not self._is_interaction_hit(candidate, event):
+                continue
+            editable = bool(
+                registered_editable
+                and self._resolve_selectable_artist(candidate) is not None
+            )
+            hits.append(
+                HitCandidate(
+                    candidate,
+                    editable,
+                    pick_order((index, (candidate, registered_editable))),
+                    index,
+                )
+            )
+        return HitStack(tuple(hits))
+
+    def get_hit_candidates(self, event: MouseEvent) -> tuple[Artist, ...]:
+        """Public candidate-list API resolved through the active selection tool."""
+
+        return self._ensure_selection_kernel().candidates(self.get_hit_stack(event))
+
+    def get_hit_candidate_entries(
+        self, event: MouseEvent
+    ) -> tuple[tuple[Artist, str], ...]:
+        entries = []
+        for artist in self.get_hit_candidates(event):
+            name = self._interaction_label(artist)
+            type_name = type(artist).__name__
+            entries.append((artist, f"{name} [{type_name}]"))
+        return tuple(entries)
+
+    def show_hit_candidate_menu(self, event: MouseEvent):
+        entries = self.get_hit_candidate_entries(event)
+        window = getattr(self.figure, "window", None)
+        if not entries or window is None:
+            return entries
+        menu = QtWidgets.QMenu(window)
+        for artist, label in entries:
+            action = menu.addAction(label)
+            action.triggered.connect(
+                lambda _checked=False, artist=artist: self.select_element(artist)
+            )
+        self._candidate_menu = menu
+        menu.popup(QtGui.QCursor.pos())
+        return entries
+
     def get_picked_element(
         self,
         event: MouseEvent,
@@ -1515,85 +2169,25 @@ class DragManager:
         picked_element: Artist = None,
         last_selected: Artist = None,
     ):
-        """get the picked element that an event refers to.
-        To implement selection of elements at the back with multiple clicks.
+        """Get the exact leaf Artist hit by an event.
+
+        The legacy return shape is retained for callers that need direct Artist
+        hits.  Canvas selection resolves this stack separately through the active
+        object/direct tool.
         """
         if element is None and hasattr(self, "_selectable_artists"):
-            picked = picked_element
-            blocked = object()
             self._last_pick_blocked = False
-            selectable_ids = self._selectable_artist_ids
-            interaction_artists = [
-                (artist, id(artist) in selectable_ids)
-                for artist in getattr(
-                    self, "_interaction_artists", self._selectable_artists
-                )
-            ]
-            registration_order = {
-                id(artist): index
-                for index, (artist, _editable) in enumerate(interaction_artists)
-            }
-            parent_map = getattr(self, "_selection_parent_by_id", {})
-            child_orders: dict[int, dict[int, int]] = getattr(
-                self, "_draw_child_orders", {}
-            )
-            self._draw_child_orders = child_orders
-
-            def semantic_parent(artist):
-                parent = parent_map.get(id(artist))
-                if parent is None and isinstance(artist, SubFigure):
-                    parent = getattr(artist, "_parent", None)
-                return parent
-
-            def child_order(parent, child, fallback):
-                parent_key = id(parent)
-                if parent_key not in child_orders:
-                    try:
-                        children = get_artist_children(parent)
-                    except (AttributeError, TypeError, ValueError, RuntimeError):
-                        children = []
-                    child_orders[parent_key] = {
-                        id(item): index for index, item in enumerate(children)
-                    }
-                return child_orders[parent_key].get(id(child), fallback)
-
-            def pick_order(entry):
-                index, (artist, _editable) = entry
-                path = []
-                current = artist
-                seen = set()
-                while current is not None and not isinstance(current, Figure):
-                    current_key = id(current)
-                    if current_key in seen:
-                        break
-                    seen.add(current_key)
-                    parent = semantic_parent(current)
-                    fallback = registration_order.get(current_key, index)
-                    order = (
-                        child_order(parent, current, fallback)
-                        if parent is not None
-                        else fallback
-                    )
-                    path.append((float(current.get_zorder()), order))
-                    current = parent
-                return tuple(reversed(path)), index
-
-            candidates = sorted(
-                enumerate(interaction_artists),
-                key=pick_order,
-            )
-            for _index, (candidate, editable) in candidates:
-                if not self._is_interaction_hit(candidate, event):
-                    continue
-                if not editable or self._resolve_selectable_artist(candidate) is None:
-                    picked = blocked
-                    continue
-                if candidate is last_selected:
-                    self._last_pick_blocked = picked is blocked
-                    return (None if self._last_pick_blocked else picked), True
-                picked = candidate
-            self._last_pick_blocked = picked is blocked
-            return (None if self._last_pick_blocked else picked), False
+            available: list[Artist] = []
+            for candidate in self.get_hit_stack(event):
+                if not candidate.editable:
+                    if not available:
+                        self._last_pick_blocked = True
+                    break
+                available.append(candidate.artist)
+            if last_selected is not None and last_selected in available:
+                index = available.index(last_selected) + 1
+                return (available[index] if index < len(available) else None), True
+            return (available[0] if available else picked_element), False
         # start with the figure
         if element is None:
             element = self.figure
@@ -1689,7 +2283,11 @@ class DragManager:
             self.select_element(click_element, event)
 
     def motion_notify_event0(self, event: MouseEvent):
-        self._update_marquee_rect(event)
+        if self.marquee_start is not None:
+            self._hide_preselection()
+            self._update_marquee_rect(event)
+        elif not any(getattr(grabber, "got_artist", False) for grabber in self.selection.grabbers):
+            self.update_preselection(event)
 
     def _artist_intersects_bbox(
         self, artist: Artist, x0: float, y0: float, x1: float, y1: float
@@ -1771,6 +2369,7 @@ class DragManager:
                         )
                     )
                 ]
+            elements = self._ensure_selection_kernel().map_artists(elements)
         if elements or not additive:
             selected_elements = self.select_elements(
                 elements,
@@ -1797,7 +2396,11 @@ class DragManager:
 
     def button_press_event0(self, event: MouseEvent):
         """when the mouse button is pressed"""
+        if event.button == 3:
+            self.show_hit_candidate_menu(event)
+            return
         if event.button == 1:
+            self._hide_preselection()
             last = (
                 self.selection.targets[-1].target
                 if len(self.selection.targets)
@@ -1807,10 +2410,28 @@ class DragManager:
                 [t.target.contains(event)[0] for t in self.selection.targets]
             )
 
-            # recursively iterate over all elements
-            picked_element, _ = self.get_picked_element(
-                event, last_selected=last if event.dblclick else None
+            hit_stack = self.get_hit_stack(event)
+            # Keep the exact-leaf API active so unsupported foreground objects
+            # retain their blocking semantics.
+            raw_picked, _ = self.get_picked_element(event)
+            click_through = _event_has_modifier(
+                event, "alt"
+            ) or _event_has_modifier(event, "option")
+            kernel = self._ensure_selection_kernel()
+            picked_element = kernel.pick(
+                hit_stack,
+                cycle_from=last if click_through else None,
+                wrap=click_through,
             )
+            if kernel.mode is SelectionMode.DIRECT and picked_element is None:
+                picked_element = raw_picked
+
+            if event.dblclick and picked_element is not None:
+                if self.enter_isolation(picked_element):
+                    inner = kernel.pick(hit_stack)
+                    if inner is not None:
+                        self.select_element(inner, event)
+                    return
 
             # if the element is a grabber, store it
             if getattr(self, "_last_pick_blocked", False):
@@ -1829,7 +2450,12 @@ class DragManager:
                 self._start_marquee_selection(event)
                 return
             # if not, we want to keep our selected element, if the click was in the area of the selected element
-            elif len(self.selection.targets) == 0 or not contained or event.dblclick:
+            elif (
+                len(self.selection.targets) == 0
+                or not contained
+                or event.dblclick
+                or click_through
+            ):
                 self.select_element(picked_element, event)
                 contained = True
 
@@ -1912,21 +2538,27 @@ class DragManager:
     def undo(self):
         print("back edit")
         self.figure.change_tracker.backEdit()
-        self.selection.clear_targets()
-        self.selected_element = None
-        self.on_select(None, None)
+        current = [target.target for target in self.selection.targets]
+        self.selected_element = current[-1] if current else None
+        self._update_interaction_controls()
         self.figure.canvas.draw()
 
     def redo(self):
         print("forward edit")
         self.figure.change_tracker.forwardEdit()
-        self.selection.clear_targets()
-        self.selected_element = None
-        self.on_select(None, None)
+        current = [target.target for target in self.selection.targets]
+        self.selected_element = current[-1] if current else None
+        self._update_interaction_controls()
         self.figure.canvas.draw()
 
     def key_press_event(self, event: KeyEvent):
         """when a key is pressed"""
+        if event.key == "v":
+            self.set_selection_mode(SelectionMode.OBJECT)
+            return
+        if event.key == "a":
+            self.set_selection_mode(SelectionMode.DIRECT)
+            return
         # space: print code to restore current configuration
         if event.key == "ctrl+s":
             self.figure.change_tracker.save()
@@ -1935,6 +2567,9 @@ class DragManager:
         if event.key == "ctrl+y":
             self.redo()
         if event.key == "escape":
+            if self._ensure_selection_kernel().scope_root is not None:
+                self.exit_isolation()
+                return
             self.selection.clear_targets()
             self.selected_element = None
             self.on_select(None, None)

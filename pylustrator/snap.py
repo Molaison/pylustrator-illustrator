@@ -40,6 +40,7 @@ from .artist_adapters import (
     set_legend_point_anchor_display as set_legend_point_anchor_display,
 )
 from .helper_functions import main_figure
+from .operations import OperationSupport, TransformOperation
 
 
 DIR_X0 = 1
@@ -77,11 +78,19 @@ class TargetWrapper:
 
     @property
     def do_scale(self) -> bool:
-        return self.capabilities.can_resize
+        return self.supports_operation(TransformOperation.RESIZE_GEOMETRY)
 
     @property
     def fixed_aspect(self) -> bool:
         return self.capabilities.fixed_aspect
+
+    def operation_support(
+        self, operation: TransformOperation | str
+    ) -> OperationSupport:
+        return self.adapter.operation_support(operation)
+
+    def supports_operation(self, operation: TransformOperation | str) -> bool:
+        return self.adapter.supports_operation(operation)
 
     def get_transform(self):
         return self.adapter.get_transform()

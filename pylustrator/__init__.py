@@ -48,6 +48,16 @@ from .artist_adapters import (
     get_artist_adapter,
     register_artist_adapter,
 )
+from .interaction import HitCandidate, HitStack, SelectionKernel, SelectionMode
+from .editor_model import EditorGroup, EditorScene
+from .operations import OperationSupport, TransformIntent, TransformOperation
+from .transform_engine import TransformPlan, TransformPreflightError
+from .commands import (
+    GENERATED_STATE_VERSION,
+    ObjectLocator,
+    migrate_generated_command,
+    migrate_generated_source,
+)
 
 __version__ = "1.3.0"
 
@@ -77,4 +87,19 @@ __all__ = [
     "UnsupportedArtistError",
     "get_artist_adapter",
     "register_artist_adapter",
+    "HitCandidate",
+    "HitStack",
+    "SelectionKernel",
+    "SelectionMode",
+    "EditorGroup",
+    "EditorScene",
+    "OperationSupport",
+    "TransformIntent",
+    "TransformOperation",
+    "TransformPlan",
+    "TransformPreflightError",
+    "GENERATED_STATE_VERSION",
+    "ObjectLocator",
+    "migrate_generated_command",
+    "migrate_generated_source",
 ]

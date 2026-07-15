@@ -7,6 +7,7 @@ import matplotlib as mpl
 from matplotlib.artist import Artist
 
 from pylustrator.drag_helper import get_artist_children
+from pylustrator.editor_model import EditorGroup
 
 
 class myTreeWidgetItem(QtGui.QStandardItem):
@@ -178,8 +179,8 @@ class MyTreeView(QtWidgets.QTreeView):
                     pass
                 return
             try:
-                entry = entry.tree_parent
-            except AttributeError:
+                entry = self.getParentEntry(entry)
+            except (AttributeError, RuntimeError):
                 return
 
     def treeClicked(self, index: QtCore.QModelIndex):
@@ -222,14 +223,25 @@ class MyTreeView(QtWidgets.QTreeView):
         """when expanding a tree item"""
         if entry is None:
             return [self.fig]
-        return get_artist_children(entry)
+        children = get_artist_children(entry)
+        dragger = getattr(getattr(self, "fig", None), "figure_dragger", None)
+        scene = getattr(dragger, "editor_scene", None)
+        if scene is not None:
+            return scene.tree_children(entry, children)
+        return children
 
     def getParentEntry(self, entry: Artist) -> Artist:
         """get the parent of an item"""
+        dragger = getattr(getattr(self, "fig", None), "figure_dragger", None)
+        scene = getattr(dragger, "editor_scene", None)
+        if scene is not None:
+            return scene.tree_parent(entry)
         return getattr(entry, "tree_parent", None)
 
     def getNameOfEntry(self, entry: Artist) -> str:
         """convert an entry to a string"""
+        if isinstance(entry, EditorGroup):
+            return entry.name
         try:
             return str(entry)
         except AttributeError:
@@ -237,6 +249,15 @@ class MyTreeView(QtWidgets.QTreeView):
 
     def getIconOfEntry(self, entry: Artist) -> QtGui.QIcon:
         """get the icon of an entry"""
+        dragger = getattr(getattr(self, "fig", None), "figure_dragger", None)
+        scene = getattr(dragger, "editor_scene", None)
+        if scene is not None:
+            if scene.is_locked(entry):
+                return qta.icon("fa5s.lock")
+            if scene.is_explicitly_hidden(entry) or not entry.get_visible():
+                return qta.icon("fa5s.eye-slash")
+        if isinstance(entry, EditorGroup):
+            return qta.icon("fa5s.layer-group")
         if getattr(entry, "_draggable", None):
             if entry._draggable.connected:
                 return qta.icon("fa5.hand-paper-o")
@@ -285,7 +306,9 @@ class MyTreeView(QtWidgets.QTreeView):
         # add all marker types
         row = -1
         for row, entry in enumerate(query):
-            entry.tree_parent = parent_entry
+            dragger = getattr(getattr(self, "fig", None), "figure_dragger", None)
+            if getattr(dragger, "editor_scene", None) is None:
+                entry.tree_parent = parent_entry
             if 1:
                 if (
                     isinstance(entry, mpl.spines.Spine)

@@ -35,6 +35,9 @@ from pylustrator.drag_helper import (
     GrabbableRectangleSelection,
 )
 from pylustrator.snap import SnapSamePos, TargetWrapper
+from pylustrator.interaction import SelectionMode
+from pylustrator.editor_model import EditorGroup
+from pylustrator.commands import semantic_equal
 
 
 class SelectionView:
@@ -187,6 +190,387 @@ def selection_rect_extents(selection):
             )
         )
     return extents
+
+
+def _center_event(fig, artist, *, key=None, dblclick=False):
+    bbox = artist.get_window_extent(fig.canvas.get_renderer())
+    return MouseEvent(
+        "button_press_event",
+        fig.canvas,
+        (bbox.x0 + bbox.x1) / 2,
+        (bbox.y0 + bbox.y1) / 2,
+        button=1,
+        key=key,
+        dblclick=dblclick,
+    )
+
+
+def test_hit_stack_is_front_to_back_and_exposes_all_overlapping_candidates() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    lower = ax.add_patch(Rectangle((0.2, 0.2), 0.6, 0.6, zorder=2))
+    upper = ax.add_patch(Rectangle((0.2, 0.2), 0.6, 0.6, zorder=5))
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    x, y = ax.transData.transform((0.5, 0.5))
+    event = MouseEvent("button_press_event", fig.canvas, x, y, button=1)
+
+    stack = manager.get_hit_stack(event)
+
+    assert stack.artists.index(upper) < stack.artists.index(lower)
+    assert manager.get_hit_candidates(event)[:2] == (upper, lower)
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_hover_preselection_and_candidate_entries_use_same_resolver() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    lower = ax.add_patch(Rectangle((0.2, 0.2), 0.6, 0.6, zorder=2))
+    upper = ax.add_patch(Rectangle((0.2, 0.2), 0.6, 0.6, zorder=5))
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    x, y = ax.transData.transform((0.5, 0.5))
+    event = MouseEvent("motion_notify_event", fig.canvas, x, y)
+
+    hovered = manager.update_preselection(event)
+    entries = manager.get_hit_candidate_entries(event)
+
+    assert hovered is upper
+    assert manager.preselection_artist is upper
+    assert manager.preselection_rect.isVisible()
+    assert entries[0][0] is upper
+    assert entries[1][0] is lower
+
+    manager._hide_preselection()
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_object_and_direct_tools_resolve_legend_children_differently() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    ax.plot([0, 1], [0, 1], label="line")
+    legend = ax.legend()
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    text = legend.get_texts()[0]
+    event = _center_event(fig, text)
+
+    manager.set_selection_mode(SelectionMode.OBJECT)
+    assert manager.get_hit_candidates(event)[0] is legend
+
+    manager.set_selection_mode(SelectionMode.DIRECT)
+    assert manager.get_hit_candidates(event)[0] is text
+
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_alt_click_cycles_resolved_candidates_in_visual_order() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    lower = ax.add_patch(Rectangle((0.2, 0.2), 0.6, 0.6, zorder=2))
+    upper = ax.add_patch(Rectangle((0.2, 0.2), 0.6, 0.6, zorder=5))
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    x, y = ax.transData.transform((0.5, 0.5))
+
+    first = MouseEvent("button_press_event", fig.canvas, x, y, button=1)
+    manager.button_press_event0(first)
+    manager.button_release_event0(first)
+    assert manager.selected_element is upper
+
+    cycle = MouseEvent(
+        "button_press_event", fig.canvas, x, y, button=1, key="alt"
+    )
+    manager.button_press_event0(cycle)
+    manager.button_release_event0(cycle)
+    assert manager.selected_element is lower
+
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_double_click_enters_legend_isolation_and_escape_exits_one_scope() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    ax.plot([0, 1], [0, 1], label="line")
+    legend = ax.legend()
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    text = legend.get_texts()[0]
+    event = _center_event(fig, text, dblclick=True)
+
+    manager.button_press_event0(event)
+
+    assert manager.isolation_breadcrumbs == ("Legend",)
+    assert manager.selected_element is text
+    assert [target.target for target in manager.selection.targets] == [text]
+
+    manager.key_press_event(KeyEvent("key_press_event", fig.canvas, "escape"))
+    assert manager.isolation_breadcrumbs == ()
+    assert manager.selected_element is legend
+    assert [target.target for target in manager.selection.targets] == [legend]
+
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_logical_group_selects_as_one_object_but_direct_tool_reaches_member() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    first = ax.add_patch(Rectangle((0.15, 0.2), 0.25, 0.3, zorder=3))
+    second = ax.add_patch(Rectangle((0.55, 0.2), 0.25, 0.3, zorder=3))
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_elements([first, second], primary=second)
+
+    group = manager.group_selection("Pair")
+
+    assert isinstance(group, EditorGroup)
+    assert manager.selected_element is group
+    assert [target.target for target in manager.selection.targets] == [group]
+    x, y = ax.transData.transform((0.25, 0.3))
+    event = MouseEvent("button_press_event", fig.canvas, x, y, button=1)
+    assert manager.get_hit_candidates(event)[0] is group
+
+    manager.set_selection_mode(SelectionMode.DIRECT)
+    assert manager.get_hit_candidates(event)[0] is first
+
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_logical_group_drag_transforms_every_member_with_one_selection_box() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    first = ax.add_patch(Rectangle((0.15, 0.2), 0.25, 0.3))
+    second = ax.add_patch(Rectangle((0.55, 0.2), 0.25, 0.3))
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    before = [
+        TargetWrapper(artist).get_selection_points().copy()
+        for artist in (first, second)
+    ]
+    manager.select_elements([first, second], primary=second)
+    group = manager.group_selection("Pair")
+
+    manager.selection.start_move()
+    manager.selection.move(
+        (13, -8),
+        DIR_X0 | DIR_X1 | DIR_Y0 | DIR_Y1,
+        [],
+        ignore_snaps=True,
+    )
+    manager.selection.end_move()
+    fig.canvas.draw()
+
+    assert [target.target for target in manager.selection.targets] == [group]
+    assert len(manager.selection.targets_rects) == 2
+    for artist, original in zip((first, second), before):
+        moved = TargetWrapper(artist).get_selection_points()
+        assert np.allclose(moved - original, [13, -8])
+
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_group_undo_redo_rebuilds_same_stable_group_identity() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    first = ax.add_patch(Rectangle((0.15, 0.2), 0.25, 0.3))
+    second = ax.add_patch(Rectangle((0.55, 0.2), 0.25, 0.3))
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_elements([first, second], primary=second)
+    group = manager.group_selection("Pair")
+    group_id = group.group_id
+    edit = fig.change_tracker.edit
+
+    edit[0]()
+    assert manager.editor_scene.groups == {}
+    assert manager.editor_scene.selection_parent(first) is ax
+
+    edit[1]()
+    restored = manager.editor_scene.groups[group_id]
+    assert restored.name == "Pair"
+    assert restored.members == [first, second]
+    assert manager.editor_scene.selection_parent(first) is restored
+
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_object_tree_shows_logical_group_under_common_matplotlib_owner() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    first = ax.add_patch(Rectangle((0.15, 0.2), 0.25, 0.3))
+    second = ax.add_patch(Rectangle((0.55, 0.2), 0.25, 0.3))
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_elements([first, second], primary=second)
+    group = manager.group_selection("Pair")
+
+    signals = TreeSignals()
+    container = QtWidgets.QWidget()
+    layout = QtWidgets.QVBoxLayout(container)
+    tree = MyTreeView(signals, layout)
+    signals.figure_changed.emit(fig)
+    tree.expand(fig)
+    tree.expand(ax)
+
+    item = tree.getItemFromEntry(group)
+    assert item is not None
+    assert item.text() == "Pair"
+    assert tree.getParentEntry(group) is ax
+    assert tree.queryToExpandEntry(group) == [first, second]
+
+    manager.selection.clear_targets()
+    tree.deleteLater()
+    container.deleteLater()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_locked_and_hidden_layer_state_is_serializable_and_excluded_from_hits() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    rectangle = ax.add_patch(Rectangle((0.2, 0.2), 0.6, 0.6, zorder=5))
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    x, y = ax.transData.transform((0.5, 0.5))
+    event = MouseEvent("button_press_event", fig.canvas, x, y, button=1)
+    assert rectangle in manager.get_hit_candidates(event)
+
+    manager.select_element(rectangle)
+    assert manager.set_selection_locked(True)
+    assert rectangle not in manager.get_hit_candidates(event)
+    assert manager.editor_scene.export_state()["locked"]
+
+    assert manager.unlock_all()
+    manager.select_element(rectangle)
+    assert manager.set_selection_visible(False)
+    assert not rectangle.get_visible()
+    assert rectangle not in manager.get_hit_stack(event).artists
+    assert manager.editor_scene.export_state()["hidden"]
+
+    assert manager.show_all()
+    assert rectangle.get_visible()
+    assert rectangle in manager.get_hit_candidates(event)
+
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def _install_real_history_tracker(fig):
+    from pylustrator.change_tracker import ChangeTracker as RealChangeTracker
+
+    tracker = RealChangeTracker.__new__(RealChangeTracker)
+    tracker.figure = fig
+    tracker.changes = {}
+    tracker.saved = True
+    tracker.edits = []
+    tracker.last_edit = -1
+    tracker.update_changes_signal = None
+    tracker.no_save = False
+    fig.change_tracker = tracker
+    return tracker
+
+
+def test_semantic_noop_drag_restores_exact_state_without_dirtying_history() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    rectangle = ax.add_patch(Rectangle((0.2, 0.3), 0.25, 0.2))
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    tracker = _install_real_history_tracker(fig)
+    manager.select_element(rectangle)
+    before = TargetWrapper(rectangle).get_restore_state()
+
+    manager.selection.start_move()
+    manager.selection.addOffset((12, -7), DIR_X0 | DIR_X1 | DIR_Y0 | DIR_Y1)
+    manager.selection.addOffset((0, 0), DIR_X0 | DIR_X1 | DIR_Y0 | DIR_Y1)
+    manager.selection.has_moved = True
+    manager.selection.end_move()
+
+    assert tracker.edits == []
+    assert tracker.changes == {}
+    assert tracker.saved
+    assert semantic_equal(TargetWrapper(rectangle).get_restore_state(), before, atol=0)
+
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_undo_redo_preserves_selection_and_isolation_scope() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    ax.plot([0, 1], [0, 1], label="line")
+    legend = ax.legend()
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    tracker = _install_real_history_tracker(fig)
+    text = legend.get_texts()[0]
+    assert manager.enter_isolation(legend)
+    manager.select_element(text)
+
+    manager.selection.start_move()
+    manager.selection.addOffset((8, -3), DIR_X0 | DIR_X1 | DIR_Y0 | DIR_Y1)
+    manager.selection.has_moved = True
+    manager.selection.end_move()
+    assert len(tracker.edits) == 1
+
+    manager.undo()
+    assert manager.isolation_breadcrumbs == ("Legend",)
+    assert manager.selected_element is text
+    assert [target.target for target in manager.selection.targets] == [text]
+
+    manager.redo()
+    assert manager.isolation_breadcrumbs == ("Legend",)
+    assert manager.selected_element is text
+    assert [target.target for target in manager.selection.targets] == [text]
+
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_repeated_arrow_nudges_coalesce_into_one_undoable_command() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    rectangle = ax.add_patch(Rectangle((0.2, 0.3), 0.25, 0.2))
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    tracker = _install_real_history_tracker(fig)
+    manager.select_element(rectangle)
+    before = TargetWrapper(rectangle).get_selection_points().copy()
+
+    event = KeyEvent("key_press_event", fig.canvas, "right")
+    manager.selection.keyPressEvent(event)
+    manager.selection.keyPressEvent(event)
+
+    assert len(tracker.edits) == 1
+    moved = TargetWrapper(rectangle).get_selection_points().copy()
+    assert np.allclose(moved - before, [2, 0])
+    manager.undo()
+    assert np.allclose(TargetWrapper(rectangle).get_selection_points(), before)
+    manager.redo()
+    assert np.allclose(TargetWrapper(rectangle).get_selection_points(), moved)
+
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
 
 
 def test_multi_selection_has_visible_per_target_indicators() -> None:

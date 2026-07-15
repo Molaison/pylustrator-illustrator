@@ -255,6 +255,38 @@ def test_axes_proxy_legend_replay_uses_existing_legend_handles() -> None:
     plt.close(fig)
 
 
+def test_legacy_proxy_handle_reference_replays_after_generated_block_init() -> None:
+    from pylustrator.change_tracker import init_figure
+
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    legend = ax.legend(
+        handles=[Patch(facecolor="red"), Patch(facecolor="blue")],
+        labels=["proxy A", "proxy B"],
+    )
+    assert ax.get_legend_handles_labels() == ([], [])
+
+    init_figure(fig)
+
+    legacy_handles = ax.get_legend_handles_labels()[0]
+    assert legacy_handles == list(legend.legend_handles)
+    legacy_handles[0].set_alpha(0.25)
+    assert legend.legend_handles[0].get_alpha() == 0.25
+    plt.close(fig)
+
+
+def test_generated_source_migration_rewrites_legacy_legend_proxy_locator() -> None:
+    from pylustrator.commands import migrate_generated_source
+
+    source = (
+        'plt.figure(1).axes[0].get_legend_handles_labels()[0][1].set_alpha(0.5)\n'
+    )
+
+    migrated = migrate_generated_source(source)
+
+    assert "get_legend_handles_labels" not in migrated
+    assert ".get_legend().legend_handles[1]" in migrated
+
+
 def test_extra_axes_legend_uses_artist_reference_not_current_axes_legend() -> None:
     from pylustrator.change_tracker import ChangeTracker, getReference
 

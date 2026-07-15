@@ -57,3 +57,52 @@ display-space preview.
    :members:
 
 .. autofunction:: pylustrator.register_artist_adapter
+
+Selection and editor groups
+---------------------------
+
+Canvas interaction first builds a front-to-back ``HitStack`` and then resolves
+it through ``SelectionKernel``.  Object Selection groups semantic composites;
+Direct Selection keeps the exact leaf Artist.  Isolation scopes, hover
+preselection, Alt-click cycling, and the candidate menu all use this same
+resolver.
+
+Logical ``EditorGroup`` objects are independent of Matplotlib ownership.  Their
+membership, names, locks, visibility, and stable identifiers are stored in the
+versioned figure editor state and restored before interaction starts.
+
+.. autoclass:: pylustrator.SelectionMode
+   :members:
+
+.. autoclass:: pylustrator.HitStack
+   :members:
+
+.. autoclass:: pylustrator.SelectionKernel
+   :members:
+
+.. autoclass:: pylustrator.EditorGroup
+   :members:
+
+Semantic transforms and replay
+------------------------------
+
+``OperationSupport`` distinguishes geometry resize from appearance scaling,
+layout reflow, rotation, and point editing.  ``TransformPlan`` preflights every
+target before mutation and rolls back earlier targets if an adapter fails.
+
+Generated blocks carry a schema version.  Legacy proxy-legend references are
+accepted during replay and rewritten through the public migration helpers.
+
+.. autoclass:: pylustrator.TransformOperation
+   :members:
+
+.. autoclass:: pylustrator.OperationSupport
+   :members:
+
+.. autoclass:: pylustrator.TransformIntent
+   :members:
+
+.. autoclass:: pylustrator.TransformPlan
+   :members:
+
+.. autofunction:: pylustrator.migrate_generated_source

@@ -52,6 +52,9 @@ from matplotlib.transforms import (
 )
 from packaging import version
 
+from .editor_model import EditorGroup
+from .operations import OperationSupport, TransformOperation
+
 
 def checkXLabel(target: Artist):
     """Return the owning axes when *target* is its x-axis label."""
@@ -192,6 +195,7 @@ class ArtistAdapter:
     """Base display/native interaction protocol for one Matplotlib artist."""
 
     default_capabilities = ArtistCapabilities()
+    unsupported_operation_reasons: dict[TransformOperation, str] = {}
 
     def __init__(self, target: Artist):
         self.target = target
@@ -208,6 +212,46 @@ class ArtistAdapter:
     @property
     def supported(self) -> bool:
         return self.capabilities.editable
+
+    def operation_support(
+        self, operation: TransformOperation | str
+    ) -> OperationSupport:
+        operation = TransformOperation.coerce(operation)
+        capabilities = self.capabilities
+        legacy_support = {
+            TransformOperation.SELECT: capabilities.can_select,
+            TransformOperation.TRANSLATE: capabilities.can_translate,
+            TransformOperation.RESIZE_GEOMETRY: capabilities.can_resize,
+            TransformOperation.ROTATE: capabilities.can_rotate,
+            TransformOperation.SNAPSHOT: capabilities.can_snapshot,
+            TransformOperation.SERIALIZE: capabilities.can_serialize,
+            TransformOperation.SCALE_APPEARANCE: False,
+            TransformOperation.REFLOW_LAYOUT: False,
+            TransformOperation.EDIT_POINTS: False,
+        }
+        if legacy_support[operation]:
+            constraints = ("fixed_aspect",) if (
+                operation is TransformOperation.RESIZE_GEOMETRY
+                and capabilities.fixed_aspect
+            ) else ()
+            preview_strategy = (
+                "native_rotation"
+                if operation is TransformOperation.ROTATE
+                else "control_points"
+            )
+            return OperationSupport.allowed(
+                operation,
+                constraints=constraints,
+                preview_strategy=preview_strategy,
+            )
+        reason = self.unsupported_operation_reasons.get(
+            operation,
+            f"{type(self.target).__name__} has no lossless {operation.value} adapter",
+        )
+        return OperationSupport.denied(operation, reason)
+
+    def supports_operation(self, operation: TransformOperation | str) -> bool:
+        return self.operation_support(operation).supported
 
     def get_transform(self) -> Transform:
         getter = getattr(self.target, "get_transform", None)
@@ -730,6 +774,11 @@ class FancyBboxPatchAdapter(PatchAdapter):
 
 
 class RegularPolygonAdapter(PatchAdapter):
+    unsupported_operation_reasons = {
+        TransformOperation.RESIZE_GEOMETRY: (
+            "RegularPolygon resize must change its semantic radius, not stretch its center point"
+        )
+    }
     default_capabilities = ArtistCapabilities(
         can_select=True,
         can_translate=True,
@@ -810,6 +859,14 @@ class PathPatchAdapter(PatchAdapter):
 
 
 class TextAdapter(ArtistAdapter):
+    unsupported_operation_reasons = {
+        TransformOperation.RESIZE_GEOMETRY: (
+            "Text bounds come from font metrics; use appearance scaling instead of geometry resize"
+        ),
+        TransformOperation.SCALE_APPEARANCE: (
+            "Text appearance scaling is not implemented yet"
+        ),
+    }
     default_capabilities = ArtistCapabilities(
         can_select=True,
         can_translate=True,
@@ -1075,6 +1132,14 @@ class AxesAdapter(ArtistAdapter):
 
 
 class LegendAdapter(ArtistAdapter):
+    unsupported_operation_reasons = {
+        TransformOperation.RESIZE_GEOMETRY: (
+            "Legend size is controlled by layout; use legend reflow instead of stretching its bounds"
+        ),
+        TransformOperation.REFLOW_LAYOUT: (
+            "Legend layout reflow is not implemented yet"
+        ),
+    }
     default_capabilities = ArtistCapabilities(
         can_select=True,
         can_translate=True,
@@ -1131,7 +1196,94 @@ class LegendAdapter(ArtistAdapter):
         self.invalidate_geometry_cache()
 
 
+class EditorGroupAdapter(ArtistAdapter):
+    """Apply one display-space operation atomically to logical group members."""
+
+    @classmethod
+    def capabilities_for(cls, target: EditorGroup) -> ArtistCapabilities:
+        if not target.members:
+            return ArtistCapabilities()
+        capabilities = [get_artist_adapter(member).capabilities for member in target.members]
+        return ArtistCapabilities(
+            can_select=all(value.can_select for value in capabilities),
+            can_translate=all(value.can_translate for value in capabilities),
+            can_resize=all(value.can_resize for value in capabilities),
+            can_snapshot=all(value.can_snapshot for value in capabilities),
+            can_serialize=all(value.can_serialize for value in capabilities),
+            fixed_aspect=any(value.fixed_aspect for value in capabilities),
+            # Rotation of a group also changes member positions around one pivot;
+            # native per-member rotation alone is not an equivalent operation.
+            can_rotate=False,
+        )
+
+    def get_transform(self) -> Transform:
+        return IdentityTransform()
+
+    def _member_adapters(self) -> list[ArtistAdapter]:
+        return [get_artist_adapter(member) for member in self.target.members]
+
+    def native_control_points(self):
+        points = []
+        for adapter in self._member_adapters():
+            points.extend(adapter.control_points())
+        return points
+
+    def selection_points(self) -> np.ndarray:
+        preview = self._preview_points("_pylustrator_preview_selection_points")
+        if preview is not None:
+            return preview
+        points = [
+            adapter.selection_points()
+            for adapter in self._member_adapters()
+            if adapter.capabilities.can_select
+        ]
+        points = [value for value in points if len(value)]
+        return np.concatenate(points) if points else np.empty((0, 2), dtype=float)
+
+    def _apply_native_control_points(self, points) -> None:
+        start = 0
+        for adapter in self._member_adapters():
+            length = len(adapter.control_points())
+            adapter.apply_control_points(points[start : start + length])
+            start += length
+        if start != len(points):
+            raise ValueError("Editor-group control-point count changed during transform")
+
+    def serialize_changes(self):
+        records = []
+        for adapter in self._member_adapters():
+            records.extend(adapter.serialize_changes())
+        return tuple(records)
+
+    def snapshot(self):
+        return {
+            "type": "editor_group",
+            "id": self.target.group_id,
+            "members": [
+                (member, get_artist_adapter(member).snapshot())
+                for member in self.target.members
+            ],
+        }
+
+    def restore(self, state) -> None:
+        if state.get("type") != "editor_group" or state.get("id") != self.target.group_id:
+            raise ValueError(f"Snapshot does not belong to group {self.target.group_id!r}")
+        for member, member_state in state["members"]:
+            get_artist_adapter(member).restore(member_state)
+        self.invalidate_geometry_cache()
+
+    def invalidate_geometry_cache(self) -> None:
+        super().invalidate_geometry_cache()
+        for adapter in self._member_adapters():
+            adapter.invalidate_geometry_cache()
+
+
 class Line2DAdapter(ArtistAdapter):
+    unsupported_operation_reasons = {
+        TransformOperation.RESIZE_GEOMETRY: (
+            "Line geometry resize requires an affine coordinate preflight"
+        )
+    }
     default_capabilities = ArtistCapabilities(
         can_select=True,
         can_translate=True,
@@ -1223,6 +1375,14 @@ class AxesImageAdapter(ArtistAdapter):
 
 
 class CollectionAdapter(ArtistAdapter):
+    unsupported_operation_reasons = {
+        TransformOperation.RESIZE_GEOMETRY: (
+            "Collection resize must distinguish item positions from marker appearance"
+        ),
+        TransformOperation.SCALE_APPEARANCE: (
+            "Collection appearance scaling is not implemented yet"
+        ),
+    }
     default_capabilities = ArtistCapabilities(
         can_select=True,
         can_translate=True,
@@ -1390,6 +1550,7 @@ def get_artist_adapter(target: Artist) -> ArtistAdapter:
 # distance, then priority and only then registration order for true ties.
 for _artist_type, _adapter_type in (
     (Artist, ArtistAdapter),
+    (EditorGroup, EditorGroupAdapter),
     (Axes, AxesAdapter),
     (Text, TextAdapter),
     (Annotation, AnnotationAdapter),
@@ -1424,6 +1585,7 @@ __all__ = [
     "CollectionAdapter",
     "ConnectionPatchAdapter",
     "EllipseAdapter",
+    "EditorGroupAdapter",
     "FancyArrowPatchAdapter",
     "FancyBboxPatchAdapter",
     "LegendAdapter",
