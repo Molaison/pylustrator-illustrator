@@ -211,6 +211,23 @@ def test_transform_preflight_rejects_mixed_selection_before_any_mutation() -> No
     plt.close(fig)
 
 
+def test_transform_preflight_rejects_fully_clipped_translation_destination() -> None:
+    fig, axes = plt.subplots(1, 2, figsize=(6, 3), dpi=100)
+    rectangle = axes[1].add_patch(Rectangle((0.6, 0.4), 0.2, 0.2))
+    fig.canvas.draw()
+    wrapper = TargetWrapper(rectangle)
+    before = wrapper.get_restore_state()
+    left_axes_center = np.asarray(axes[0].bbox.get_points(), dtype=float).mean(axis=0)
+    right_rectangle_center = wrapper.get_selection_points().mean(axis=0)
+    delta = left_axes_center - right_rectangle_center
+
+    with pytest.raises(TransformPreflightError, match="active clip region"):
+        TransformPlan.preflight([rectangle], TransformIntent.translate(delta))
+
+    assert np.allclose(wrapper.get_restore_state()["positions"], before["positions"])
+    plt.close(fig)
+
+
 def test_transform_plan_rolls_back_all_targets_when_one_adapter_fails() -> None:
     class AtomicArtist(Artist):
         def __init__(self, position, fail=False):

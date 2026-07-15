@@ -41,6 +41,17 @@ class TransformPlan:
             support = adapter.operation_support(intent.operation)
             if not support.supported:
                 failures.append((adapter.target, support))
+                continue
+            if intent.operation is TransformOperation.TRANSLATE:
+                try:
+                    adapter.preflight_translation(intent.delta)
+                except (TypeError, ValueError) as error:
+                    failures.append(
+                        (
+                            adapter.target,
+                            OperationSupport.denied(intent.operation, str(error)),
+                        )
+                    )
         if failures:
             raise TransformPreflightError(failures)
         return cls(intent, adapters)

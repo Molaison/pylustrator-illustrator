@@ -31,9 +31,11 @@ from typing import Iterable, Sequence
 from qtpy import QtCore, QtGui, QtWidgets
 
 from .artist_adapters import (
+    UnsupportedArtistError,
     iter_figure_legends,
     iter_legend_children,
     selection_geometry_snapshot,
+    suspend_change_recording,
 )
 from .snap import (
     TargetWrapper,
@@ -109,9 +111,10 @@ def _container_keeps_children(artist: Artist) -> bool:
 
 
 def _event_has_modifier(event, modifier: str) -> bool:
+    key = getattr(event, "key", None)
     return (
-        modifier in event.key.split("+")
-        if event is not None and event.key is not None
+        modifier in key.split("+")
+        if event is not None and key is not None
         else False
     )
 
@@ -164,7 +167,11 @@ class GrabFunctions(object):
         if self.got_artist:
             self.got_artist = False
             self.figure.canvas.mpl_disconnect(self._c1)
-            self.releasedEvent(event)
+            try:
+                self.releasedEvent(event)
+            except UnsupportedArtistError as error:
+                QtWidgets.QMessageBox.warning(None, "Pylustrator", str(error))
+                self.figure.canvas.draw_idle()
 
     def clickedEvent(self, event: MouseEvent):
         """when the mouse is clicked"""
@@ -277,12 +284,14 @@ class GrabbableRectangleSelection(GrabFunctions):
         self.addGrabber(0.5, 1, DIR_Y1, GrabberGenericRectangle)
         self.addGrabber(1, 0, DIR_X1 | DIR_Y0, GrabberGenericRound)
         self.addGrabber(0, 0.5, DIR_X0, GrabberGenericRectangle)
+        self.rotation_grabber = GrabberRotation(self, self.graphics_scene)
 
         self.c4 = self.figure.canvas.mpl_connect("key_press_event", self.keyPressEvent)
 
         self.targets = []
         self.targets_rects = []
         self.lock_aspect_ratio = False
+        self.reference_point = (0.5, 0.5)
         self.defer_artist_updates = True
 
         self.hide_grabber()
@@ -366,17 +375,21 @@ class GrabbableRectangleSelection(GrabFunctions):
         points = None
         for target in self.targets:
             new_points = np.array(target.get_selection_points())
+            if new_points.ndim != 2 or not len(new_points):
+                continue
 
             if points is None:
                 points = new_points
             else:
                 points = np.concatenate((points, new_points))
 
-        if points is None:
+        if points is None or not len(points):
+            self.hide_grabber()
             return
 
         for grabber in self.grabbers:
             grabber.targets = self.targets
+        self.rotation_grabber.targets = self.targets
 
         self.positions[0] = np.min(points[:, 0])
         self.positions[1] = np.min(points[:, 1])
@@ -394,10 +407,7 @@ class GrabbableRectangleSelection(GrabFunctions):
                 self.positions[1] + 0.01,
             )
 
-        if self.do_target_scale():
-            self.update_grabber()
-        else:
-            self.hide_grabber()
+        self.update_grabber()
 
     @staticmethod
     def _unique_wrappers(wrappers: Iterable[TargetWrapper]) -> list[TargetWrapper]:
@@ -525,6 +535,26 @@ class GrabbableRectangleSelection(GrabFunctions):
                 return np.array([bbox.x0, bbox.y0, bbox.x1, bbox.y1])
             return self._bounds_from_points(points_list)
 
+        def execute_translation_plan(plan, axis: int, edit_name: str) -> None:
+            vectors = []
+            for target, delta in plan:
+                display_delta = np.zeros(2, dtype=float)
+                display_delta[axis] = delta
+                target.preflight_rigid_visible_translation(display_delta)
+                vectors.append((target, display_delta))
+            self.start_move(save_targets=[target for target, _delta in vectors])
+            try:
+                for target, display_delta in vectors:
+                    target.translate(display_delta)
+                self.update_extent()
+                self.has_moved = True
+                self.end_move(edit_name)
+            except Exception:
+                self._restore_move_start()
+                self.has_moved = False
+                self.end_move(edit_name)
+                raise
+
         def align(y: int, func: callable):
             items = self._resolve_alignment_items()
             measure_points = [
@@ -537,14 +567,7 @@ class GrabbableRectangleSelection(GrabFunctions):
             new_center = func(reference_bounds(measure_points)[y::2])
             deltas = [new_center - center for center in centers]
             plan = self._delta_plan(items, deltas)
-            self.start_move(save_targets=[target for target, _delta in plan])
-            for target, delta in plan:
-                display_delta = np.zeros(2, dtype=float)
-                display_delta[y] = delta
-                target.translate(display_delta)
-            self.update_extent()
-            self.has_moved = True
-            self.end_move()
+            execute_translation_plan(plan, y, "Align")
 
             self.figure.canvas.draw()
             self.update_selection_rectangles()
@@ -575,13 +598,7 @@ class GrabbableRectangleSelection(GrabFunctions):
                 deltas[index] = pos - np.min(points[:, y])
                 pos += sizes[index] + spaces
             plan = self._delta_plan(items, deltas)
-            self.start_move(save_targets=[target for target, _delta in plan])
-            for target, delta in plan:
-                display_delta = np.zeros(2, dtype=float)
-                display_delta[y] = delta
-                target.translate(display_delta)
-            self.has_moved = True
-            self.end_move()
+            execute_translation_plan(plan, y, "Distribute")
 
             self.figure.canvas.draw()
             self.update_selection_rectangles()
@@ -672,13 +689,6 @@ class GrabbableRectangleSelection(GrabFunctions):
                 raise ValueError("Selected object has no width.")
             if match_height and current_height <= 0:
                 raise ValueError("Selected object has no height.")
-            planned.append((target, bounds))
-
-        self.start_move()
-        changed = False
-        for target, bounds in planned:
-            current_width = bounds[2] - bounds[0]
-            current_height = bounds[3] - bounds[1]
             scale_x = reference_width / current_width if match_width else 1.0
             scale_y = reference_height / current_height if match_height else 1.0
             if keep_aspect_ratio:
@@ -701,16 +711,26 @@ class GrabbableRectangleSelection(GrabFunctions):
                 ],
                 dtype=float,
             )
-            target.resize(transform)
-            changed = True
+            target.preflight_rigid_visible_resize(transform)
+            planned.append((target, transform))
 
-        if changed:
+        if not planned:
+            return False
+        self.start_move()
+        try:
+            for target, transform in planned:
+                target.resize(transform)
             self.update_extent()
             self.has_moved = True
-        self.end_move("Resize")
+            self.end_move("Resize")
+        except Exception:
+            self._restore_move_start()
+            self.has_moved = False
+            self.end_move("Resize")
+            raise
         self.figure.canvas.draw()
         self.update_selection_rectangles()
-        return changed
+        return True
 
     def scale_selection(self, factor: float) -> bool:
         """Scale the current selection around its combined center."""
@@ -724,8 +744,7 @@ class GrabbableRectangleSelection(GrabFunctions):
         if np.isclose(factor, 1.0):
             return False
 
-        center_x = (self.positions[0] + self.positions[2]) / 2
-        center_y = (self.positions[1] + self.positions[3]) / 2
+        center_x, center_y = self.reference_position()
         transform = np.array(
             [
                 [factor, 0.0, center_x * (1.0 - factor)],
@@ -735,12 +754,20 @@ class GrabbableRectangleSelection(GrabFunctions):
             dtype=float,
         )
 
-        self.start_move()
         for target in self.targets:
-            target.resize(transform)
-        self.update_extent()
-        self.has_moved = True
-        self.end_move("Scale")
+            target.preflight_rigid_visible_resize(transform)
+        self.start_move()
+        try:
+            for target in self.targets:
+                target.resize(transform)
+            self.update_extent()
+            self.has_moved = True
+            self.end_move("Scale")
+        except Exception:
+            self._restore_move_start()
+            self.has_moved = False
+            self.end_move("Scale")
+            raise
         self.figure.canvas.draw()
         self.update_selection_rectangles()
         return True
@@ -756,6 +783,126 @@ class GrabbableRectangleSelection(GrabFunctions):
 
     def _set_rotation_value(self, target: Artist, value: float) -> None:
         TargetWrapper(target).set_rotation(value)
+
+    def rotation_handle_supported(self) -> bool:
+        """Expose a handle only when one exact native rotation pivot exists."""
+
+        return bool(
+            len(self.targets) == 1
+            and self.operation_support(TransformOperation.ROTATE).supported
+        )
+
+    def rotation_pivot(self) -> np.ndarray:
+        if not self.rotation_handle_supported():
+            raise ValueError(
+                "Rotation handles require one selected object with native rotation support"
+            )
+        return np.asarray(self.targets[0].get_rotation_pivot(), dtype=float)
+
+    def start_rotation(self, event: MouseEvent) -> None:
+        """Begin one deferred, atomic native-rotation gesture."""
+
+        if not self.rotation_handle_supported():
+            support = self.operation_support(TransformOperation.ROTATE)
+            raise ValueError(support.reason or "Rotation handle is unavailable")
+        pivot = self.rotation_pivot()
+        pointer = np.asarray((event.x, event.y), dtype=float)
+        vector = pointer - pivot
+        if not np.all(np.isfinite(vector)) or np.linalg.norm(vector) <= 1e-9:
+            raise ValueError("Rotation handle is too close to its native pivot")
+
+        self.start_move(save_targets=self.targets)
+        self.rotation_drag_target = self.targets[0]
+        self.rotation_drag_pivot = pivot
+        self.rotation_drag_start_pointer_angle = float(
+            np.degrees(np.arctan2(vector[1], vector[0]))
+        )
+        self.rotation_drag_start_value = self.rotation_drag_target.get_rotation()
+        self.rotation_drag_preview_value = self.rotation_drag_start_value
+
+    def preview_rotation(self, event: MouseEvent) -> float:
+        """Preview the exact native angle that will be committed on release."""
+
+        target = getattr(self, "rotation_drag_target", None)
+        if target is None:
+            raise RuntimeError("No rotation gesture is active")
+        pointer = np.asarray((event.x, event.y), dtype=float)
+        vector = pointer - self.rotation_drag_pivot
+        if not np.all(np.isfinite(vector)) or np.linalg.norm(vector) <= 1e-9:
+            return self.rotation_drag_preview_value
+        pointer_angle = float(np.degrees(np.arctan2(vector[1], vector[0])))
+        delta = (
+            pointer_angle - self.rotation_drag_start_pointer_angle + 180.0
+        ) % 360.0 - 180.0
+        if _event_has_modifier(event, "shift"):
+            delta = round(delta / 15.0) * 15.0
+        value = self.rotation_drag_start_value + delta
+        try:
+            with suspend_change_recording():
+                target.set_rotation(value)
+        except Exception:
+            self._restore_move_start()
+            self.has_moved = False
+            self.end_move("Rotate")
+            self._clear_rotation_gesture()
+            raise
+        self.rotation_drag_preview_value = value
+        self.has_moved = not np.isclose(value, self.rotation_drag_start_value)
+        self.update_extent()
+        self.update_selection_rectangles()
+        self.hide_grabber()
+        canvas = self.figure.canvas
+        if hasattr(canvas, "schedule_draw"):
+            canvas.schedule_draw()
+        else:
+            canvas.draw_idle()
+        return value
+
+    def _clear_rotation_gesture(self) -> None:
+        for name in (
+            "rotation_drag_target",
+            "rotation_drag_pivot",
+            "rotation_drag_start_pointer_angle",
+            "rotation_drag_start_value",
+            "rotation_drag_preview_value",
+        ):
+            try:
+                delattr(self, name)
+            except AttributeError:
+                pass
+
+    def end_rotation(self) -> bool:
+        """Commit one generated change and one undo item for a handle gesture."""
+
+        target = getattr(self, "rotation_drag_target", None)
+        if target is None:
+            return False
+        changed = not np.isclose(
+            self.rotation_drag_preview_value, self.rotation_drag_start_value
+        )
+        try:
+            if changed:
+                # The preview was deliberately unrecorded. Reapplying the final
+                # absolute value emits exactly one stable generated change.
+                target.set_rotation(self.rotation_drag_preview_value)
+                self.update_extent()
+                self.has_moved = True
+            else:
+                self.has_moved = False
+            self.end_move("Rotate")
+        except Exception:
+            self._restore_move_start()
+            self.has_moved = False
+            self.end_move("Rotate")
+            self._clear_rotation_gesture()
+            raise
+        self._clear_rotation_gesture()
+        signal = getattr(self.figure.signals, "figure_selection_property_changed", None)
+        if signal is not None:
+            signal.emit()
+        self.figure.canvas.draw()
+        self.update_selection_rectangles()
+        return changed
 
     def rotate_selection(self, angle_degrees: float) -> bool:
         """Rotate selected objects that have a native saveable rotation property."""
@@ -791,7 +938,9 @@ class GrabbableRectangleSelection(GrabFunctions):
 
         redo()
         self.figure.change_tracker.addEdit([undo, redo, "Rotate"])
-        self.figure.signals.figure_selection_property_changed.emit()
+        signal = getattr(self.figure.signals, "figure_selection_property_changed", None)
+        if signal is not None:
+            signal.emit()
         self.figure.signals.figure_selection_moved.emit()
         return True
 
@@ -824,6 +973,10 @@ class GrabbableRectangleSelection(GrabFunctions):
                     )
                 if new_points is None:
                     new_points = np.array(target.get_selection_points())
+                if new_points.ndim != 2 or not len(new_points):
+                    for i in range(2):
+                        self.targets_rects[index * 2 + i].setRect(-100, -100, 0, 0)
+                    continue
                 x0, y0, x1, y1 = (
                     np.min(new_points[:, 0]),
                     np.min(new_points[:, 1]),
@@ -860,12 +1013,18 @@ class GrabbableRectangleSelection(GrabFunctions):
             for grabber in self.grabbers:
                 grabber.updatePos()
         else:
-            self.hide_grabber()
+            for grabber in self.grabbers:
+                grabber.set_xy((-100, -100))
+        if self.rotation_handle_supported():
+            self.rotation_grabber.updatePos()
+        else:
+            self.rotation_grabber.hide()
 
     def hide_grabber(self):
         """hide the grabber elements"""
         for grabber in self.grabbers:
             grabber.set_xy((-100, -100))
+        self.rotation_grabber.hide()
 
     def clear_targets(self):
         """remove all elements from the selection"""
@@ -897,6 +1056,163 @@ class GrabbableRectangleSelection(GrabFunctions):
     def size(self) -> (float, float):
         """the size of the current selection (width and height)"""
         return self.p2 - self.p1
+
+    def selection_bounds(self) -> np.ndarray:
+        """Return the exact visible bounds shared by selection UI operations."""
+
+        point_sets = []
+        for target in self.targets:
+            points = np.asarray(target.get_selection_points(), dtype=float)
+            if points.ndim != 2 or points.shape[1] < 2:
+                continue
+            points = points[np.all(np.isfinite(points[:, :2]), axis=1), :2]
+            if len(points):
+                point_sets.append(points)
+        if not point_sets:
+            raise ValueError("No selected object has finite visible geometry")
+        return self._bounds_from_points(point_sets)
+
+    def set_reference_point(self, point: Sequence[float]) -> tuple[float, float]:
+        """Set the normalized transform-panel anchor without mutating the figure."""
+
+        point = tuple(float(value) for value in point)
+        if len(point) != 2 or not np.all(np.isfinite(point)):
+            raise ValueError("Reference point must contain two finite values")
+        if any(value not in (0.0, 0.5, 1.0) for value in point):
+            raise ValueError("Reference point values must use the 3x3 transform grid")
+        self.reference_point = point
+        return point
+
+    def reference_position(self) -> np.ndarray:
+        """Resolve the normalized reference point in display coordinates."""
+
+        bounds = self.selection_bounds()
+        low = bounds[:2]
+        size = bounds[2:] - low
+        return low + np.asarray(self.reference_point, dtype=float) * size
+
+    def translate_reference_to(self, display_position: Sequence[float]) -> bool:
+        """Move the whole selection so its active reference reaches a display point."""
+
+        if not self.targets:
+            return False
+        support = self.operation_support(TransformOperation.TRANSLATE)
+        if not support.supported:
+            raise ValueError(support.reason)
+        desired = np.asarray(display_position, dtype=float)
+        if desired.shape != (2,) or not np.all(np.isfinite(desired)):
+            raise ValueError("Reference position must contain two finite values")
+        delta = desired - self.reference_position()
+        if np.allclose(delta, 0.0):
+            return False
+
+        for target in self.targets:
+            target.preflight_rigid_visible_translation(delta)
+        self.start_move()
+        try:
+            for target in self.targets:
+                target.translate(delta)
+            self.update_extent()
+            self.has_moved = True
+            self.end_move("Change position")
+        except Exception:
+            self._restore_move_start()
+            self.has_moved = False
+            self.end_move("Change position")
+            raise
+        signal = getattr(self.figure.signals, "figure_selection_property_changed", None)
+        if signal is not None:
+            signal.emit()
+        self.figure.canvas.draw()
+        self.update_selection_rectangles()
+        return True
+
+    def resize_selection_to(
+        self,
+        display_size: Sequence[float],
+        *,
+        keep_aspect_ratio: bool = False,
+        changed_axis: int | None = None,
+    ) -> bool:
+        """Resize visible selection bounds about the active reference point."""
+
+        if not self.targets:
+            return False
+        support = self.operation_support(TransformOperation.RESIZE_GEOMETRY)
+        if not support.supported:
+            raise ValueError(support.reason)
+        desired = np.asarray(display_size, dtype=float)
+        if desired.shape != (2,) or not np.all(np.isfinite(desired)):
+            raise ValueError("Selection size must contain two finite values")
+
+        bounds = self.selection_bounds()
+        current = bounds[2:] - bounds[:2]
+        if np.any(current <= np.finfo(float).eps):
+            raise ValueError("Selection has a zero visible width or height")
+        if np.any(desired <= 0.0):
+            raise ValueError("Selection width and height must be positive")
+
+        if keep_aspect_ratio:
+            if changed_axis in (0, 1):
+                scale = desired[changed_axis] / current[changed_axis]
+            else:
+                scale = min(desired[0] / current[0], desired[1] / current[1])
+            desired = current * scale
+        scale_x, scale_y = desired / current
+        if np.allclose((scale_x, scale_y), (1.0, 1.0)):
+            return False
+
+        pivot_x, pivot_y = self.reference_position()
+        matrix = np.array(
+            [
+                [scale_x, 0.0, pivot_x * (1.0 - scale_x)],
+                [0.0, scale_y, pivot_y * (1.0 - scale_y)],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=float,
+        )
+
+        planned_selection = [
+            target.preflight_rigid_visible_resize(matrix) for target in self.targets
+        ]
+        expected_bounds = self._bounds_from_points(
+            [
+                self.apply_transform(
+                    matrix,
+                    np.array(
+                        [[bounds[0], bounds[1]], [bounds[2], bounds[3]]],
+                        dtype=float,
+                    ),
+                )
+            ]
+        )
+        planned_bounds = self._bounds_from_points(planned_selection)
+        if not np.allclose(
+            planned_bounds, expected_bounds, atol=0.25, rtol=0.0
+        ):
+            raise UnsupportedArtistError(
+                "Numeric resize cannot reach the requested visible bounds because "
+                "an active clip would change the selection envelope"
+            )
+
+        self.start_move()
+        try:
+            for target in self.targets:
+                target.resize(matrix)
+            self.update_extent()
+            self.has_moved = True
+            self.end_move("Resize")
+        except Exception:
+            self._restore_move_start()
+            self.has_moved = False
+            self.end_move("Resize")
+            raise
+        signal = getattr(self.figure.signals, "figure_selection_property_changed", None)
+        if signal is not None:
+            signal.emit()
+        self.figure.canvas.draw()
+        self.update_selection_rectangles()
+        return True
 
     def get_trans_matrix(self):
         """the transformation matrix for the current displacement and scaling of the selection"""
@@ -1020,11 +1336,29 @@ class GrabbableRectangleSelection(GrabFunctions):
     def _commit_deferred_positions(self):
         if not getattr(self, "defer_current_move", False):
             return
+        pending = []
         for target in self.targets:
             points = self.move_current_positions.get(id(target.target))
             if points is None:
                 continue
+            translation_delta = None
+            start = self.move_start_positions.get(id(target.target))
+            if start is not None and np.shape(start) == np.shape(points) and len(points):
+                deltas = np.asarray(points, dtype=float) - np.asarray(start, dtype=float)
+                if np.allclose(deltas, deltas[0]):
+                    translation_delta = deltas[0]
+            pending.append((target, points, translation_delta))
+
+        # Preview geometry is already at the proposed destination. Clear every
+        # preview before validating the display delta, otherwise adapters would
+        # add the delta to the preview a second time. Preflight the complete
+        # transaction before mutating any target.
+        for target, _points, _translation_delta in pending:
             self._clear_preview(target)
+        for target, _points, translation_delta in pending:
+            if translation_delta is not None:
+                target.preflight_translation(translation_delta)
+        for target, points, _translation_delta in pending:
             target.set_positions(points)
 
     def _move_changed_semantically(self) -> bool:
@@ -1180,11 +1514,20 @@ class GrabbableRectangleSelection(GrabFunctions):
                 )
                 selection_points = resize_selection_points
             self.move_current_positions[id(target.target)] = points
-            self.move_current_selection_points[id(target.target)] = selection_points
             if getattr(self, "defer_current_move", False):
                 self._set_preview_positions(target, points, selection_points)
+                # TargetWrapper applies the active paint clip to the preview.
+                # Store the same envelope that the user actually sees so the
+                # preview indicator and committed selection cannot diverge.
+                selection_points = np.asarray(
+                    target.get_selection_points(), dtype=float
+                )
             else:
                 target.set_positions(points)
+                selection_points = np.asarray(
+                    target.get_selection_points(), dtype=float
+                )
+            self.move_current_selection_points[id(target.target)] = selection_points
 
         self.update_selection_rectangles(use_previous_offset=True)
         # for rect in self.targets_rects:
@@ -1315,6 +1658,7 @@ class DragManager:
         self.make_figure_draggable(self.figure)
         self.make_axes_draggable(self.figure.axes)
         self.editor_scene.restore_persisted_state()
+        self._sync_editor_groups()
         self.selection = GrabbableRectangleSelection(figure, figure._pyl_scene)
         self.figure.selection = self.selection
         self.change_tracker = ChangeTracker(figure, no_save)
@@ -1469,12 +1813,48 @@ class DragManager:
         self._update_interaction_controls()
 
     def _notify_editor_scene_changed(self, owner: Artist = None) -> None:
+        self._sync_editor_groups()
         signals = getattr(self.figure, "signals", None)
         signal = getattr(signals, "figure_element_child_created", None)
         if signal is not None:
             signal.emit(owner or self.figure)
         self.invalidate_geometry_cache()
         self.figure.canvas.draw_idle()
+
+    def _sync_editor_groups(self) -> None:
+        """Keep transient group nodes aligned with the persisted editor scene."""
+
+        scene = self._ensure_editor_scene()
+        active_groups = tuple(scene.groups.values())
+        active_ids = {id(group) for group in active_groups}
+
+        def remove_stale(items):
+            return [
+                item
+                for item in items
+                if not isinstance(item, EditorGroup) or id(item) in active_ids
+            ]
+
+        if hasattr(self, "_selectable_artists"):
+            self._selectable_artists = remove_stale(self._selectable_artists)
+            self._selectable_artist_ids = {
+                id(item) for item in self._selectable_artists
+            }
+        if hasattr(self, "_interaction_artists"):
+            self._interaction_artists = remove_stale(self._interaction_artists)
+            self._interaction_artist_ids = {
+                id(item) for item in self._interaction_artists
+            }
+        if hasattr(self, "_uneditable_artists"):
+            self._uneditable_artists = remove_stale(self._uneditable_artists)
+            self._uneditable_artist_ids = {
+                id(item) for item in self._uneditable_artists
+            }
+        for key, parent in list(getattr(self, "_selection_parent_by_id", {}).items()):
+            if isinstance(parent, EditorGroup) and id(parent) not in active_ids:
+                self._selection_parent_by_id.pop(key, None)
+        for group in active_groups:
+            self.make_draggable(group, group.owner)
 
     def _hide_preselection(self) -> None:
         rect = getattr(self, "preselection_rect", None)
@@ -1963,6 +2343,8 @@ class DragManager:
 
         if getattr(artist, "figure", None) is None:
             return False
+        if isinstance(artist, EditorGroup) and artist not in self._ensure_editor_scene().groups.values():
+            return False
         current = artist
         seen = set()
         parent_map = getattr(self, "_selection_parent_by_id", {})
@@ -2405,7 +2787,19 @@ class DragManager:
             if self._artist_intersects_bbox(artist, x0, y0, x1, y1)
         ]
         prefer_containers = bool(getattr(self, "marquee_select_containers_only", False))
-        if not prefer_containers:
+        if prefer_containers:
+            elements = [
+                element for element in elements if _container_yields_to_children(element)
+            ]
+        else:
+            # Panel containers are never an implicit fallback for an otherwise
+            # empty marquee. This keeps the opt-in toggle semantically real and
+            # prevents an empty plot-area drag from moving the entire Axes.
+            elements = [
+                element
+                for element in elements
+                if not _container_yields_to_children(element)
+            ]
             blockers = [
                 artist
                 for artist in getattr(self, "_uneditable_artists", [])
@@ -2734,6 +3128,73 @@ class GrabberGenericRectangle(GrabberGeneric):
         return
         Rectangle.set_xy(self, (xy[0] - self.d / 2, xy[1] - self.d / 2))
         self.rect.set_xy((xy[0] - self.d / 2, xy[1] - self.d / 2))
+
+
+class GrabberRotation(GrabFunctions):
+    """One native-angle handle anchored to the selected artist's true pivot."""
+
+    def __init__(self, parent: GrabbableRectangleSelection, scene):
+        GrabFunctions.__init__(self, parent, 0, no_height=True)
+        self.targets = []
+        line_pen = QtGui.QPen(QtGui.QColor("#1E88E5"), 1)
+        pivot_pen = QtGui.QPen(QtGui.QColor("#1E88E5"), 2)
+        handle_pen = QtGui.QPen(QtGui.QColor("black"), 2)
+        handle_brush = QtGui.QBrush(QtGui.QColor("#1E88E5"))
+
+        self.line = QtWidgets.QGraphicsLineItem(scene)
+        self.line.setPen(line_pen)
+        self.line.setZValue(902)
+        self.pivot_marker = QtWidgets.QGraphicsEllipseItem(-3, -3, 6, 6, scene)
+        self.pivot_marker.setPen(pivot_pen)
+        self.pivot_marker.setBrush(QtGui.QBrush(QtCore.Qt.NoBrush))
+        self.pivot_marker.setZValue(903)
+        self.handle = MyEllipse(-5, -5, 10, 10, scene)
+        self.handle.view = scene.view
+        self.handle.grabber = self
+        self.handle.setPen(handle_pen)
+        self.handle.setBrush(handle_brush)
+        self.handle.setZValue(904)
+        self.handle.setToolTip("Drag to rotate; hold Shift to snap to 15°")
+        self.handle.setCursor(QtCore.Qt.CrossCursor)
+        self.xy = (-100.0, -100.0)
+        self.hide()
+
+    def get_xy(self):
+        return self.xy
+
+    def set_xy(self, xy) -> None:
+        self.xy = (float(xy[0]), float(xy[1]))
+        self.handle.setRect(self.xy[0] - 5, self.xy[1] - 5, 10, 10)
+
+    def updatePos(self) -> None:
+        bounds = self.parent.selection_bounds()
+        pivot = self.parent.rotation_pivot()
+        handle = np.array([(bounds[0] + bounds[2]) / 2, bounds[3] + 24.0])
+        self.set_xy(handle)
+        self.line.setLine(
+            float(pivot[0]), float(pivot[1]), float(handle[0]), float(handle[1])
+        )
+        self.pivot_marker.setRect(
+            float(pivot[0]) - 3, float(pivot[1]) - 3, 6, 6
+        )
+        self.line.setVisible(True)
+        self.pivot_marker.setVisible(True)
+        self.handle.setVisible(True)
+
+    def hide(self) -> None:
+        self.line.setVisible(False)
+        self.pivot_marker.setVisible(False)
+        self.handle.setVisible(False)
+
+    def clickedEvent(self, event: MouseEvent):
+        self.parent.start_rotation(event)
+
+    def movedEvent(self, event: MouseEvent):
+        self.parent.preview_rotation(event)
+        self.moved = True
+
+    def releasedEvent(self, event: MouseEvent):
+        self.parent.end_rotation()
 
 
 class MyItem:

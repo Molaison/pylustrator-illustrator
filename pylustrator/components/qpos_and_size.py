@@ -1,5 +1,5 @@
 from typing import Optional
-from qtpy import QtWidgets
+from qtpy import QtCore, QtWidgets
 import qtawesome as qta
 
 import matplotlib as mpl
@@ -15,6 +15,67 @@ except ImportError:
 from pylustrator.helper_functions import changeFigureSize, main_figure
 from pylustrator.QLinkableWidgets import DimensionsWidget, ComboWidget
 from pylustrator.snap import TargetWrapper
+from pylustrator.artist_adapters import UnsupportedArtistError
+from pylustrator.operations import TransformOperation
+
+
+class ReferencePointWidget(QtWidgets.QWidget):
+    """Compact Illustrator-style 3x3 transform reference locator."""
+
+    referenceChanged = QtCore.Signal(tuple)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._value = (0.5, 0.5)
+        layout = QtWidgets.QGridLayout(self)
+        layout.setContentsMargins(1, 1, 1, 1)
+        layout.setHorizontalSpacing(1)
+        layout.setVerticalSpacing(1)
+        self._buttons = {}
+        labels = {
+            (0.0, 1.0): "Top left",
+            (0.5, 1.0): "Top center",
+            (1.0, 1.0): "Top right",
+            (0.0, 0.5): "Center left",
+            (0.5, 0.5): "Center",
+            (1.0, 0.5): "Center right",
+            (0.0, 0.0): "Bottom left",
+            (0.5, 0.0): "Bottom center",
+            (1.0, 0.0): "Bottom right",
+        }
+        for row, y in enumerate((1.0, 0.5, 0.0)):
+            for column, x in enumerate((0.0, 0.5, 1.0)):
+                point = (x, y)
+                button = QtWidgets.QToolButton(self)
+                button.setCheckable(True)
+                button.setAutoExclusive(True)
+                button.setFixedSize(9, 9)
+                button.setToolTip(f"Transform reference: {labels[point]}")
+                button.setStyleSheet(
+                    "QToolButton { border: 1px solid #666; border-radius: 4px; "
+                    "padding: 0; background: transparent; } "
+                    "QToolButton:checked { background: #1e88e5; border-color: #1e88e5; }"
+                )
+                button.clicked.connect(
+                    lambda checked, point=point: checked and self.setValue(point, True)
+                )
+                layout.addWidget(button, row, column)
+                self._buttons[point] = button
+        self._buttons[self._value].setChecked(True)
+        self.setToolTip("Reference point for numeric position and size transforms")
+
+    def value(self) -> tuple[float, float]:
+        return self._value
+
+    def setValue(self, point, emit: bool = False) -> None:
+        point = tuple(float(value) for value in point)
+        if point not in self._buttons:
+            raise ValueError(f"Unsupported transform reference point: {point!r}")
+        changed = point != self._value
+        self._value = point
+        self._buttons[point].setChecked(True)
+        if emit and changed:
+            self.referenceChanged.emit(point)
 
 
 class QPosAndSize(QtWidgets.QWidget):
@@ -72,6 +133,10 @@ class QPosAndSize(QtWidgets.QWidget):
         self.layout.addWidget(self.input_lock_aspect, 1, 2)
         self.input_lock_aspect.toggled.connect(self.changeLockAspect)
 
+        self.input_reference = ReferencePointWidget(self)
+        self.layout.addWidget(self.input_reference, 0, 2)
+        self.input_reference.referenceChanged.connect(self.changeReference)
+
         self.layout.setColumnStretch(3, 1)
 
     def setFigure(self, figure):
@@ -80,6 +145,9 @@ class QPosAndSize(QtWidgets.QWidget):
         if selection is not None:
             self.input_lock_aspect.setChecked(
                 bool(getattr(selection, "lock_aspect_ratio", False))
+            )
+            self.input_reference.setValue(
+                getattr(selection, "reference_point", (0.5, 0.5))
             )
 
     def select_element(self, element):
@@ -112,6 +180,33 @@ class QPosAndSize(QtWidgets.QWidget):
         selection = getattr(getattr(self, "fig", None), "selection", None)
         if selection is not None:
             selection.lock_aspect_ratio = bool(state)
+
+    def changeReference(self, point) -> None:
+        selection = self._active_selection(self.element)
+        if selection is None:
+            return
+        selection.set_reference_point(point)
+        self.setElement(self.element)
+
+    def _active_selection(self, element):
+        if element is None or isinstance(element, Figure):
+            return None
+        try:
+            selection = main_figure(element).selection
+        except (AttributeError, RuntimeError):
+            return None
+        if not hasattr(selection, "selection_bounds"):
+            return None
+        if element not in [target.target for target in selection.targets]:
+            return None
+        return selection
+
+    def _display_size_transform(self, figure):
+        if self.transform_index == 0:
+            return figure.dpi_scale_trans.inverted() + transforms.Affine2D().scale(2.54)
+        if self.transform_index == 1:
+            return figure.dpi_scale_trans.inverted()
+        return transforms.IdentityTransform()
 
     def _lock_aspect_enabled(self) -> bool:
         selection = getattr(getattr(self, "fig", None), "selection", None)
@@ -190,6 +285,31 @@ class QPosAndSize(QtWidgets.QWidget):
         every element whose transform differs from the primary element.
         """
         selection = main_figure(self.element).selection
+        active_selection = self._active_selection(self.element)
+        if active_selection is not None:
+            primary = TargetWrapper(self.element)
+            current_display = active_selection.reference_position()
+            desired_native = np.asarray(
+                primary.transform_inverted_points([current_display])[0], dtype=float
+            )
+            if value_x is not None:
+                desired_native[0] = value_x
+            if value_y is not None:
+                desired_native[1] = value_y
+            desired_display = np.asarray(
+                primary.transform_points([desired_native])[0], dtype=float
+            )
+            try:
+                changed = active_selection.translate_reference_to(desired_display)
+            except UnsupportedArtistError as error:
+                self.input_position.setToolTip(str(error))
+                QtWidgets.QMessageBox.warning(self, "Pylustrator", str(error))
+                self.setElement(self.element)
+                return
+            if changed:
+                self.setElement(self.element)
+            return
+
         elements = [target.target for target in selection.targets]
         if self.element not in elements:
             elements.append(self.element)
@@ -295,6 +415,23 @@ class QPosAndSize(QtWidgets.QWidget):
             self.setElement(self.element)
             self.signals.figure_size_changed.emit()
         else:
+            active_selection = self._active_selection(self.element)
+            if active_selection is not None:
+                try:
+                    changed = active_selection.resize_selection_to(
+                        value,
+                        keep_aspect_ratio=self._lock_aspect_enabled(),
+                        changed_axis=changed_axis,
+                    )
+                except UnsupportedArtistError as error:
+                    self.input_shape.setToolTip(str(error))
+                    QtWidgets.QMessageBox.warning(self, "Pylustrator", str(error))
+                    self.setElement(self.element)
+                    return
+                if changed:
+                    self.setElement(self.element)
+                return
+
             elements = [self.element]
             elements += [
                 element.target
@@ -344,30 +481,22 @@ class QPosAndSize(QtWidgets.QWidget):
         if isinstance(element, Figure):
             if self.transform_index == 0:
                 return transforms.Affine2D().scale(2.54, 2.54)
-            return None
-        if isinstance(element, Axes):
-            display_transform = TargetWrapper(element).get_transform()
-            if self.transform_index == 0:
-                return (
-                    transforms.Affine2D().scale(2.54, 2.54)
-                    + element.figure.dpi_scale_trans.inverted()
-                    + display_transform
-                )
             if self.transform_index == 1:
-                return element.figure.dpi_scale_trans.inverted() + display_transform
+                return transforms.IdentityTransform()
             if self.transform_index == 2:
-                return display_transform
+                return element.dpi_scale_trans
             return None
+        display_transform = TargetWrapper(element).get_transform()
         if self.transform_index == 0:
             return (
-                transforms.Affine2D().scale(2.54, 2.54)
+                display_transform
                 + element.figure.dpi_scale_trans.inverted()
-                + element.get_transform()
+                + transforms.Affine2D().scale(2.54, 2.54)
             )
         if self.transform_index == 1:
-            return element.figure.dpi_scale_trans.inverted() + element.get_transform()
+            return display_transform + element.figure.dpi_scale_trans.inverted()
         if self.transform_index == 2:
-            return element.get_transform()
+            return display_transform
         return None
 
     def setElement(self, element: Artist):
@@ -378,6 +507,30 @@ class QPosAndSize(QtWidgets.QWidget):
         self.input_shape_transform.setDisabled(True)
         self.input_transform.setDisabled(True)
         self.input_lock_aspect.setEnabled(True)
+        self.input_reference.setDisabled(True)
+
+        active_selection = self._active_selection(element)
+        if active_selection is not None:
+            self.input_reference.setEnabled(True)
+            self.input_reference.setValue(active_selection.reference_point)
+            primary = TargetWrapper(element)
+            reference_display = active_selection.reference_position()
+            reference_native = primary.transform_inverted_points([reference_display])[0]
+            self.input_position.setTransform(self.getTransform(element))
+            self.input_position.setValue(reference_native)
+            self.input_position.setEnabled(True)
+            self.input_transform.setEnabled(True)
+
+            bounds = active_selection.selection_bounds()
+            self.input_shape.setTransform(self._display_size_transform(self.fig))
+            self.input_shape.setValue(bounds[2:] - bounds[:2])
+            support = active_selection.operation_support(
+                TransformOperation.RESIZE_GEOMETRY
+            )
+            self.input_shape.setEnabled(support.supported)
+            self.input_shape.setToolTip("" if support.supported else support.reason)
+            self.input_lock_aspect.setEnabled(support.supported)
+            return
 
         if isinstance(element, Figure):
             pos = element.get_size_inches()

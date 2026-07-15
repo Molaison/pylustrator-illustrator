@@ -95,15 +95,160 @@ def selection_geometry_snapshot():
         _SELECTION_GEOMETRY_CACHE.reset(token)
 
 
+def _display_clip_components(
+    target: Artist,
+) -> tuple[np.ndarray | None, Path | None]:
+    """Resolve the display-space clips that actually constrain leaf paint."""
+
+    # Legend is a layout container whose own Artist clip metadata is not used
+    # when its frame, handles, and text children draw. Treating that metadata as
+    # paint clipping makes visible outside-Axes legends impossible to move.
+    if isinstance(target, (Legend, EditorGroup)) or not bool(
+        getattr(target, "get_clip_on", lambda: False)()
+    ):
+        return None, None
+
+    clip_box_bounds = None
+    clip_box = getattr(target, "get_clip_box", lambda: None)()
+    if clip_box is not None:
+        bounds = np.asarray(clip_box.extents, dtype=float)
+        if bounds.shape == (4,) and np.all(np.isfinite(bounds)):
+            clip_box_bounds = bounds
+
+    clip_path = None
+    try:
+        path, affine = target.get_transformed_clip_path_and_affine()
+        if path is not None:
+            transformed = affine.transform_path(path)
+            bounds = np.asarray(transformed.get_extents().extents, dtype=float)
+            if bounds.shape == (4,) and np.all(np.isfinite(bounds)):
+                clip_path = transformed
+    except (AttributeError, TypeError, ValueError, RuntimeError):
+        pass
+    return clip_box_bounds, clip_path
+
+
+def _clip_polygon_to_bbox(vertices, bounds: np.ndarray) -> np.ndarray:
+    """Clip one display-space polygon to an axis-aligned bbox."""
+
+    polygon = np.asarray(vertices, dtype=float)
+    polygon = polygon[np.all(np.isfinite(polygon[:, :2]), axis=1), :2]
+    if len(polygon) < 3:
+        return np.empty((0, 2), dtype=float)
+
+    def clip_edge(points, *, axis: int, limit: float, keep_greater: bool):
+        if not len(points):
+            return points
+        result = []
+
+        def inside(point) -> bool:
+            return bool(point[axis] >= limit) if keep_greater else bool(
+                point[axis] <= limit
+            )
+
+        previous = points[-1]
+        previous_inside = inside(previous)
+        for current in points:
+            current_inside = inside(current)
+            if current_inside != previous_inside:
+                denominator = current[axis] - previous[axis]
+                if not np.isclose(denominator, 0.0):
+                    fraction = (limit - previous[axis]) / denominator
+                    result.append(previous + fraction * (current - previous))
+            if current_inside:
+                result.append(current)
+            previous = current
+            previous_inside = current_inside
+        return np.asarray(result, dtype=float)
+
+    for axis, limit, keep_greater in (
+        (0, bounds[0], True),
+        (0, bounds[2], False),
+        (1, bounds[1], True),
+        (1, bounds[3], False),
+    ):
+        polygon = clip_edge(
+            polygon, axis=axis, limit=float(limit), keep_greater=keep_greater
+        )
+        if not len(polygon):
+            break
+    return polygon
+
+
+def _clip_path_intersection_bounds(
+    clip_path: Path, low: np.ndarray, high: np.ndarray
+) -> np.ndarray | None:
+    """Approximate the visible bbox of a rectangular envelope under a Path clip."""
+
+    bounds = np.array([*low, *high], dtype=float)
+    points = []
+    try:
+        polygons = clip_path.to_polygons(closed_only=True)
+    except (AttributeError, TypeError, ValueError, RuntimeError):
+        polygons = ()
+    for polygon in polygons:
+        clipped = _clip_polygon_to_bbox(polygon, bounds)
+        if len(clipped):
+            points.append(clipped)
+    if not points:
+        return None
+    points = np.concatenate(points)
+    return np.array(
+        [
+            np.min(points[:, 0]),
+            np.min(points[:, 1]),
+            np.max(points[:, 0]),
+            np.max(points[:, 1]),
+        ],
+        dtype=float,
+    )
+
+
+def _clip_selection_points(target: Artist, points) -> np.ndarray:
+    """Clip a selection envelope to the Artist's active paint region."""
+
+    points = np.asarray(points, dtype=float)
+    if points.ndim != 2 or points.shape[1] < 2 or not len(points):
+        return points
+    finite = points[np.all(np.isfinite(points[:, :2]), axis=1), :2]
+    if not len(finite):
+        return np.empty((0, 2), dtype=float)
+    clip_box, clip_path = _display_clip_components(target)
+    if clip_box is None and clip_path is None:
+        return points
+
+    low = np.min(finite, axis=0)
+    high = np.max(finite, axis=0)
+    if clip_box is not None:
+        low = np.maximum(low, clip_box[:2])
+        high = np.minimum(high, clip_box[2:])
+    if np.any(high < low):
+        return np.empty((0, 2), dtype=float)
+
+    if clip_path is not None:
+        candidate = Bbox.from_extents(*low, *high)
+        try:
+            if not clip_path.intersects_bbox(candidate, filled=True):
+                return np.empty((0, 2), dtype=float)
+        except (TypeError, ValueError, RuntimeError):
+            return np.empty((0, 2), dtype=float)
+        intersection = _clip_path_intersection_bounds(clip_path, low, high)
+        if intersection is None:
+            return np.empty((0, 2), dtype=float)
+        low = intersection[:2]
+        high = intersection[2:]
+    return np.asarray((low, high), dtype=float)
+
+
 def cached_selection_points(target: Artist, compute) -> np.ndarray:
     """Measure once inside :func:`selection_geometry_snapshot`."""
 
     cache = _SELECTION_GEOMETRY_CACHE.get()
     if cache is None:
-        return np.asarray(compute(), dtype=float)
+        return _clip_selection_points(target, compute())
     key = id(target)
     if key not in cache:
-        cache[key] = np.asarray(compute(), dtype=float).copy()
+        cache[key] = _clip_selection_points(target, compute()).copy()
     return cache[key].copy()
 
 
@@ -567,9 +712,122 @@ class ArtistAdapter:
             raise UnsupportedArtistError(
                 f"{type(self.target).__name__} cannot be translated losslessly"
             )
+        self.validate_native_control_points(points)
         self._apply_native_control_points(points)
         self.record_changes()
         self.invalidate_geometry_cache()
+
+    def validate_native_control_points(self, points) -> None:
+        """Reject destination-specific geometry before mutating an artist."""
+
+    def display_clip_bounds(self) -> np.ndarray | None:
+        """Return a conservative display-space bbox for the active paint clip."""
+
+        clip_box, clip_path = _display_clip_components(self.target)
+        clip_bounds = [] if clip_box is None else [clip_box]
+        if clip_path is not None:
+            clip_bounds.append(np.asarray(clip_path.get_extents().extents, dtype=float))
+        if not clip_bounds:
+            return None
+        result = clip_bounds[0].copy()
+        for bounds in clip_bounds[1:]:
+            result[:2] = np.maximum(result[:2], bounds[:2])
+            result[2:] = np.minimum(result[2:], bounds[2:])
+        return result
+
+    def validate_translation_visibility(self, visible_points) -> None:
+        """Reject translations whose paint becomes wholly clipped away."""
+
+        clip_box, clip_path = _display_clip_components(self.target)
+        if clip_box is None and clip_path is None:
+            return
+        visible = self.bounds_points(visible_points)
+        if not len(visible):
+            return
+        candidate = Bbox.from_extents(*visible[0], *visible[1])
+        visible_in_clip_box = clip_box is None or Bbox.from_extents(
+            *clip_box
+        ).overlaps(candidate)
+        visible_in_clip_path = True
+        if clip_path is not None:
+            try:
+                visible_in_clip_path = clip_path.intersects_bbox(
+                    candidate, filled=True
+                )
+            except (TypeError, ValueError, RuntimeError):
+                visible_in_clip_path = False
+        if not visible_in_clip_box or not visible_in_clip_path:
+            raise UnsupportedArtistError(
+                f"{type(self.target).__name__} translation would move its visible "
+                "geometry entirely outside the active clip region"
+            )
+
+    def preflight_translation(self, delta: Sequence[float]) -> None:
+        support = self.operation_support(TransformOperation.TRANSLATE)
+        if not support.supported:
+            raise UnsupportedArtistError(support.reason)
+        delta = np.asarray(delta, dtype=float)
+        if delta.shape != (2,) or not np.all(np.isfinite(delta)):
+            raise ValueError("Display-space translation must contain two finite values")
+        points = self.point_array(self.control_points())
+        self.validate_native_control_points(self.display_to_native(points + delta))
+        self.validate_translation_visibility(
+            self.point_array(self.selection_points()) + delta
+        )
+
+    def preview_translation_selection_points(
+        self, delta: Sequence[float]
+    ) -> np.ndarray:
+        """Return the clipped visible envelope after a display translation."""
+
+        delta = np.asarray(delta, dtype=float)
+        if delta.shape != (2,) or not np.all(np.isfinite(delta)):
+            raise ValueError("Display-space translation must contain two finite values")
+        proposed = self.point_array(self.selection_points()) + delta
+        return _clip_selection_points(self.target, proposed)
+
+    def preflight_rigid_visible_translation(self, delta: Sequence[float]) -> None:
+        """Require an exact visible-envelope shift for numeric/layout commands."""
+
+        self.preflight_translation(delta)
+        delta = np.asarray(delta, dtype=float)
+        current = self.bounds_points(
+            _clip_selection_points(self.target, self.selection_points())
+        )
+        proposed = self.bounds_points(self.preview_translation_selection_points(delta))
+        if not len(current) or not len(proposed):
+            raise UnsupportedArtistError(
+                f"{type(self.target).__name__} has no visible bounds for exact translation"
+            )
+        expected = current + delta
+        _clip_box, clip_path = _display_clip_components(self.target)
+        if clip_path is not None:
+            raw = self.bounds_points(self.point_array(self.selection_points()) + delta)
+            corners = np.array(
+                [
+                    raw[0],
+                    (raw[0, 0], raw[1, 1]),
+                    raw[1],
+                    (raw[1, 0], raw[0, 1]),
+                ],
+                dtype=float,
+            )
+            try:
+                contained = bool(
+                    np.all(clip_path.contains_points(corners, radius=1e-7))
+                )
+            except (TypeError, ValueError, RuntimeError):
+                contained = False
+            if not contained:
+                raise UnsupportedArtistError(
+                    f"{type(self.target).__name__} exact translation cannot preserve "
+                    "visible bounds inside its non-rectangular clip path"
+                )
+        if not np.allclose(proposed, expected, atol=0.25, rtol=0.0):
+            raise UnsupportedArtistError(
+                f"{type(self.target).__name__} exact translation would change its "
+                "visible bounds at the active clip region"
+            )
 
     def apply_control_points(self, points) -> None:
         self.apply_native_control_points(self.display_to_native(points))
@@ -583,6 +841,7 @@ class ArtistAdapter:
             raise ValueError("Display-space translation must contain exactly x and y")
         if np.all(delta == 0):
             return
+        self.preflight_translation(delta)
         points = self.point_array(self.control_points())
         self.apply_control_points(points + delta)
 
@@ -629,17 +888,85 @@ class ArtistAdapter:
             selection_points = self.selection_points()
         return self._transform_points(matrix, selection_points)
 
+    def preflight_resize(
+        self, matrix, *, control_points=None, selection_points=None
+    ) -> np.ndarray:
+        """Plan a resize and return its clipped visible envelope without mutation."""
+
+        support = self.operation_support(TransformOperation.RESIZE_GEOMETRY)
+        if not support.supported:
+            raise UnsupportedArtistError(support.reason)
+        matrix = np.asarray(matrix, dtype=float)
+        if matrix.shape != (3, 3) or not np.all(np.isfinite(matrix)):
+            raise ValueError("Display-space resize requires a finite 3x3 matrix")
+        if control_points is None:
+            control_points = self.control_points()
+        if selection_points is None:
+            selection_points = self.selection_points()
+        planned_control = self.preview_resize_control_points(
+            matrix,
+            control_points=control_points,
+            selection_points=selection_points,
+        )
+        self.validate_native_control_points(self.display_to_native(planned_control))
+        planned_selection = self.preview_resize_selection_points(
+            matrix,
+            control_points=control_points,
+            selection_points=selection_points,
+        )
+        visible = _clip_selection_points(self.target, planned_selection)
+        if not len(visible):
+            raise UnsupportedArtistError(
+                f"{type(self.target).__name__} resize would leave no visible geometry "
+                "inside the active clip region"
+            )
+        return visible
+
+    def preflight_rigid_visible_resize(self, matrix) -> np.ndarray:
+        """Require a resize to preserve the planned visible-envelope transform."""
+
+        current = self.bounds_points(
+            _clip_selection_points(self.target, self.selection_points())
+        )
+        planned = self.bounds_points(self.preflight_resize(matrix))
+        expected = self.bounds_points(self._transform_points(matrix, current))
+        if not len(current) or not len(planned) or not len(expected):
+            raise UnsupportedArtistError(
+                f"{type(self.target).__name__} has no visible bounds for exact resize"
+            )
+        if not np.allclose(planned, expected, atol=0.25, rtol=0.0):
+            raise UnsupportedArtistError(
+                f"{type(self.target).__name__} exact resize would change its visible "
+                "bounds at the active clip region"
+            )
+        return planned
+
     def resize(self, matrix) -> None:
         if not self.capabilities.can_resize:
             raise UnsupportedArtistError(
                 f"{type(self.target).__name__} cannot be resized losslessly"
             )
+        self.preflight_resize(matrix)
         self.apply_control_points(self.preview_resize_control_points(matrix))
 
     def rotation(self) -> float:
         raise UnsupportedArtistError(
             f"{type(self.target).__name__} has no native rotation property"
         )
+
+    def rotation_pivot(self) -> np.ndarray:
+        """Return the native-rotation anchor in display coordinates."""
+
+        if not self.capabilities.can_rotate:
+            raise UnsupportedArtistError(
+                f"{type(self.target).__name__} cannot be rotated losslessly"
+            )
+        points = self.finite_points(self.control_points())
+        if not len(points):
+            raise UnsupportedArtistError(
+                f"{type(self.target).__name__} has no finite rotation anchor"
+            )
+        return np.asarray(points[0], dtype=float)
 
     def _apply_rotation(self, value: float) -> None:
         raise UnsupportedArtistError(
@@ -1123,6 +1450,18 @@ class RectangleAdapter(PatchAdapter):
             ),
         ]
 
+    def rotation_pivot(self) -> np.ndarray:
+        rotation_point = getattr(
+            self.target,
+            "rotation_point",
+            getattr(self.target, "_rotation_point", "xy"),
+        )
+        if rotation_point == "center":
+            return np.mean(np.asarray(self.control_points(), dtype=float), axis=0)
+        if rotation_point != "xy":
+            return np.asarray(self.native_to_display([rotation_point])[0], dtype=float)
+        return np.asarray(self.control_points()[0], dtype=float)
+
     def _apply_native_control_points(self, points) -> None:
         self.target.set_xy(points[0])
         self.target.set_width(points[1][0] - points[0][0])
@@ -1161,6 +1500,9 @@ class EllipseAdapter(PatchAdapter):
         center = np.asarray(self.target.center, dtype=float)
         size = np.asarray((self.target.width, self.target.height), dtype=float)
         return [center - size / 2, center + size / 2]
+
+    def rotation_pivot(self) -> np.ndarray:
+        return np.mean(np.asarray(self.control_points(), dtype=float), axis=0)
 
     def _apply_native_control_points(self, points) -> None:
         self.target.center = np.mean(points, axis=0)
@@ -1381,6 +1723,10 @@ class TextAdapter(ArtistAdapter):
         TransformOperation.SCALE_APPEARANCE: (
             "Text appearance scaling is not implemented yet"
         ),
+        TransformOperation.ROTATE: (
+            "Legend-managed Text rotation reflows its layout and cannot preserve "
+            "a stable native pivot"
+        ),
     }
     default_capabilities = ArtistCapabilities(
         can_select=True,
@@ -1389,6 +1735,25 @@ class TextAdapter(ArtistAdapter):
         can_serialize=True,
         can_rotate=True,
     )
+
+    @classmethod
+    def capabilities_for(cls, target: Text) -> ArtistCapabilities:
+        figure = getattr(target, "figure", None)
+        if figure is not None and any(
+            target in iter_legend_children(legend)
+            for legend in iter_figure_legends(figure)
+        ):
+            capabilities = cls.default_capabilities
+            return ArtistCapabilities(
+                can_select=capabilities.can_select,
+                can_translate=capabilities.can_translate,
+                can_resize=capabilities.can_resize,
+                can_snapshot=capabilities.can_snapshot,
+                can_serialize=capabilities.can_serialize,
+                fixed_aspect=capabilities.fixed_aspect,
+                can_rotate=False,
+            )
+        return cls.default_capabilities
 
     def __init__(self, target: Text):
         super().__init__(target)
@@ -1561,6 +1926,44 @@ class AnnotationAdapter(TextAdapter):
 
     def _xy_transform(self):
         return self.target._get_xy_transform(self.renderer(), self.target.xycoords)
+
+    def operation_support(self, operation: TransformOperation | str) -> OperationSupport:
+        support = super().operation_support(operation)
+        operation = TransformOperation.coerce(operation)
+        if support.supported and operation is TransformOperation.TRANSLATE:
+            clip = self.target.get_annotation_clip()
+            if clip or (clip is None and self.target.xycoords == "data"):
+                return OperationSupport.allowed(
+                    operation,
+                    constraints=(*support.constraints, "annotated_point_within_owning_axes"),
+                    preview_strategy=support.preview_strategy,
+                )
+        return support
+
+    def validate_native_control_points(self, points) -> None:
+        clip = self.target.get_annotation_clip()
+        clipped_to_annotated_point = clip or (
+            clip is None and self.target.xycoords == "data"
+        )
+        if not clipped_to_annotated_point or len(points) < 2:
+            return
+        axes = self.target.axes
+        if axes is None:
+            raise UnsupportedArtistError(
+                "Clipped Annotation translation requires an owning Axes"
+            )
+        xy_display = np.asarray(self._xy_transform().transform(points[1]), dtype=float)
+        if not axes.contains_point(xy_display):
+            raise UnsupportedArtistError(
+                "Annotation translation would move its annotated point outside "
+                "the owning Axes while annotation clipping is active"
+            )
+
+    def invalidate_geometry_cache(self) -> None:
+        super().invalidate_geometry_cache()
+        arrow = self.target.arrow_patch
+        if arrow is not None:
+            setattr(arrow, "_pylustrator_cached_get_extend", None)
 
     def selection_points(self) -> np.ndarray:
         preview = self._preview_points("_pylustrator_preview_selection_points")
@@ -1944,6 +2347,60 @@ class EditorGroupAdapter(ArtistAdapter):
         ]
         points = [value for value in points if len(value)]
         return np.concatenate(points) if points else np.empty((0, 2), dtype=float)
+
+    def preflight_translation(self, delta: Sequence[float]) -> None:
+        support = self.operation_support(TransformOperation.TRANSLATE)
+        if not support.supported:
+            raise UnsupportedArtistError(support.reason)
+        # The non-rendering group has no clip of its own. Every leaf must accept
+        # the same display delta before any member is allowed to mutate.
+        for adapter in self._member_adapters():
+            adapter.preflight_translation(delta)
+
+    def preflight_rigid_visible_translation(self, delta: Sequence[float]) -> None:
+        for adapter in self._member_adapters():
+            adapter.preflight_rigid_visible_translation(delta)
+
+    def preflight_resize(
+        self, matrix, *, control_points=None, selection_points=None
+    ) -> np.ndarray:
+        support = self.operation_support(TransformOperation.RESIZE_GEOMETRY)
+        if not support.supported:
+            raise UnsupportedArtistError(support.reason)
+        adapters = self._member_adapters()
+        if control_points is None:
+            control_points = np.asarray(self.control_points(), dtype=float)
+        else:
+            control_points = np.asarray(control_points, dtype=float)
+        planned = []
+        start = 0
+        for adapter in adapters:
+            length = len(adapter.control_points())
+            member_points = control_points[start : start + length]
+            if adapter.target.get_visible():
+                planned.extend(
+                    adapter.preflight_resize(
+                        matrix,
+                        control_points=member_points,
+                        selection_points=adapter.selection_points(),
+                    )
+                )
+            start += length
+        if start != len(control_points):
+            raise ValueError("Editor-group control-point count changed during preflight")
+        return self.bounds_points(planned)
+
+    def preflight_rigid_visible_resize(self, matrix) -> np.ndarray:
+        planned = [
+            adapter.preflight_rigid_visible_resize(matrix)
+            for adapter in self._member_adapters()
+            if adapter.target.get_visible()
+        ]
+        if not planned:
+            raise UnsupportedArtistError(
+                "EditorGroup has no visible bounds for exact resize"
+            )
+        return self.bounds_points(planned)
 
     def preview_resize_control_points(
         self, matrix, *, control_points=None, selection_points=None

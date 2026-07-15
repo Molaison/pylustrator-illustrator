@@ -117,6 +117,15 @@ class TargetWrapper:
     def translate(self, delta) -> None:
         self.adapter.translate(delta)
 
+    def preflight_translation(self, delta) -> None:
+        self.adapter.preflight_translation(delta)
+
+    def preview_translation_selection_points(self, delta) -> np.ndarray:
+        return self.adapter.preview_translation_selection_points(delta)
+
+    def preflight_rigid_visible_translation(self, delta) -> None:
+        self.adapter.preflight_rigid_visible_translation(delta)
+
     def apply_display_transform(self, matrix) -> None:
         self.adapter.apply_display_transform(matrix)
 
@@ -138,11 +147,20 @@ class TargetWrapper:
             selection_points=selection_points,
         )
 
+    def preflight_resize(self, matrix) -> np.ndarray:
+        return self.adapter.preflight_resize(matrix)
+
+    def preflight_rigid_visible_resize(self, matrix) -> np.ndarray:
+        return self.adapter.preflight_rigid_visible_resize(matrix)
+
     def resize(self, matrix) -> None:
         self.adapter.resize(matrix)
 
     def get_rotation(self) -> float:
         return self.adapter.rotation()
+
+    def get_rotation_pivot(self) -> np.ndarray:
+        return self.adapter.rotation_pivot()
 
     def set_rotation(self, value: float) -> None:
         self.adapter.set_rotation(value)

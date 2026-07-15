@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import matplotlib
 
 matplotlib.use("Agg")
@@ -10,6 +12,7 @@ import pytest
 from matplotlib.backend_bases import KeyEvent, MouseEvent
 from matplotlib.collections import LineCollection, PolyCollection
 from matplotlib.patches import (
+    Circle,
     ConnectionPatch,
     Ellipse,
     FancyArrowPatch,
@@ -383,6 +386,29 @@ def test_logical_group_selects_as_one_object_but_direct_tool_reaches_member() ->
     assert manager.get_hit_candidates(event)[0] is first
 
     manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_direct_marquee_skips_empty_logical_group_bounds() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    first = ax.add_patch(Rectangle((0.1, 0.3), 0.15, 0.2))
+    second = ax.add_patch(Rectangle((0.75, 0.3), 0.15, 0.2))
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_elements([first, second], primary=second)
+    group = manager.group_selection("Separated pair")
+    manager.selection.clear_targets()
+    x, y = ax.transData.transform((0.5, 0.4))
+
+    manager.set_selection_mode(SelectionMode.OBJECT)
+    assert manager.select_elements_in_bbox(x - 1, y - 1, x + 1, y + 1) == [group]
+    manager.selection.clear_targets()
+
+    manager.set_selection_mode(SelectionMode.DIRECT)
+    assert manager.select_elements_in_bbox(x - 1, y - 1, x + 1, y + 1) == []
+    assert manager.selection.targets == []
     plt.close(fig)
     assert app is not None
 
@@ -949,6 +975,274 @@ def test_annotation_with_mixed_coordinate_systems_moves_as_one_visual_object() -
     assert app is not None
 
 
+def test_cross_axes_clipped_annotation_alignment_is_rejected_before_mutation() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, axes = plt.subplots(1, 2, figsize=(6, 3), dpi=100)
+    annotations = [
+        ax.annotate(
+            "QA",
+            xy=(0.28, 0.32),
+            xycoords="data",
+            xytext=(0.7, 0.78),
+            textcoords="axes fraction",
+            arrowprops={"arrowstyle": "->"},
+        )
+        for ax in axes
+    ]
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_elements(annotations, primary=annotations[-1])
+    before = [TargetWrapper(item).get_restore_state() for item in annotations]
+
+    support = manager.selection.operation_support("translate")
+    assert "annotated_point_within_owning_axes" in support.constraints
+    with pytest.raises(TypeError, match="outside the owning Axes"):
+        manager.selection.align_points("left_x")
+
+    after = [TargetWrapper(item).get_restore_state() for item in annotations]
+    assert all(semantic_equal(old, new) for old, new in zip(before, after))
+    assert not hasattr(fig.change_tracker, "edit")
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_cross_axes_fully_clipped_patch_alignment_is_rejected_atomically() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, axes = plt.subplots(1, 2, figsize=(6, 3), dpi=100)
+    rectangles = [
+        ax.add_patch(Rectangle((0.6, 0.4), 0.2, 0.2)) for ax in axes
+    ]
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_elements(rectangles, primary=rectangles[-1])
+    before = [TargetWrapper(item).get_restore_state() for item in rectangles]
+
+    with pytest.raises(TypeError, match="entirely outside the active clip region"):
+        manager.selection.align_points("left_x")
+
+    after = [TargetWrapper(item).get_restore_state() for item in rectangles]
+    assert all(semantic_equal(old, new) for old, new in zip(before, after))
+    assert not hasattr(fig.change_tracker, "edit")
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_deferred_translation_preflight_uses_pre_preview_geometry() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    rectangle = ax.add_patch(Rectangle((0.88, 0.4), 0.04, 0.1))
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_element(rectangle)
+    wrapper = TargetWrapper(rectangle)
+    before = wrapper.get_positions().copy()
+    delta = ax.transData.transform((0.07, 0.0)) - ax.transData.transform((0.0, 0.0))
+
+    manager.selection.start_move()
+    manager.selection.move(
+        delta,
+        DIR_X0 | DIR_X1 | DIR_Y0 | DIR_Y1,
+        [],
+        ignore_snaps=True,
+    )
+    manager.selection.end_move()
+    fig.canvas.draw()
+
+    assert np.allclose(wrapper.get_positions(), before + delta)
+    fig.change_tracker.edit[0]()
+    assert np.allclose(wrapper.get_positions(), before)
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_partially_clipped_drag_keeps_preview_selection_on_visible_paint() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    rectangle = ax.add_patch(
+        Rectangle((0.72, 0.35), 0.2, 0.25, linewidth=2, color="red")
+    )
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_element(rectangle)
+    delta = np.array([40.0, 0.0])
+
+    manager.selection.start_move()
+    manager.selection.move(
+        delta,
+        DIR_X0 | DIR_X1 | DIR_Y0 | DIR_Y1,
+        [],
+        ignore_snaps=True,
+    )
+    preview = manager.selection.move_current_selection_points[id(rectangle)].copy()
+    assert np.max(preview[:, 0]) == pytest.approx(ax.bbox.x1)
+    manager.selection.end_move()
+    fig.canvas.draw()
+    committed = TargetWrapper(rectangle).get_selection_points()
+
+    painted = np.asarray(fig.canvas.buffer_rgba()).copy()
+    rectangle.set_visible(False)
+    fig.canvas.draw()
+    without_rectangle = np.asarray(fig.canvas.buffer_rgba()).copy()
+    changed_rows, changed_columns = np.where(
+        np.any(painted != without_rectangle, axis=2)
+    )
+    painted_right = float(np.max(changed_columns))
+
+    assert np.allclose(committed, preview, atol=0.25)
+    assert np.max(committed[:, 0]) - painted_right <= 1.5
+    rectangle.set_visible(True)
+    fig.change_tracker.edit[0]()
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_alignment_rejects_partial_clip_that_would_miss_requested_edge() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig = plt.figure(figsize=(4, 3), dpi=100)
+    left_axes = fig.add_axes((0.1, 0.1, 0.5, 0.8))
+    right_axes = fig.add_axes((0.5, 0.1, 0.4, 0.8))
+    left = left_axes.add_patch(Rectangle((0.75, 0.4), 0.1, 0.2))
+    right = right_axes.add_patch(Rectangle((0.5, 0.4), 0.2, 0.2))
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_elements([left, right], primary=right)
+    before = [TargetWrapper(artist).get_restore_state() for artist in (left, right)]
+
+    with pytest.raises(TypeError, match="visible bounds at the active clip region"):
+        manager.selection.align_points("left_x")
+
+    after = [TargetWrapper(artist).get_restore_state() for artist in (left, right)]
+    assert all(semantic_equal(old, new) for old, new in zip(before, after))
+    assert not hasattr(fig.change_tracker, "edit")
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_non_rectangular_clip_rejects_bbox_overlap_without_paint_overlap() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    ax.set_aspect("equal")
+    rectangle = ax.add_patch(Rectangle((0.45, 0.45), 0.05, 0.05, color="red"))
+    rectangle.set_clip_path(Circle((0.5, 0.5), 0.3, transform=ax.transData))
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    wrapper = TargetWrapper(rectangle)
+    before = wrapper.get_positions().copy()
+    delta = ax.transData.transform((0.28, 0.28)) - ax.transData.transform((0.0, 0.0))
+
+    with pytest.raises(TypeError, match="entirely outside the active clip region"):
+        wrapper.translate(delta)
+
+    assert np.allclose(wrapper.get_positions(), before)
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_non_rectangular_partial_clip_selection_matches_raster_paint_bounds() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    ax.set_aspect("equal")
+    rectangle = ax.add_patch(
+        Rectangle((0.45, 0.45), 0.05, 0.05, color="red", linewidth=0)
+    )
+    rectangle.set_clip_path(Circle((0.5, 0.5), 0.3, transform=ax.transData))
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    wrapper = TargetWrapper(rectangle)
+    delta = ax.transData.transform((0.23, 0.23)) - ax.transData.transform((0.0, 0.0))
+
+    wrapper.translate(delta)
+    fig.canvas.draw()
+    selection_points = wrapper.get_selection_points()
+    selection = np.array(
+        [
+            np.min(selection_points[:, 0]),
+            np.min(selection_points[:, 1]),
+            np.max(selection_points[:, 0]),
+            np.max(selection_points[:, 1]),
+        ],
+        dtype=float,
+    )
+    painted = np.asarray(fig.canvas.buffer_rgba()).copy()
+    rectangle.set_visible(False)
+    fig.canvas.draw()
+    without_rectangle = np.asarray(fig.canvas.buffer_rgba()).copy()
+    rows, columns = np.where(np.any(painted != without_rectangle, axis=2))
+    height = painted.shape[0]
+    paint_bounds = np.array(
+        [
+            np.min(columns),
+            height - 1 - np.max(rows),
+            np.max(columns),
+            height - 1 - np.min(rows),
+        ],
+        dtype=float,
+    )
+
+    assert np.allclose(selection, paint_bounds, atol=2.0)
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_cross_axes_editor_group_preflights_every_clipped_member() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, axes = plt.subplots(1, 2, figsize=(6, 3), dpi=100)
+    left = axes[0].add_patch(Rectangle((0.2, 0.4), 0.15, 0.2))
+    right_members = [
+        axes[1].add_patch(Rectangle((x, 0.4), 0.12, 0.2))
+        for x in (0.55, 0.75)
+    ]
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_elements(right_members, primary=right_members[-1])
+    group = manager.group_selection("Clipped pair")
+    manager.select_elements([left, group], primary=group)
+    before = TargetWrapper(group).get_restore_state()
+
+    with pytest.raises(TypeError, match="entirely outside the active clip region"):
+        manager.selection.align_points("left_x")
+
+    assert semantic_equal(before, TargetWrapper(group).get_restore_state())
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_unclipped_annotation_large_translation_invalidates_arrow_geometry() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    annotation = ax.annotate(
+        "unclipped",
+        xy=(0.28, 0.32),
+        xycoords="data",
+        xytext=(0.7, 0.78),
+        textcoords="axes fraction",
+        arrowprops={"arrowstyle": "->"},
+        annotation_clip=False,
+    )
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    wrapper = TargetWrapper(annotation)
+    before = wrapper.get_selection_points().copy()
+    delta = np.array([-80.0, 0.0])
+
+    wrapper.translate(delta)
+    fig.canvas.draw()
+    after = wrapper.get_selection_points()
+
+    assert np.allclose(after, before + delta, atol=0.05)
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
 def test_text_visible_bbox_is_preserved_and_used_for_selection() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
@@ -1167,7 +1461,9 @@ def test_scatter_collection_is_selectable_and_moves_in_its_own_coordinates() -> 
     fig.canvas.draw()
     manager = attach_drag_manager(fig)
     before_offsets = np.asarray(scatter.get_offsets(), dtype=float).copy()
-    before_bounds = TargetWrapper(scatter).get_selection_points().copy()
+    wrapper = TargetWrapper(scatter)
+    before_bounds = wrapper.get_selection_points().copy()
+    expected_visible_bounds = wrapper.preview_translation_selection_points((14, -6))
 
     manager.select_element(scatter)
     manager.selection.start_move()
@@ -1179,10 +1475,12 @@ def test_scatter_collection_is_selectable_and_moves_in_its_own_coordinates() -> 
     )
     manager.selection.end_move()
     fig.canvas.draw()
-    after_bounds = TargetWrapper(scatter).get_selection_points()
+    after_bounds = wrapper.get_selection_points()
 
     assert manager.selected_element is scatter
-    assert np.allclose(after_bounds - before_bounds, [14, -6])
+    assert np.allclose(after_bounds, expected_visible_bounds)
+    assert np.allclose(after_bounds[0] - before_bounds[0], [14, -6])
+    assert after_bounds[1, 0] == pytest.approx(ax.bbox.x1)
     assert not np.allclose(scatter.get_offsets(), before_offsets)
     fig.change_tracker.edit[0]()
     assert np.allclose(scatter.get_offsets(), before_offsets)
@@ -1310,6 +1608,71 @@ def test_rotation_routes_through_artist_capabilities_and_undo() -> None:
     fig.change_tracker.edit[0]()
     assert text.get_rotation() == 0
     assert rectangle.get_angle() == 0
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_rotation_handle_commits_arbitrary_native_angle_and_single_undo() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    text = ax.text(0.35, 0.55, "rotate by handle")
+    rectangle = ax.add_patch(Rectangle((0.65, 0.2), 0.15, 0.2))
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    fig.signals.figure_selection_property_changed = Signal()
+    manager.select_element(text)
+    selection = manager.selection
+
+    assert selection.rotation_handle_supported()
+    assert selection.rotation_grabber.handle.isVisible()
+    pivot = selection.rotation_pivot()
+    start = np.asarray(selection.rotation_grabber.get_xy(), dtype=float)
+    vector = start - pivot
+    angle = np.deg2rad(37.0)
+    rotated = pivot + np.array(
+        [
+            vector[0] * np.cos(angle) - vector[1] * np.sin(angle),
+            vector[0] * np.sin(angle) + vector[1] * np.cos(angle),
+        ]
+    )
+
+    selection.start_rotation(SimpleNamespace(x=start[0], y=start[1], key=None))
+    preview = selection.preview_rotation(
+        SimpleNamespace(x=rotated[0], y=rotated[1], key=None)
+    )
+    assert preview == pytest.approx(37.0)
+    assert text.get_rotation() == pytest.approx(37.0)
+    assert selection.end_rotation()
+    assert text.get_rotation() == pytest.approx(37.0)
+
+    fig.change_tracker.edit[0]()
+    assert text.get_rotation() == pytest.approx(0.0)
+
+    manager.select_elements([text, rectangle], primary=rectangle)
+    assert not selection.rotation_handle_supported()
+    assert not selection.rotation_grabber.handle.isVisible()
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_legend_managed_text_hides_rotation_handle_when_layout_moves_pivot() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    ax.plot([0, 1], [0, 1], label="line")
+    legend = ax.legend()
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    legend_text = legend.get_texts()[0]
+
+    manager.select_elements([legend_text], primary=legend_text)
+
+    support = TargetWrapper(legend_text).operation_support("rotate")
+    assert not support.supported
+    assert "stable native pivot" in support.reason
+    assert not manager.selection.rotation_handle_supported()
+    assert not manager.selection.rotation_grabber.handle.isVisible()
     manager.selection.clear_targets()
     plt.close(fig)
     assert app is not None
@@ -1687,6 +2050,39 @@ def test_match_width_uses_visible_bounds_without_scaling_strokes() -> None:
     assert app is not None
 
 
+def test_match_width_preflights_all_targets_before_clip_limited_resize() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 2), dpi=100)
+    reference = Rectangle(
+        (0.05, 0.05), 0.9, 0.1, transform=fig.transFigure, facecolor="none"
+    )
+    fig.add_artist(reference)
+    safe_target = ax.add_patch(Rectangle((0.2, 0.2), 0.1, 0.2))
+    clipped_target = ax.imshow(np.arange(16).reshape((4, 4)))
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_elements(
+        [reference, safe_target, clipped_target], primary=clipped_target
+    )
+    before = [
+        TargetWrapper(target).get_restore_state()
+        for target in (safe_target, clipped_target)
+    ]
+
+    with pytest.raises(TypeError, match="active clip region"):
+        manager.selection.match_size("width", keep_aspect_ratio=False)
+
+    after = [
+        TargetWrapper(target).get_restore_state()
+        for target in (safe_target, clipped_target)
+    ]
+    assert all(semantic_equal(old, new) for old, new in zip(before, after))
+    assert not hasattr(fig.change_tracker, "edit")
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
 def test_size_widget_undo_restores_axes_position() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     container = QtWidgets.QWidget()
@@ -1739,6 +2135,112 @@ def test_size_widget_lock_aspect_resizes_from_changed_axis() -> None:
     assert app is not None
 
 
+def test_selection_reference_point_is_non_mutating_editor_state() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    rectangle = ax.add_patch(Rectangle((0.2, 0.3), 0.25, 0.2, linewidth=3))
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_element(rectangle)
+    before = TargetWrapper(rectangle).get_selection_points().copy()
+    bounds = manager.selection.selection_bounds()
+
+    manager.selection.set_reference_point((1.0, 1.0))
+
+    assert np.allclose(TargetWrapper(rectangle).get_selection_points(), before)
+    assert np.allclose(manager.selection.reference_position(), bounds[2:])
+    assert not hasattr(fig.change_tracker, "edit")
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_numeric_selection_resize_keeps_active_reference_fixed_and_undoes() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    rectangle = ax.add_patch(Rectangle((0.2, 0.3), 0.25, 0.2, linewidth=3))
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_element(rectangle)
+    manager.selection.set_reference_point((0.0, 0.0))
+    before = manager.selection.selection_bounds().copy()
+    desired = before[2:] - before[:2] + np.array([30.0, 18.0])
+
+    assert manager.selection.resize_selection_to(desired)
+    fig.canvas.draw()
+    after = manager.selection.selection_bounds()
+
+    assert np.allclose(after[:2], before[:2], atol=0.25)
+    assert np.allclose(after[2:] - after[:2], desired, atol=0.25)
+    fig.change_tracker.edit[0]()
+    fig.canvas.draw()
+    assert np.allclose(manager.selection.selection_bounds(), before, atol=0.25)
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_numeric_image_resize_rejects_clip_limited_visible_size_atomically() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    image = ax.imshow(np.arange(16).reshape((4, 4)))
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_element(image)
+    before = TargetWrapper(image).get_restore_state()
+    bounds = manager.selection.selection_bounds()
+    desired = bounds[2:] - bounds[:2] + np.array([9.0, 6.0])
+
+    with pytest.raises(TypeError, match="active clip region"):
+        manager.selection.resize_selection_to(desired)
+
+    assert semantic_equal(before, TargetWrapper(image).get_restore_state())
+    assert not hasattr(fig.change_tracker, "edit")
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_transform_panel_moves_mixed_selection_by_visible_reference_point() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    container = QtWidgets.QWidget()
+    layout = QtWidgets.QVBoxLayout(container)
+    signals = WidgetSignals()
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    axes_text = ax.text(0.2, 0.4, "axes", transform=ax.transAxes)
+    figure_text = fig.text(0.7, 0.7, "figure", transform=fig.transFigure)
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    fig.signals.figure_selection_property_changed = Signal()
+    manager.select_elements([axes_text, figure_text], primary=axes_text)
+    widget = QPosAndSize(layout, signals)
+    widget.setFigure(fig)
+    widget.setElement(axes_text)
+    renderer = fig.canvas.get_renderer()
+    axes_before = axes_text.get_window_extent(renderer).frozen()
+    figure_before = figure_text.get_window_extent(renderer).frozen()
+    reference_before = manager.selection.reference_position().copy()
+    desired_display = reference_before + np.array([31.0, 0.0])
+    desired_native = TargetWrapper(axes_text).transform_inverted_points(
+        [desired_display]
+    )[0]
+
+    widget.changePos(float(desired_native[0]), None)
+    fig.canvas.draw()
+
+    axes_after = axes_text.get_window_extent(renderer)
+    figure_after = figure_text.get_window_extent(renderer)
+    assert axes_after.x0 - axes_before.x0 == pytest.approx(31.0, abs=1e-9)
+    assert figure_after.x0 - figure_before.x0 == pytest.approx(31.0, abs=1e-9)
+    assert np.allclose(manager.selection.reference_position(), desired_display)
+    widget.input_reference.setValue((0.0, 0.0), emit=True)
+    assert manager.selection.reference_point == (0.0, 0.0)
+    manager.selection.clear_targets()
+    container.deleteLater()
+    plt.close(fig)
+    assert app is not None
+
+
 def test_position_widget_moves_mixed_transforms_by_one_display_delta() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     container = QtWidgets.QWidget()
@@ -1751,6 +2253,7 @@ def test_position_widget_moves_mixed_transforms_by_one_display_delta() -> None:
     manager = attach_drag_manager(fig)
     fig.signals = signals
     manager.select_elements([axes_text, figure_text], primary=axes_text)
+    manager.selection.set_reference_point((0.0, 0.0))
     widget = QPosAndSize(layout, signals)
     widget.setFigure(fig)
     widget.setElement(axes_text)
@@ -1803,6 +2306,36 @@ def test_position_widget_uses_subfigure_transform_for_axes() -> None:
     assert np.allclose(widget_display, interaction_display)
     assert manager._selection_parent_by_id[id(ax)] is right
     manager.selection.clear_targets()
+    container.deleteLater()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_transform_panel_converts_display_coordinates_to_physical_units_last() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    container = QtWidgets.QWidget()
+    layout = QtWidgets.QVBoxLayout(container)
+    signals = WidgetSignals()
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    text = ax.text(0.2, 0.4, "physical units", transform=ax.transAxes)
+    fig.canvas.draw()
+    fig.signals = signals
+    fig.selection = EmptySelection()
+    widget = QPosAndSize(layout, signals)
+    widget.setFigure(fig)
+    display = text.get_transform().transform(text.get_position())
+
+    widget.transform_index = 0
+    centimeters = widget.getTransform(text).transform(text.get_position())
+    assert np.allclose(centimeters, display / fig.dpi * 2.54)
+
+    widget.transform_index = 1
+    inches = widget.getTransform(text).transform(text.get_position())
+    assert np.allclose(inches, display / fig.dpi)
+
+    widget.transform_index = 2
+    figure_pixels = widget.getTransform(fig).transform(fig.get_size_inches())
+    assert np.allclose(figure_pixels, np.asarray(fig.get_size_inches()) * fig.dpi)
     container.deleteLater()
     plt.close(fig)
     assert app is not None
@@ -2017,7 +2550,7 @@ def test_drag_rectangle_container_only_mode_replaces_selected_children() -> None
     assert app is not None
 
 
-def test_drag_rectangle_selects_empty_plot_area_axes() -> None:
+def test_drag_rectangle_empty_plot_area_requires_container_toggle() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
     fig.canvas.draw()
@@ -2026,6 +2559,12 @@ def test_drag_rectangle_selects_empty_plot_area_axes() -> None:
     cx = (bbox.x0 + bbox.x1) / 2
     cy = (bbox.y0 + bbox.y1) / 2
 
+    selected = manager.select_elements_in_bbox(cx - 10, cy - 10, cx + 10, cy + 10)
+
+    assert selected == []
+    assert manager.selection.targets == []
+
+    manager.marquee_select_containers_only = True
     selected = manager.select_elements_in_bbox(cx - 10, cy - 10, cx + 10, cy + 10)
 
     assert selected == [ax]

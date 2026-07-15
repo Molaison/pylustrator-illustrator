@@ -136,15 +136,30 @@ class SelectionKernel:
         containing Axes.
         """
 
+        raw_candidates = tuple(hit_stack)
         resolved: list[Artist] = []
         seen: set[int] = set()
         root = self.scope_root
-        for candidate in hit_stack:
+        for candidate in raw_candidates:
             if not self._in_scope(candidate.artist):
                 continue
             if root is not None and candidate.artist is root:
                 continue
             if not candidate.editable:
+                break
+            if self.mode is SelectionMode.DIRECT and self._is_group(candidate.artist):
+                has_leaf_hit = any(
+                    other.editable
+                    and not self._is_group(other.artist)
+                    and self.contains(candidate.artist, other.artist)
+                    for other in raw_candidates
+                    if other.artist is not candidate.artist
+                )
+                # Skip a group shell when a leaf inside it was also hit. An
+                # otherwise-empty group background remains a foreground barrier
+                # so Direct Selection cannot leak through into the owning Axes.
+                if has_leaf_hit:
+                    continue
                 break
             target = self.object_target(candidate.artist)
             if target is None or id(target) in seen:
@@ -176,6 +191,8 @@ class SelectionKernel:
         result: list[Artist] = []
         seen: set[int] = set()
         for artist in artists:
+            if self.mode is SelectionMode.DIRECT and self._is_group(artist):
+                continue
             target = self.object_target(artist)
             if target is None or id(target) in seen:
                 continue

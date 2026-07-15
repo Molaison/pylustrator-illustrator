@@ -103,7 +103,7 @@ class Align(QtWidgets.QWidget):
                 self.fig.selection.rotate_selection(-15)
             else:
                 self.fig.selection.align_points(act)
-        except ValueError as exc:
+        except (TypeError, ValueError) as exc:
             QtWidgets.QMessageBox.warning(self, "Pylustrator", str(exc))
             return
         self.fig.selection.update_selection_rectangles()

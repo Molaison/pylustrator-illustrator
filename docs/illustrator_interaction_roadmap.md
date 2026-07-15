@@ -24,7 +24,7 @@ Implementation order follows architectural dependencies.
 
 Status (2026-07-15): implemented on
 ``refactor/artist-adapter-architecture``.  The P0 implementation is covered by
-569 passing tests, 119 explicit capability-branch skips, no xfails, Ruff, the
+588 passing tests, 119 explicit capability-branch skips, no xfails, Ruff, the
 full Fig2 interaction probe, and a read-only smoke replay of
 the unmodified formal Fig2.  The formal file retained SHA-256
 ``b0cd72abf3962cd6cd2354467ad57aa37ecc213332645d7cb56e6f4af598ad70``.
@@ -80,8 +80,23 @@ when Matplotlib's native picker rejects a zero-area closed Path. Degenerate
 PathPatch outlines now fall back to transformed centerline distance instead of
 an over-broad bounding-box hit. The real Fig2 probe promotes unclickable
 candidates and missing operation categories to explicit failures: all 423 click
-candidates are cycle-reachable and all 19 represented categories now execute an
-alignment workflow.
+candidates are cycle-reachable and all 19 represented categories now have an
+alignment contract workflow. Eighteen execute to subpixel accuracy; the Fig2
+AxesImage category has no destination that can preserve its clip-limited visible
+bounds, so it demonstrates a typed, zero-mutation constraint rejection instead
+of reporting a false alignment success.
+
+The destination-specific clip audit now treats paint clipping as part of the
+visible selection contract. Rectangular clips intersect the displayed envelope;
+non-rectangular clip paths use their transformed polygon intersection, which
+reduced the independent circle-clip raster comparison to roughly 0.5 px. Free
+drag previews and commits share that clipped envelope, while exact commands
+such as alignment, numeric position/size, match-size, and toolbar scaling first
+require a rigid visible-envelope plan. A fully hidden destination or a plan that
+cannot reach its requested visible bounds raises `UnsupportedArtistError`
+before any Artist, change record, selection, or undo state mutates. Legend is
+explicitly exempt from its container-level clip metadata because Matplotlib
+draws the frame, handles, and texts as independent children.
 
 ### P0.1 Selection kernel
 
@@ -164,16 +179,33 @@ marquee selects 364 targets in 70.5 ms median. This is slightly slower than the
 well below the earlier 125.6 ms adapter result; whole-selection move and undo
 remain subsecond with unchanged numerical error.
 
+The transform bar now has a 3x3 reference locator. Numeric X/Y addresses that
+point on the exact visible selection bounds, while W/H resizes about the same
+point through one preflighted atomic transaction. Physical units compose in the
+correct order (native coordinates to display pixels, then inches or
+centimeters). A single object with an exact native rotation contract also shows
+an arbitrary-angle handle connected to its real native pivot; Shift snaps the
+preview to 15-degree increments, and release emits one generated change and one
+undo item. Multi-object rotation handles stay hidden until adapters can express
+honest common-pivot geometry instead of merely changing every object's local
+angle in place. Legend-managed Text also hides the handle: Matplotlib's Legend
+packer moves its anchor by about 6.4 px after rotation in the real Fig2, so the
+native Text angle is not an honest stable-pivot object transform. The exhaustive
+Fig2 audit therefore records 81 representative workflows rather than inflating
+the count to 83; all 6,279 instance checks and all 81 workflows pass.
+
 Remaining feature work:
 
-- Reference-point transform panel and arbitrary rotation handles.
+- Common-pivot multi-object rotation and movable pivots for artist types with a
+  complete semantic geometry plan.
 - Key-object/artboard alignment and numeric distribute spacing.
 - Generic smart guides for edges, centers, baselines, anchors, and equal gaps.
 - Direct path/endpoint editing and inline text editing.
 - Content-following cached drag previews and spatial hit/snap indexes.
 - A renderer-faithful paint-envelope policy for miter/cap joins, path effects,
-  and clipping; current axial stroke padding is intentionally not advertised as
-  exact raster coverage.
+  compound clip holes, and non-bbox source geometry; current axial stroke
+  padding and clip-envelope polygon intersection are intentionally not
+  advertised as exact raster coverage for every Matplotlib renderer effect.
 
 ## P2: workflow breadth
 
@@ -187,5 +219,5 @@ Remaining feature work:
 Fig2 fork validation remains the primary real-world fixture.  Formal
 `editable/fig2.py` and publication outputs must not be modified by interaction
 experiments.  Automated probes should report results separately for object and
-direct selection modes and retain the existing drag, align, resize, rotation,
-aspect, undo, replay, and performance checks.
+direct selection modes and retain the existing drag, align, resize, reference
+transform, rotation-handle, aspect, undo, replay, and performance checks.
