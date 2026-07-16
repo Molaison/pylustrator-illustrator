@@ -58,6 +58,7 @@ from packaging import version
 
 from .editor_model import EditorGroup
 from .operations import OperationSupport, TransformOperation
+from .property_adapters import axis_tick_label_reference
 from .replay import replay_literal
 
 
@@ -2563,6 +2564,21 @@ class TextAdapter(ArtistAdapter):
             "complete visible bounds rigidly around the displayed pivot; use "
             "an anchor-mode rigid rotation plan",
         )
+
+    def operation_support(
+        self, operation: TransformOperation | str
+    ) -> OperationSupport:
+        operation = TransformOperation.coerce(operation)
+        if (
+            operation is TransformOperation.TRANSLATE
+            and axis_tick_label_reference(self.target) is not None
+        ):
+            return OperationSupport.denied(
+                operation,
+                "Tick-label position is managed by its Axis; edit tick content "
+                "or Axis spacing instead of dragging the generated Text",
+            )
+        return super().operation_support(operation)
 
     def __init__(self, target: Text):
         super().__init__(target)

@@ -52,6 +52,7 @@ from .components.plot_layout import scene_point_to_canvas_pixels
 from .editor_model import EditorGroup, EditorScene
 from .interaction import HitCandidate, HitStack, SelectionKernel, SelectionMode
 from .operations import OperationSupport, TransformOperation
+from .property_adapters import axis_tick_label_reference
 from .commands import InteractionState, ObjectLocator, semantic_equal
 from pylustrator.change_tracker import UndoRedo
 
@@ -2000,6 +2001,10 @@ class GrabbableRectangleSelection(GrabFunctions):
             self.figure.figure_dragger.change_selection_zorder("backward")
         if event.key == "pageup":
             self.figure.figure_dragger.change_selection_zorder("forward")
+        if event.key in {"left", "right", "down", "up"} and not self.operation_support(
+            TransformOperation.TRANSLATE
+        ).supported:
+            return
         if event.key == "left":
             self.start_move()
             self.addOffset((-1, 0), self.dir)
@@ -2572,6 +2577,11 @@ class DragManager:
         """Drop visible-bound caches after any render/transform change."""
         for artist in getattr(self, "_selectable_artists", []):
             setattr(artist, "_pylustrator_cached_get_extend", None)
+        # Locators may materialize additional Tick/Text objects during draw.
+        # Keep visible labels in the same explicit hit inventory as all other
+        # direct-selection targets without rebuilding the complete scene.
+        for axes in getattr(self.figure, "axes", ()):
+            self.register_axis_tick_labels(axes)
 
     def deactivate(self):
         """deactivate the interaction callbacks from the figure"""
@@ -2673,8 +2683,27 @@ class DragManager:
                 self.make_draggable(image, ax)
             self.make_draggable(ax.xaxis.get_label(), ax)
             self.make_draggable(ax.yaxis.get_label(), ax)
+            self.register_axis_tick_labels(ax)
             self.make_draggable(ax, parent or ax.figure or self.figure)
             self.make_axes_draggable(ax.child_axes, parent=ax)
+
+    def register_axis_tick_labels(self, axes: Axes) -> None:
+        """Expose every currently visible non-empty tick label as a Text leaf."""
+
+        seen_axes = set()
+        for axis_name in ("xaxis", "yaxis", "zaxis"):
+            axis = getattr(axes, axis_name, None)
+            if axis is None or id(axis) in seen_axes:
+                continue
+            seen_axes.add(id(axis))
+            ticks = (
+                *getattr(axis, "majorTicks", ()),
+                *getattr(axis, "minorTicks", ()),
+            )
+            for tick in ticks:
+                for label in (tick.label1, tick.label2):
+                    if label.get_visible() and label.get_text() != "":
+                        self.make_draggable(label, axes)
 
     def make_figure_draggable(self, fig: Figure | SubFigure) -> None:
         for artist in fig.artists:
@@ -3217,7 +3246,18 @@ class DragManager:
     ) -> list[Artist]:
         x0, x1 = sorted((float(x0), float(x1)))
         y0, y1 = sorted((float(y0), float(y1)))
-        artists = list(self.iter_selectable_artists())
+        # Formatter-owned tick labels are click-selectable for property edits,
+        # but cannot participate in a rigid marquee transform.  Requiring an
+        # explicit click also prevents one generated label from disabling an
+        # otherwise movable mixed marquee selection.
+        artists = [
+            artist
+            for artist in self.iter_selectable_artists()
+            if not (
+                isinstance(artist, Text)
+                and axis_tick_label_reference(artist) is not None
+            )
+        ]
         elements = [
             artist
             for artist in artists
@@ -3361,7 +3401,9 @@ class DragManager:
             if self.grab_element:
                 self.grab_element.button_press_event(event)
             # if not, notify the selected element
-            elif contained:
+            elif contained and self.selection.operation_support(
+                TransformOperation.TRANSLATE
+            ).supported:
                 self.selection.button_press_event(event)
 
     def select_element(self, element: Artist, event: MouseEvent = None):

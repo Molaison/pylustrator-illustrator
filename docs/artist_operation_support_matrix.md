@@ -1,7 +1,7 @@
 # Artist operation support matrix
 
 This document is an independent QA audit of the adapter contract on
-`refactor/artist-adapter-architecture`, dated 2026-07-15.  It treats the
+`refactor/artist-adapter-architecture`, updated 2026-07-16.  It treats the
 registry and `ArtistCapabilities`/`OperationSupport` as executable promises,
 not merely implementation metadata.
 
@@ -55,7 +55,7 @@ Anchor-mode Text and ordinary similarity Patches use Q preferentially.
 | `Artist` fallback | `ArtistAdapter` | none | Registry resolution; all operation descriptors; direct M/display-transform/Z/R/N rejection and zero mutation | **PASS** | Deliberately uneditable. Semantic entrypoints reject through `UnsupportedArtistError` before geometry arithmetic. |
 | `EditorGroup` | `EditorGroupAdapter` | S M Z Q N C | Bounds; M/Z/Q preview and commit; recursive shared-pivot plan; per-leaf fixed-stroke resize; N; replay; direct and outer-plan failing-member rollback; single-emission recording | **PASS** | Native R is denied; Q is advertised only when every leaf has a complete rigid plan. |
 | `Axes` | `AxesAdapter` | S M Z N C | Bounds; M/Z; parent Figure size; N; real replay; nonuniform fixed-aspect preview/commit | **PASS** | R is explicitly unsupported. Fixed-aspect Axes advertise the `fixed_aspect` constraint and normalize preview/commit through the same native-space rule. |
-| `Text` | `TextAdapter` | S M R Q N C conditionally | Axes/data/figure/display transforms; visible text bounds; M; native R; anchor-mode Q; complete N; real replay; explicit Undo/Redo bookkeeping | **PASS** | Q requires `rotation_mode='anchor'`, an invertible affine position transform, and no wrap/bbox/path effect/transform-relative angle. Legend and layout-owned Text deny R/Q because Matplotlib rewrites their position. Geometry resize remains denied. |
+| `Text` | `TextAdapter` | S M R Q N C conditionally | Axes/data/figure/display transforms; visible text bounds; M; native R; anchor-mode Q; complete N; real replay; explicit Undo/Redo bookkeeping; Axis-owned property edits | **PASS** | Q requires `rotation_mode='anchor'`, an invertible affine position transform, and no wrap/bbox/path effect/transform-relative angle. Legend and layout-owned Text deny R/Q because Matplotlib rewrites their position. Formatter-owned tick labels are property-selectable but deny M; their content is edited through the Axis. Geometry resize remains denied. |
 | `Annotation` | `AnnotationAdapter` | S M R N C | Mixed data/axes endpoint coordinates; text and arrow-stroke bounds; two control points; M; R; complete N; real replay | **PASS** | Geometry resize is explicitly denied. |
 | `Legend` | `LegendAdapter` | S M N C | Visible handles/text/title union; `frameon=False/True`; M; logical-owner persistence; self-contained single-glyph proxy replay; N; real replay | **PASS** | Geometry resize and layout reflow are explicitly denied. Explicit composite handlers without a frozen entry specification remain selectable but dynamically deny transform/replay. |
 | `Line2D` | `Line2DAdapter` | S M Q N C conditionally | Data/log transforms; visible line, marker-path, and marker-edge bounds; M; affine shared-pivot Q; N; real `.set_data` replay | **PASS** | Q requires default drawstyle, no marker/path effect, an invertible affine transform, and no Legend layout owner. Geometry resize remains denied. |
@@ -86,7 +86,8 @@ The following behavior passes for every type that advertises it:
   `Annotation` before `Text` and `ConnectionPatch` before `FancyArrowPatch`.
 - Display-space translation moves control points and final selection bounds by
   the preview delta within 0.25 px.  The selected object is the object mutated;
-  parent Axes and unrelated figure-level sentinel text do not move.
+  parent Axes and unrelated figure-level sentinel text do not move. Generated
+  tick-label Text explicitly denies translation because its Axis owns position.
 - Geometry resize matches preview controls and final visible bounds within
   0.25 px for EditorGroup, Axes, AxesImage, Rectangle, Ellipse, Polygon, and
   PathPatch. Thick patch strokes remain fixed in display pixels; both direct
@@ -122,6 +123,37 @@ where needed, and recursive group member plans. Resize rejects off-diagonal
 rotation/shear matrices so callers cannot bypass these semantic contracts.
 
 ## P0 findings fixed after the independent audit
+
+### Axis-owned text properties now follow their semantic owner
+
+Matplotlib exposes axis titles and tick labels as `Text`, but they do not have
+ordinary Text lifecycle semantics. An empty axis-title slot is still a live
+object, while tick-label content is formatter output and is overwritten on the
+next draw. The legacy property path violated both rules: empty text serialized
+only `text=''`, dropping font and geometry state, and direct `set_text()` on a
+tick label appeared to succeed before draw silently reverted it.
+
+The editor now initializes property baselines for every live Text descendant.
+Empty existing Text serializes its complete changed state, so font, colour,
+style, position, content, Undo/Redo, and replay remain lossless. Tick-label
+content uses one Axis-owned semantic transaction: it materializes the current
+tick/label mapping, restores the original view limits, preserves Text identity,
+and records a replayable `set_*ticks(...), set_*lim(...)` command. Mixed text
+selections, no-ops, and injected recording failures are atomic.
+
+Visible non-empty tick labels join the canvas hit inventory in both Object and
+Direct Selection. Their selection bounds are exact, but dragging is disabled
+with a typed Axis-ownership reason; a click therefore cannot fall through and
+move the containing Axes. They are excluded from marquee selection because a
+formatter-owned leaf cannot participate in a rigid mixed transform.
+
+The fixed real-Fig2 audit covers panel A's empty ylabel and all 11 visible
+y-major tick labels: 22/22 Object/Direct hits select the exact Text without
+starting a drag, 11/11 translations reject with zero mutation/record/edit, and
+8/8 text/font-size draw, Undo/Redo, and replay workflows pass. Default Object
+whole-canvas marquee remains 364 non-container objects with zero tick labels or
+Axes. The formal Fig2 SHA-256 remains
+`b0cd72abf3962cd6cd2354467ad57aa37ecc213332645d7cb56e6f4af598ad70`.
 
 ### Common-pivot rotation is now a first-class semantic operation
 

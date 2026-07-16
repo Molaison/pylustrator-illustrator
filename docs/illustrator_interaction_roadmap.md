@@ -22,9 +22,9 @@ editor must preserve semantic figure structure and reproducible Python output.
 
 Implementation order follows architectural dependencies.
 
-Status (2026-07-15): implemented on
+Status (2026-07-16): implemented on
 ``refactor/artist-adapter-architecture``.  The P0 implementation is covered by
-693 passing tests, 147 explicit capability-branch skips, no xfails, Ruff, the
+712 passing tests, 147 explicit capability-branch skips, no xfails, Ruff, the
 full Fig2 interaction probe, and a read-only smoke replay of
 the unmodified formal Fig2.  The formal file retained SHA-256
 ``b0cd72abf3962cd6cd2354467ad57aa37ecc213332645d7cb56e6f4af598ad70``.
@@ -38,6 +38,17 @@ restore snapshots with change recording suspended, preventing a serialization
 failure from recursively failing during rollback.  Repeated editor
 initialization is idempotent as well, so Matplotlib methods cannot accumulate
 recursive wrappers across interactive runs or test cases.
+
+A later manual Fig2 pass exposed the same ownership mistake in Axis text.
+Panel A's true ylabel is an empty but live Text slot, while its 11 visible
+method names are formatter-owned y-tick labels. Empty Text snapshots now retain
+all appearance/content state, and tick content is committed through an atomic
+Axis-owned tick/label plan instead of transient `Text.set_text()`. Visible tick
+labels are exact click targets in Object and Direct Selection, but reject drag
+with an ownership reason and stay out of rigid marquee selections. Independent
+Fig2 QA passed 22/22 click paths, 11/11 zero-mutation translation rejections,
+and 8/8 text/font-size draw, Undo/Redo, and replay workflows; the default
+whole-canvas marquee remains 364 non-container objects.
 
 An independent 20-type adapter contract matrix subsequently found and closed
 two remaining P0 gaps: rotatable snapshots now include native angles, and a
@@ -250,7 +261,7 @@ mutates. Alignment reference/key state is also part of interaction-state and
 geometry undo/redo restoration. The regression suite covers all six alignment
 directions, positive/zero/negative spacing with the key first/middle/last,
 mixed selection lifecycles, exact no-ops, UI control state, clip rejection, and
-undo/redo; the current full suite passes 693 tests with 147 skips.
+undo/redo; the current full suite passes 712 tests with 147 skips.
 
 A read-only real-Fig2 fork probe covers all 19 represented categories. Eighteen
 align to key/artboard references with at most `1.14e-13` px error; AxesImage

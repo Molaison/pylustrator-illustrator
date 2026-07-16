@@ -205,6 +205,15 @@ def init_figure(fig):
         for text in subfig.texts:
             add_text_default(text)
 
+    # Axis tick labels, offset text, Legend children, and other Matplotlib-
+    # managed text are not present in ``Axes.texts``/``Figure.texts``.  They
+    # are nevertheless direct-selection targets and the property undo path
+    # needs the same baseline as ordinary text.  Register every live Text
+    # descendant once; ``add_text_default`` is idempotent and therefore keeps
+    # baselines restored from an existing generated block intact.
+    for text in fig.findobj(match=Text):
+        add_text_default(text)
+
 
 def add_text_default(element):
     # properties to store
@@ -566,24 +575,19 @@ class ChangeTracker:
 
     def get_describtion_string(self, element, exclude_default=True):
         if isinstance(element, Text):
-            # if the text is deleted we do not need to store all properties
-            if not element.get_visible() or element.get_text() == "":
+            # Deletion is represented by visibility for ordinary Text.  An
+            # empty string alone is not deletion: axis labels, titles, offset
+            # text, and user-created placeholders are stable semantic slots.
+            # Returning early for those objects used to discard every change
+            # except ``text=''`` (including font size, colour, position, and
+            # rotation) and made UndoRedo snapshots lossy.
+            if not element.get_visible():
                 if getattr(element, "is_new_text", False):
                     return (
                         element.axes or element.figure,
                         ".text(0, 0, , visible=False)",
                     )
-                else:
-                    is_label = np.any(
-                        [
-                            ax.xaxis.get_label() == element
-                            or ax.yaxis.get_label() == element
-                            for ax in element.figure.axes
-                        ]
-                    )
-                    if is_label:
-                        return element, ".set(text='')"
-                    return element, ".set(visible=False)"
+                return element, ".set(visible=False)"
 
             # properties to store
             properties = [

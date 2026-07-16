@@ -1546,6 +1546,100 @@ def test_yaxis_label_drag_keeps_selection_box_and_text_together() -> None:
     assert app is not None
 
 
+@pytest.mark.parametrize(
+    "selection_mode", [SelectionMode.OBJECT, SelectionMode.DIRECT]
+)
+def test_visible_tick_label_is_canvas_reachable_without_starting_parent_drag(
+    selection_mode,
+) -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    ax.set_yticks([0, 1], labels=["first method", "second method"])
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.set_selection_mode(selection_mode)
+    label = ax.yaxis.get_major_ticks()[0].label1
+    bbox = label.get_window_extent(fig.canvas.get_renderer())
+    event = MouseEvent(
+        "button_press_event",
+        fig.canvas,
+        (bbox.x0 + bbox.x1) / 2,
+        (bbox.y0 + bbox.y1) / 2,
+        button=1,
+    )
+
+    assert id(label) in manager._interaction_artist_ids
+    assert id(label) in manager._selectable_artist_ids
+    assert label.contains(event)[0]
+    assert label in manager.get_hit_candidates(event)
+    assert manager.get_picked_element(event)[0] is label
+
+    manager.button_press_event0(event)
+    assert manager.selected_element is label
+    assert [target.target for target in manager.selection.targets] == [label]
+    assert not manager.selection.got_artist
+    manager.button_release_event0(event)
+    assert [target.target for target in manager.selection.targets] == [label]
+
+    manager.selection.clear_targets()
+    marquee = manager.select_elements_in_bbox(
+        bbox.x0 - 1,
+        bbox.y0 - 1,
+        bbox.x1 + 1,
+        bbox.y1 + 1,
+    )
+    assert label not in marquee
+
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_tick_label_translation_is_typed_rejected_without_mutation() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    ax.set_yticks([0], labels=["generated label"])
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    label = ax.yaxis.get_major_ticks()[0].label1
+    wrapper = TargetWrapper(label)
+    before = wrapper.get_selection_points().copy()
+    support = wrapper.operation_support(TransformOperation.TRANSLATE)
+
+    assert not support.supported
+    assert "managed by its Axis" in support.reason
+    with pytest.raises(UnsupportedArtistError, match="managed by its Axis"):
+        wrapper.translate((12, -7))
+    fig.canvas.draw()
+    np.testing.assert_allclose(wrapper.get_selection_points(), before, atol=0, rtol=0)
+    assert manager.figure.change_tracker.changes == []
+
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_tick_labels_materialized_after_draw_join_hit_inventory() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    ax.set_yticks([0], labels=["first"])
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+
+    ax.set_yticks([0, 1], labels=["first", "later"])
+    fig.canvas.draw()
+    later = ax.yaxis.get_major_ticks()[1].label1
+    assert id(later) not in manager._selectable_artist_ids
+
+    manager.invalidate_geometry_cache()
+    assert id(later) in manager._interaction_artist_ids
+    assert id(later) in manager._selectable_artist_ids
+
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
 def test_annotation_with_mixed_coordinate_systems_moves_as_one_visual_object() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
