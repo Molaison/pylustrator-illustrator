@@ -846,12 +846,14 @@ class PlotWindow(QtWidgets.QWidget):
         self.fig.canvas.draw()
 
     def actionSave(self):
-        """save the code for the figure"""
+        """Save the editable source document.
+
+        Image export is an explicit, separate action.  Replaying previous
+        ``savefig`` calls here both blocked the UI on rendering and caused the
+        tracking wrapper to append the replayed requests again, doubling the
+        work after every Ctrl+S.
+        """
         self.fig.change_tracker.save()
-        for _last_saved_figure, args, kwargs in getattr(
-            self.fig, "_last_saved_figure", []
-        ):
-            self.fig.savefig(_last_saved_figure, *args, **kwargs)
 
     def actionSaveImage(self):
         """save figure as an image"""

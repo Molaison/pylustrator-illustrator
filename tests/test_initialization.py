@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import matplotlib
 
 matplotlib.use("Agg")
@@ -29,3 +31,25 @@ def test_repeated_initialize_does_not_stack_matplotlib_wrappers() -> None:
     finally:
         plt.show = original_show
         QtGuiDrag.no_save_allowed = original_no_save
+
+
+def test_action_save_writes_source_without_reexporting_images() -> None:
+    from pylustrator.QtGuiDrag import PlotWindow
+
+    fig = plt.figure()
+    calls = {"source": 0, "exports": []}
+    fig.change_tracker = SimpleNamespace(
+        save=lambda: calls.__setitem__("source", calls["source"] + 1)
+    )
+    request = ("existing-export.png", (), {"dpi": 300})
+    fig._last_saved_figure = [request]
+    fig.savefig = lambda *args, **kwargs: calls["exports"].append((args, kwargs))
+
+    try:
+        PlotWindow.actionSave(SimpleNamespace(fig=fig))
+
+        assert calls["source"] == 1
+        assert calls["exports"] == []
+        assert fig._last_saved_figure == [request]
+    finally:
+        plt.close(fig)

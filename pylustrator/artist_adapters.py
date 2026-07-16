@@ -68,8 +68,8 @@ _CHANGE_RECORDING_ENABLED = ContextVar(
 _SELECTION_GEOMETRY_CACHE = ContextVar(
     "pylustrator_selection_geometry_cache", default=None
 )
+_LEGEND_OWNER_CACHE = ContextVar("pylustrator_legend_owner_cache", default=None)
 _LEGEND_OWNER_INVENTORY_ATTR = "_pylustrator_legend_owner_inventory"
-_LEGEND_OWNER_SNAPSHOT_KEY = object()
 _ACTIVE_LAYOUT_OWNER_SNAPSHOT_KEY = object()
 
 
@@ -85,19 +85,42 @@ def suspend_change_recording():
 
 
 @contextmanager
-def selection_geometry_snapshot():
-    """Reuse one immutable geometry measurement during a selection action."""
+def legend_owner_snapshot():
+    """Resolve Legend ownership once during one non-structural action phase.
 
-    existing = _SELECTION_GEOMETRY_CACHE.get()
+    Ownership is structural state, not geometry.  Keeping it in a dedicated
+    snapshot lets a move reuse the inventory while artists change position,
+    without allowing selection bounds measured before the mutation to leak
+    into the committed state.
+    """
+
+    existing = _LEGEND_OWNER_CACHE.get()
     if existing is not None:
         yield existing
         return
     cache = {}
-    token = _SELECTION_GEOMETRY_CACHE.set(cache)
+    token = _LEGEND_OWNER_CACHE.set(cache)
     try:
         yield cache
     finally:
-        _SELECTION_GEOMETRY_CACHE.reset(token)
+        _LEGEND_OWNER_CACHE.reset(token)
+
+
+@contextmanager
+def selection_geometry_snapshot():
+    """Reuse one immutable geometry measurement during a selection action."""
+
+    with legend_owner_snapshot():
+        existing = _SELECTION_GEOMETRY_CACHE.get()
+        if existing is not None:
+            yield existing
+            return
+        cache = {}
+        token = _SELECTION_GEOMETRY_CACHE.set(cache)
+        try:
+            yield cache
+        finally:
+            _SELECTION_GEOMETRY_CACHE.reset(token)
 
 
 def _display_clip_components(
@@ -412,8 +435,8 @@ def _legend_inventory_signature(legends: Sequence[Legend]) -> tuple:
 def _legend_owner_inventory(figure) -> dict[int, tuple[Artist, Legend]]:
     """Map every managed descendant to its live Legend once per structure."""
 
-    snapshot = _SELECTION_GEOMETRY_CACHE.get()
-    snapshot_key = (_LEGEND_OWNER_SNAPSHOT_KEY, id(figure))
+    snapshot = _LEGEND_OWNER_CACHE.get()
+    snapshot_key = id(figure)
     if snapshot is not None:
         snapshot_entry = snapshot.get(snapshot_key)
         if snapshot_entry is not None and snapshot_entry[0] is figure:
@@ -436,6 +459,20 @@ def _legend_owner_inventory(figure) -> dict[int, tuple[Artist, Legend]]:
     if snapshot is not None:
         snapshot[snapshot_key] = (figure, inventory)
     return inventory
+
+
+def invalidate_legend_owner_inventory(figure) -> None:
+    """Drop ownership state after a Legend or its packer is reconstructed."""
+
+    if figure is None:
+        return
+    try:
+        delattr(figure, _LEGEND_OWNER_INVENTORY_ATTR)
+    except AttributeError:
+        pass
+    snapshot = _LEGEND_OWNER_CACHE.get()
+    if snapshot is not None:
+        snapshot.pop(id(figure), None)
 
 
 def legend_owner_for_artist(target: Artist) -> Legend | None:
@@ -4239,12 +4276,14 @@ __all__ = [
     "iter_figure_legends",
     "iter_legend_children",
     "iter_legend_managed_artists",
+    "invalidate_legend_owner_inventory",
     "legend_anchor_is_point",
     "legend_anchor_transform",
     "legend_display_loc",
     "legend_loc_transform",
     "legend_owner_for_artist",
     "legend_owner_for_text",
+    "legend_owner_snapshot",
     "layout_owner_for_text",
     "register_artist_adapter",
     "set_legend_point_anchor_display",

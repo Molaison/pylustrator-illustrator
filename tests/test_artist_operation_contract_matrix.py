@@ -1666,6 +1666,7 @@ def test_narrow_axis_line_translate_replays_without_precision_amplification() ->
 
 def test_saved_generated_block_imports_numpy_for_nonfinite_literals(
     monkeypatch,
+    capsys,
 ) -> None:
     fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
     target = ax.plot([0.2, np.nan, 0.8], [0.3, np.nan, 0.7])[0]
@@ -1689,6 +1690,7 @@ def test_saved_generated_block_imports_numpy_for_nonfinite_literals(
 
     try:
         tracker.save()
+        assert "#% start: automatic generated code" not in capsys.readouterr().out
         generated = "\n".join(saved["lines"])
         assert "import numpy as np" in generated
         assert generated.index("import numpy as np") < generated.index("np.nan")

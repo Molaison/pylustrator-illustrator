@@ -34,6 +34,7 @@ except ImportError:
 import matplotlib as mpl
 from matplotlib.artist import Artist
 from matplotlib.figure import Figure
+from matplotlib.legend import Legend
 from matplotlib.ticker import AutoLocator
 
 from pylustrator.artist_adapters import (
@@ -42,6 +43,8 @@ from pylustrator.artist_adapters import (
     suspend_change_recording,
 )
 from pylustrator.change_tracker import getReference
+from pylustrator.commands import ObjectLocator
+from pylustrator.editor_model import EditorScene
 from pylustrator.QLinkableWidgets import (
     QColorWidget,
     CheckWidget,
@@ -565,6 +568,46 @@ class LegendPropertiesWidget(QtWidgets.QWidget):
         old_properties = self.properties.copy()
         self.properties[name] = value
         new_properties = self.properties.copy()
+        fig = main_figure(target)
+        locator = ObjectLocator.from_artist(target)
+        axes_owner = target.axes
+        is_current_axes_legend = bool(
+            axes_owner is not None and axes_owner.get_legend() is target
+        )
+
+        def resolve_target() -> Legend:
+            if is_current_axes_legend:
+                current = axes_owner.get_legend()
+            else:
+                dragger = getattr(fig, "figure_dragger", None)
+                ensure_scene = getattr(dragger, "_ensure_editor_scene", None)
+                scene = ensure_scene() if callable(ensure_scene) else EditorScene(
+                    fig, ownership_parent=lambda _artist: None
+                )
+                current = locator.resolve(scene)
+            if not isinstance(current, Legend):
+                raise RuntimeError(
+                    "The logical Legend no longer resolves to a live object"
+                )
+            return current
+
+        def refresh_selection_after_draw() -> None:
+            dragger = getattr(fig, "figure_dragger", None)
+            # A live DragManager refreshes from Matplotlib's draw_event, after
+            # Legend packers have finalized their positions.  Lightweight
+            # embedding/test managers need the same post-draw refresh here.
+            if bool(getattr(dragger, "_selection_refresh_on_draw", False)):
+                return
+            refresh = getattr(dragger, "refresh_selection_geometry", None)
+            if callable(refresh):
+                refresh()
+                return
+            selection = getattr(fig, "selection", None)
+            if selection is not None:
+                update_extent = getattr(selection, "update_extent", None)
+                if callable(update_extent):
+                    update_extent()
+                selection.update_selection_rectangles()
 
         # Frame visibility is an appearance property.  Reconstructing a
         # Legend for it changes object identity, discards direct edits to its
@@ -572,14 +615,15 @@ class LegendPropertiesWidget(QtWidgets.QWidget):
         if name == "frameon":
             if old_properties[name] == new_properties[name]:
                 return
-            fig = main_figure(target)
 
             def setFrameOn(visible):
-                adapter.set_frame_on(visible)
+                current = resolve_target()
+                get_artist_adapter(current).set_frame_on(visible)
                 self.properties[name] = bool(visible)
-                fig.figure_dragger.select_element(target)
+                self.target = current
+                fig.figure_dragger.select_element(current)
                 fig.canvas.draw()
-                fig.selection.update_selection_rectangles()
+                refresh_selection_after_draw()
 
             def undo():
                 setFrameOn(old_properties[name])
@@ -593,6 +637,7 @@ class LegendPropertiesWidget(QtWidgets.QWidget):
 
         def setProperties(properties):
             nonlocal target
+            target = resolve_target()
             handles = replayable_legend_handles(target)
             labels = [text.get_text() for text in target.get_texts()]
             legend_state = get_artist_adapter(target).snapshot()
@@ -610,8 +655,9 @@ class LegendPropertiesWidget(QtWidgets.QWidget):
             get_artist_adapter(target).record_changes()
             fig.figure_dragger.make_draggable(target)
             fig.figure_dragger.select_element(target)
+            self.target = target
             fig.canvas.draw()
-            fig.selection.update_selection_rectangles()
+            refresh_selection_after_draw()
 
         def undo():
             setProperties(old_properties)

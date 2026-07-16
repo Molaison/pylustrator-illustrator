@@ -41,6 +41,9 @@ class Selection:
     def update_selection_rectangles(self):
         self.updated = True
 
+    def update_extent(self):
+        self.extent_updated = True
+
 
 def attach_figure_helpers(fig) -> None:
     fig.change_tracker = ChangeTracker()
@@ -164,6 +167,37 @@ def test_frameon_property_preserves_legend_identity_children_and_undo() -> None:
     redo()
     assert ax.get_legend() is legend
     assert legend.get_frame_on()
+    plt.close(fig)
+
+
+def test_frameon_undo_resolves_the_live_legend_after_another_property_rebuild() -> None:
+    from pylustrator.components.qitem_properties import LegendPropertiesWidget
+
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    attach_figure_helpers(fig)
+    legend = ax.legend(
+        handles=[Patch(label="proxy A"), Patch(label="proxy B")],
+        labels=["proxy A", "proxy B"],
+        frameon=False,
+        borderpad=0.4,
+    )
+    fig.canvas.draw()
+
+    widget = LegendPropertiesWidget.__new__(LegendPropertiesWidget)
+    widget.properties = {"frameon": False, "borderpad": 0.4}
+    widget.target = legend
+    widget.changePropertiy("frameon", True)
+    frame_undo, frame_redo, _name = fig.change_tracker.edit
+
+    widget.changePropertiy("borderpad", 0.2)
+    rebuilt = ax.get_legend()
+    assert rebuilt is not legend
+    assert rebuilt.get_frame_on()
+
+    frame_undo()
+    assert not ax.get_legend().get_frame_on()
+    frame_redo()
+    assert ax.get_legend().get_frame_on()
     plt.close(fig)
 
 

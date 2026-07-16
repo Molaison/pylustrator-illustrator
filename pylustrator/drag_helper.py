@@ -35,8 +35,10 @@ from qtpy import QtCore, QtGui, QtWidgets
 
 from .artist_adapters import (
     UnsupportedArtistError,
+    invalidate_legend_owner_inventory,
     iter_figure_legends,
     iter_legend_children,
+    legend_owner_snapshot,
     selection_geometry_snapshot,
     suspend_change_recording,
 )
@@ -318,6 +320,7 @@ class GrabbableRectangleSelection(GrabFunctions):
 
         self.targets = []
         self.targets_rects = []
+        self.target_bounds = []
         self.lock_aspect_ratio = False
         self.reference_point = (0.5, 0.5)
         self.alignment_reference_mode = "selection"
@@ -346,6 +349,7 @@ class GrabbableRectangleSelection(GrabFunctions):
             np.max(new_points[:, 0]),
             np.max(new_points[:, 1]),
         )
+        self.target_bounds.append(np.array([x0, y0, x1, y1], dtype=float))
         if 0:
             rect1 = Rectangle(
                 (x0, y0),
@@ -400,31 +404,45 @@ class GrabbableRectangleSelection(GrabFunctions):
         if update:
             self.update_extent()
 
+    @selection_geometry_snapshot()
     def update_extent(self):
         """updates the extend of the selection to all the selected elements"""
-        points = None
-        for target in self.targets:
+        bounds = []
+        self.target_bounds = [None] * len(self.targets)
+        for index, target in enumerate(self.targets):
             new_points = np.array(target.get_selection_points())
             if new_points.ndim != 2 or not len(new_points):
                 continue
+            target_bounds = self._bounds_from_points([new_points])
+            self.target_bounds[index] = target_bounds
+            bounds.append(target_bounds)
 
-            if points is None:
-                points = new_points
-            else:
-                points = np.concatenate((points, new_points))
-
-        if points is None or not len(points):
+        if not bounds:
             self.hide_grabber()
             return
+
+        self._apply_target_bounds(bounds, refresh_capabilities=True)
+
+    def _apply_target_bounds(
+        self, bounds=None, *, refresh_capabilities: bool
+    ) -> None:
+        """Update the overall grabber from cached per-target display bounds."""
+
+        if bounds is None:
+            bounds = [value for value in self.target_bounds if value is not None]
+        if not bounds:
+            self.hide_grabber()
+            return
+        bounds = np.asarray(bounds, dtype=float)
 
         for grabber in self.grabbers:
             grabber.targets = self.targets
         self.rotation_grabber.targets = self.targets
 
-        self.positions[0] = np.min(points[:, 0])
-        self.positions[1] = np.min(points[:, 1])
-        self.positions[2] = np.max(points[:, 0])
-        self.positions[3] = np.max(points[:, 1])
+        self.positions[0] = np.min(bounds[:, 0])
+        self.positions[1] = np.min(bounds[:, 1])
+        self.positions[2] = np.max(bounds[:, 2])
+        self.positions[3] = np.max(bounds[:, 3])
 
         if self.positions[2] - self.positions[0] < 0.01:
             self.positions[0], self.positions[2] = (
@@ -437,7 +455,23 @@ class GrabbableRectangleSelection(GrabFunctions):
                 self.positions[1] + 0.01,
             )
 
-        self.update_grabber()
+        if refresh_capabilities or not hasattr(self, "_grabber_scale_supported"):
+            self.update_grabber()
+        else:
+            self._position_grabbers(
+                self._grabber_scale_supported,
+                self._grabber_rotation_supported,
+            )
+
+    def refresh_targets_after_draw(self, target_indices: Iterable[int]) -> None:
+        """Remeasure only targets whose layout is finalized during draw."""
+
+        target_indices = tuple(dict.fromkeys(int(index) for index in target_indices))
+        if not target_indices:
+            return
+        with selection_geometry_snapshot():
+            self.update_selection_rectangles(target_indices=target_indices)
+            self._apply_target_bounds(refresh_capabilities=False)
 
     @staticmethod
     def _unique_wrappers(wrappers: Iterable[TargetWrapper]) -> list[TargetWrapper]:
@@ -451,6 +485,7 @@ class GrabbableRectangleSelection(GrabFunctions):
             unique.append(wrapper)
         return unique
 
+    @legend_owner_snapshot()
     def operation_support(
         self, operation: TransformOperation | str
     ) -> OperationSupport:
@@ -1170,12 +1205,24 @@ class GrabbableRectangleSelection(GrabFunctions):
             self.figure.change_tracker.removeElement(target.target)
         self.figure.canvas.draw()
 
-    def update_selection_rectangles(self, use_previous_offset=False):
+    def update_selection_rectangles(
+        self, use_previous_offset=False, target_indices: Iterable[int] = None
+    ):
         """update the selection visualisation"""
         if len(self.targets) == 0:
             return
+        indices = (
+            range(len(self.targets))
+            if target_indices is None
+            else (
+                index
+                for index in target_indices
+                if 0 <= index < len(self.targets)
+            )
+        )
         if 0:
-            for index, target in enumerate(self.targets):
+            for index in indices:
+                target = self.targets[index]
                 new_points = np.array(target.get_positions())
                 for i in range(2):
                     rect = self.targets_rects[index * 2 + i]
@@ -1183,7 +1230,8 @@ class GrabbableRectangleSelection(GrabFunctions):
                     rect.set_width(new_points[1][0] - new_points[0][0])
                     rect.set_height(new_points[1][1] - new_points[0][1])
         else:
-            for index, target in enumerate(self.targets):
+            for index in indices:
+                target = self.targets[index]
                 new_points = None
                 if use_previous_offset:
                     new_points = getattr(self, "move_current_selection_points", {}).get(
@@ -1192,6 +1240,7 @@ class GrabbableRectangleSelection(GrabFunctions):
                 if new_points is None:
                     new_points = np.array(target.get_selection_points())
                 if new_points.ndim != 2 or not len(new_points):
+                    self.target_bounds[index] = None
                     for i in range(2):
                         self.targets_rects[index * 2 + i].setRect(-100, -100, 0, 0)
                     continue
@@ -1200,6 +1249,9 @@ class GrabbableRectangleSelection(GrabFunctions):
                     np.min(new_points[:, 1]),
                     np.max(new_points[:, 0]),
                     np.max(new_points[:, 1]),
+                )
+                self.target_bounds[index] = np.array(
+                    [x0, y0, x1, y1], dtype=float
                 )
                 w0, h0 = x1 - x0, y1 - y0
                 for i in range(2):
@@ -1234,6 +1286,7 @@ class GrabbableRectangleSelection(GrabFunctions):
         index = targets_non_wrapped.index(target)
         self._clear_preview(self.targets[index])
         self.targets.pop(index)
+        self.target_bounds.pop(index)
         rect1 = self.targets_rects.pop(index * 2)
         rect2 = self.targets_rects.pop(index * 2)
         rect1.scene().removeItem(rect1)
@@ -1251,13 +1304,23 @@ class GrabbableRectangleSelection(GrabFunctions):
 
     def update_grabber(self):
         """update the position of the grabber elements"""
-        if self.do_target_scale():
+        self._grabber_scale_supported = self.do_target_scale()
+        self._grabber_rotation_supported = self.rotation_handle_supported()
+        self._position_grabbers(
+            self._grabber_scale_supported,
+            self._grabber_rotation_supported,
+        )
+
+    def _position_grabbers(self, can_scale: bool, can_rotate: bool) -> None:
+        """Reposition handles without re-evaluating immutable capabilities."""
+
+        if can_scale:
             for grabber in self.grabbers:
                 grabber.updatePos()
         else:
             for grabber in self.grabbers:
                 grabber.set_xy((-100, -100))
-        if self.rotation_handle_supported():
+        if can_rotate:
             self.rotation_grabber.updatePos()
         else:
             self.rotation_grabber.hide()
@@ -1276,6 +1339,7 @@ class GrabbableRectangleSelection(GrabFunctions):
             # self.figure.patches.remove(rect)
         self.targets_rects = []
         self.targets = []
+        self.target_bounds = []
         self.alignment_key = None
 
         self.hide_grabber()
@@ -1566,6 +1630,7 @@ class GrabbableRectangleSelection(GrabFunctions):
         """transform a point"""
         return self.transform(pos)
 
+    @selection_geometry_snapshot()
     def get_save_point(self, targets: Iterable[TargetWrapper] = None) -> callable:
         """gather the current positions in a restore point for the undo function"""
         selected_targets = [target.target for target in self.targets]
@@ -1580,6 +1645,7 @@ class GrabbableRectangleSelection(GrabFunctions):
         capture = getattr(tracker, "capture_recording_state", None)
         recording_state = capture() if capture is not None else None
 
+        @legend_owner_snapshot()
         def undo():
             self.clear_targets()
             for target, state in zip(restore_targets, states):
@@ -1592,7 +1658,9 @@ class GrabbableRectangleSelection(GrabFunctions):
                 restore_recording(recording_state)
             for target in selected_targets:
                 self.add_target(target, update=False)
-            if self.targets:
+            if self.targets and not bool(
+                getattr(dragger, "_selection_refresh_on_draw", False)
+            ):
                 self.update_extent()
             if dragger is not None:
                 dragger.selected_element = (
@@ -1606,6 +1674,7 @@ class GrabbableRectangleSelection(GrabFunctions):
 
         return undo
 
+    @selection_geometry_snapshot()
     def start_move(self, save_targets: Iterable[TargetWrapper] = None):
         """start to move a grabber"""
         self.start_p1 = self.p1.copy()
@@ -1674,6 +1743,7 @@ class GrabbableRectangleSelection(GrabFunctions):
             ]
         setattr(target.target, "_pylustrator_cached_get_extend", None)
 
+    @legend_owner_snapshot()
     def _commit_deferred_positions(self):
         if not getattr(self, "defer_current_move", False):
             return
@@ -1794,6 +1864,7 @@ class GrabbableRectangleSelection(GrabFunctions):
             raise InteractionRollbackError(failures)
         return tuple(failures)
 
+    @legend_owner_snapshot()
     def end_move(self, edit_name: str = "Move", coalesce_key: str = None):
         """a grabber move stopped"""
         if self.has_moved is True:
@@ -1838,6 +1909,7 @@ class GrabbableRectangleSelection(GrabFunctions):
         self.move_start_tracker_state = None
         self.defer_current_move = False
 
+    @legend_owner_snapshot()
     def addOffset(self, pos: Sequence, dir: int, keep_aspect_ratio: bool = True):
         """move the whole selection (e.g. for the use of the arrow keys)"""
         pos = list(pos)
@@ -2101,6 +2173,56 @@ class DragManager:
         self.c6 = self.figure.canvas.mpl_connect(
             "draw_event", self.invalidate_geometry_cache
         )
+        self._selection_refresh_on_draw = True
+
+    def _post_draw_selection_indices(self) -> tuple[int, ...]:
+        """Return selected targets whose geometry can settle during draw."""
+
+        selection = getattr(self, "selection", None)
+        if selection is None:
+            return ()
+        get_layout_engine = getattr(self.figure, "get_layout_engine", None)
+        if callable(get_layout_engine) and get_layout_engine() is not None:
+            return tuple(range(len(selection.targets)))
+
+        parent_map = getattr(self, "_selection_parent_by_id", {})
+
+        def needs_refresh(artist: Artist) -> bool:
+            if isinstance(artist, Legend) or bool(
+                getattr(artist, "_pylustrator_geometry_finalized_on_draw", False)
+            ):
+                return True
+            if isinstance(artist, EditorGroup):
+                return any(needs_refresh(member) for member in artist.members)
+            current = parent_map.get(id(artist))
+            seen = set()
+            while current is not None and id(current) not in seen:
+                if isinstance(current, Legend):
+                    return True
+                seen.add(id(current))
+                current = parent_map.get(id(current))
+            return False
+
+        return tuple(
+            index
+            for index, target in enumerate(selection.targets)
+            if needs_refresh(target.target)
+        )
+
+    def refresh_selection_geometry(self, *, post_draw: bool = False) -> None:
+        """Synchronize selection overlays with current rendered geometry."""
+
+        selection = getattr(self, "selection", None)
+        if selection is None or not getattr(selection, "targets", None):
+            return
+        if post_draw:
+            selection.refresh_targets_after_draw(
+                self._post_draw_selection_indices()
+            )
+            return
+        with selection_geometry_snapshot():
+            selection.update_extent()
+            selection.update_selection_rectangles()
 
     def _draw_parent(self, artist: Artist) -> Artist | None:
         if isinstance(artist, EditorGroup):
@@ -2582,6 +2704,9 @@ class DragManager:
         # direct-selection targets without rebuilding the complete scene.
         for axes in getattr(self.figure, "axes", ()):
             self.register_axis_tick_labels(axes)
+        # Legend/text layout is finalized by Matplotlib during draw.  Overlay
+        # geometry measured before that point is necessarily provisional.
+        self.refresh_selection_geometry(post_draw=True)
 
     def deactivate(self):
         """deactivate the interaction callbacks from the figure"""
@@ -2590,6 +2715,7 @@ class DragManager:
         self.figure.canvas.mpl_disconnect(self.c4)
         self.figure.canvas.mpl_disconnect(self.c5)
         self.figure.canvas.mpl_disconnect(self.c6)
+        self._selection_refresh_on_draw = False
 
         self.selection.clear_targets()
         self.selected_element = None
@@ -2624,6 +2750,31 @@ class DragManager:
                 parent = getattr(target, "figure", None)
         if parent is not None and parent is not target:
             self._selection_parent_by_id[id(target)] = parent
+        finalized_on_draw = bool(
+            getattr(target, "_pylustrator_geometry_finalized_on_draw", False)
+            or isinstance(target, Legend)
+            or isinstance(parent, Legend)
+        )
+        if isinstance(target, Text) and isinstance(parent, Axes):
+            axes_layout_texts = (
+                parent.title,
+                parent._left_title,
+                parent._right_title,
+                parent.xaxis.label,
+                parent.yaxis.label,
+                parent.xaxis.offsetText,
+                parent.yaxis.offsetText,
+            )
+            finalized_on_draw = finalized_on_draw or any(
+                target is text for text in axes_layout_texts
+            )
+        if isinstance(target, Text) and isinstance(parent, (Figure, SubFigure)):
+            finalized_on_draw = finalized_on_draw or any(
+                target is getattr(parent, name, None)
+                for name in ("_suptitle", "_supxlabel", "_supylabel")
+            )
+        if finalized_on_draw:
+            target._pylustrator_geometry_finalized_on_draw = True
         if isinstance(target, Text):
             target._pylustrator_legend_owner = (
                 parent if isinstance(parent, Legend) else None
@@ -2650,6 +2801,7 @@ class DragManager:
         if isinstance(target, Text):
             add_text_default(target)
         if isinstance(target, Legend):
+            invalidate_legend_owner_inventory(self.figure)
             for handle in target.legend_handles:
                 self.make_draggable(handle, target)
             for text in target.get_texts():
@@ -2703,6 +2855,7 @@ class DragManager:
             for tick in ticks:
                 for label in (tick.label1, tick.label2):
                     if label.get_visible() and label.get_text() != "":
+                        label._pylustrator_geometry_finalized_on_draw = True
                         self.make_draggable(label, axes)
 
     def make_figure_draggable(self, fig: Figure | SubFigure) -> None:
@@ -2960,6 +3113,7 @@ class DragManager:
                 primary = normalized[-1] if normalized else None
         return normalized, primary
 
+    @selection_geometry_snapshot()
     def get_hit_stack(self, event: MouseEvent) -> HitStack:
         """Return every visual hit from front to back using one draw-order model."""
 

@@ -101,19 +101,22 @@ def get_legend_reference(element: Artist):
     figure = getattr(element, "figure", None)
     if figure is None:
         return None
-    from .artist_adapters import iter_figure_legends
+    from .artist_adapters import legend_owner_for_artist
 
-    for legend in iter_figure_legends(figure):
-        if element in legend.legend_handles:
-            return (
-                getReference(legend)
-                + ".legend_handles[%d]" % legend.legend_handles.index(element)
-            )
-        texts = legend.get_texts()
-        if element in texts:
-            return getReference(legend) + ".get_texts()[%d]" % texts.index(element)
-        if element == legend.get_title():
-            return getReference(legend) + ".get_title()"
+    legend = legend_owner_for_artist(element)
+    if legend is None:
+        return None
+    if element in legend.legend_handles:
+        return (
+            getReference(legend)
+            + ".legend_handles[%d]" % legend.legend_handles.index(element)
+        )
+    texts = legend.get_texts()
+    if element in texts:
+        return getReference(legend) + ".get_texts()[%d]" % texts.index(element)
+    if element == legend.get_title():
+        return getReference(legend) + ".get_title()"
+    return None
 
 
 class CodeReference(str):
@@ -548,18 +551,20 @@ class ChangeTracker:
         self.changeCountChanged()
 
     def get_element_restore_function(self, elements):
-        description_strings = []
-        for element in elements:
-            desc = self.get_describtion_string(element, exclude_default=False)
-            if isinstance(desc, list):
-                description_strings.extend(desc)
-            else:
-                description_strings.append(desc)
+        from .artist_adapters import legend_owner_snapshot
+
+        with legend_owner_snapshot():
+            description_strings = []
+            for element in elements:
+                desc = self.get_describtion_string(element, exclude_default=False)
+                if isinstance(desc, list):
+                    description_strings.extend(desc)
+                else:
+                    description_strings.append(desc)
 
         def restore():
             for element, string in description_strings:
                 # function, arguments = re.match(r"\.([^(]*)\((.*)\)", string)
-                print(f"eval {getReference(element)}{string}")
                 eval(f"{getReference(element)}{string}")
                 if isinstance(element, Text):
                     self.addNewTextChange(element)
@@ -571,7 +576,7 @@ class ChangeTracker:
                     raise NotImplementedError
                 # getattr(element, function)(eval(arg))
 
-        return restore
+        return legend_owner_snapshot()(restore)
 
     def get_describtion_string(self, element, exclude_default=True):
         if isinstance(element, Text):
@@ -1345,6 +1350,14 @@ class ChangeTracker:
         return output
 
     def save(self):
+        """Persist generated source without repeating structural discovery."""
+
+        from .artist_adapters import legend_owner_snapshot
+
+        with legend_owner_snapshot():
+            return self._save()
+
+    def _save(self):
         """save the changes to the .py file"""
         from .commands import GENERATED_STATE_VERSION
 
@@ -1377,8 +1390,6 @@ class ChangeTracker:
         output.append(
             "#% end: automatic generated code from pylustrator" + custom_append
         )
-        print("\n" + "\n".join(output) + "\n")
-
         block_id = getReference(self.figure)
         block = getTextFromFile(block_id, stack_position)
         if not block:
@@ -1388,9 +1399,12 @@ class ChangeTracker:
             insertTextToFile(output, stack_position, block_id)
         except FileNotFoundError:
             print(
-                "WARNING: no file to save the above changes was found, you are probably using pylustrator from a shell session.",
+                "WARNING: no file to save the changes was found; generated "
+                "source follows because pylustrator is probably running from "
+                "a shell session.",
                 file=sys.stderr,
             )
+            print("\n" + "\n".join(output) + "\n")
         self.saved = True
 
 

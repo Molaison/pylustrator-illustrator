@@ -1421,6 +1421,48 @@ def test_drag_motion_uses_original_display_geometry_for_legend_text() -> None:
     assert app is not None
 
 
+def test_move_reuses_legend_ownership_inventory_per_interaction_phase(
+    monkeypatch,
+) -> None:
+    import pylustrator.artist_adapters as artist_adapters
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    lines = [
+        ax.plot([0, 1], [index, index + 0.5], label=f"line {index}")[0]
+        for index in np.linspace(0, 1, 24)
+    ]
+    ax.legend(handles=[lines[0]], labels=["representative"])
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_elements(lines)
+
+    calls = 0
+    original = artist_adapters.iter_figure_legends
+
+    def counted(figure):
+        nonlocal calls
+        calls += 1
+        return original(figure)
+
+    monkeypatch.setattr(artist_adapters, "iter_figure_legends", counted)
+    try:
+        manager.selection.start_move()
+        manager.selection.addOffset(
+            (4, -2), DIR_X0 | DIR_X1 | DIR_Y0 | DIR_Y1
+        )
+        manager.selection.has_moved = True
+        manager.selection.end_move()
+
+        # Ownership may be refreshed once for each public gesture phase, but
+        # it must not be rediscovered once per selected artist/capability read.
+        assert calls <= 6
+    finally:
+        manager.selection.clear_targets()
+        plt.close(fig)
+    assert app is not None
+
+
 def test_legend_child_drag_moves_only_selected_child() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
@@ -4216,6 +4258,7 @@ def test_frameon_property_keeps_the_live_drag_selection() -> None:
     assert manager.selected_element is legend
     assert [target.target for target in manager.selection.targets] == [legend]
     assert legend.get_frame_on()
+    assert np.allclose(manager.selection.positions, artist_visible_extent(legend))
 
     manager.selection.start_move()
     manager.selection.addOffset((12, -7), DIR_X0 | DIR_X1 | DIR_Y0 | DIR_Y1)
@@ -4229,6 +4272,122 @@ def test_frameon_property_keeps_the_live_drag_selection() -> None:
         (bounds_after[0] - bounds_before[0], bounds_after[1] - bounds_before[1]),
         (12, -7),
     )
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_legend_property_rebuild_keeps_overall_selection_extent_live() -> None:
+    from pylustrator.components.qitem_properties import LegendPropertiesWidget
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    legend = ax.legend(handles=[Patch(label="A")], frameon=False, borderpad=0.4)
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_element(legend)
+
+    widget = LegendPropertiesWidget.__new__(LegendPropertiesWidget)
+    widget.properties = {"frameon": False, "borderpad": 0.4}
+    widget.target = legend
+
+    def assert_live_overlay():
+        current = ax.get_legend()
+        actual = artist_visible_extent(current)
+        assert manager.selected_element is current
+        assert [target.target for target in manager.selection.targets] == [current]
+        assert np.allclose(manager.selection.positions, actual, atol=1e-9)
+        assert np.allclose(
+            selection_rect_extents(manager.selection)[0], actual, atol=1e-9
+        )
+
+    widget.changePropertiy("frameon", True)
+    frame_edit = fig.change_tracker.edits[-1]
+    assert_live_overlay()
+
+    widget.changePropertiy("borderpad", 0.6)
+    property_edit = fig.change_tracker.edits[-1]
+    assert_live_overlay()
+
+    for action in (
+        property_edit[0],
+        frame_edit[0],
+        frame_edit[1],
+        property_edit[1],
+    ):
+        action()
+        assert_live_overlay()
+
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_draw_event_refreshes_legend_selection_after_move_undo() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    legend = ax.legend(handles=[Patch(label="A")], frameon=False)
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager._selection_refresh_on_draw = True
+    draw_connection = fig.canvas.mpl_connect(
+        "draw_event", manager.invalidate_geometry_cache
+    )
+    manager.select_element(legend)
+
+    manager.selection.start_move()
+    manager.selection.addOffset((1, -1), DIR_X0 | DIR_X1 | DIR_Y0 | DIR_Y1)
+    manager.selection.has_moved = True
+    manager.selection.end_move()
+    fig.canvas.draw()
+
+    fig.change_tracker.edit[0]()
+    fig.canvas.draw()
+    actual = artist_visible_extent(legend)
+    assert np.allclose(manager.selection.positions, actual, atol=1e-9)
+    assert np.allclose(
+        selection_rect_extents(manager.selection)[0], actual, atol=1e-9
+    )
+
+    fig.canvas.mpl_disconnect(draw_connection)
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_draw_event_remeasures_only_layout_late_selection_targets(
+    monkeypatch,
+) -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    lines = [
+        ax.plot([0, 1], [offset, offset + 0.2])[0]
+        for offset in np.linspace(0, 1, 24)
+    ]
+    legend = ax.legend(handles=[lines[0]], labels=["representative"])
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_elements([*lines, legend])
+
+    calls = {}
+    original = TargetWrapper.get_selection_points
+
+    def counted(wrapper):
+        key = id(wrapper.target)
+        calls[key] = calls.get(key, 0) + 1
+        return original(wrapper)
+
+    monkeypatch.setattr(TargetWrapper, "get_selection_points", counted)
+    manager._selection_refresh_on_draw = True
+    draw_connection = fig.canvas.mpl_connect(
+        "draw_event", manager.invalidate_geometry_cache
+    )
+    fig.canvas.draw()
+
+    assert calls.get(id(legend), 0) == 1
+    assert all(calls.get(id(line), 0) == 0 for line in lines)
+
+    fig.canvas.mpl_disconnect(draw_connection)
     manager.selection.clear_targets()
     plt.close(fig)
     assert app is not None
