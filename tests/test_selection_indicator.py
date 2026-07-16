@@ -931,6 +931,62 @@ def test_clicking_selected_object_changes_only_alignment_key() -> None:
     assert app is not None
 
 
+def test_key_reference_falls_back_to_selection_when_only_one_object_remains() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    first = ax.add_patch(Rectangle((0.12, 0.2), 0.18, 0.2))
+    second = ax.add_patch(Rectangle((0.64, 0.58), 0.16, 0.17))
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_elements([first, second], primary=second)
+    manager.selection.set_alignment_reference("key_object", key=second)
+
+    manager.select_element(first)
+
+    assert [target.target for target in manager.selection.targets] == [first]
+    assert manager.selection.alignment_reference_mode == "selection"
+    assert manager.selection.alignment_key is None
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_single_selection_drag_ignores_stale_key_object_mode() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    target = ax.add_patch(Rectangle((0.24, 0.3), 0.2, 0.18))
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_element(target)
+    # Simulate an invalid state restored by an older session.  Pointer input
+    # must still remain safe even though the public setter rejects this state.
+    manager.selection.alignment_reference_mode = "key_object"
+    manager.selection.alignment_key = target
+    before = artist_visible_extent(target)
+    x = (before[0] + before[2]) / 2
+    y = (before[1] + before[3]) / 2
+    press = MouseEvent("button_press_event", fig.canvas, x, y, button=1)
+    move = MouseEvent(
+        "motion_notify_event", fig.canvas, x + 10, y - 6, button=1, key="alt"
+    )
+    release = MouseEvent(
+        "button_release_event", fig.canvas, x + 10, y - 6, button=1, key="alt"
+    )
+
+    manager.button_press_event0(press)
+    manager.selection.on_motion(move)
+    manager.button_release_event0(release)
+    fig.canvas.draw()
+
+    after = artist_visible_extent(target)
+    assert (after[0] - before[0], after[1] - before[1]) == pytest.approx(
+        (10, -6), abs=1e-8
+    )
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
 def test_selection_distribution_keeps_end_objects_and_equalizes_gaps() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     fig = plt.figure(figsize=(4, 3), dpi=100)

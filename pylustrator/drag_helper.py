@@ -1393,6 +1393,12 @@ class GrabbableRectangleSelection(GrabFunctions):
         if mode not in {"selection", "key_object", "artboard"}:
             mode = "selection"
         selected = [target.target for target in self.targets]
+        if mode == "key_object" and len(selected) < 2:
+            # A key object only has meaning inside a multi-selection.  Keep
+            # the interaction state valid when selection changes or an older
+            # session restores a now-impossible key-object mode.
+            mode = "selection"
+            key = None
         self.alignment_reference_mode = mode
         self.alignment_key = (
             key
@@ -3511,6 +3517,14 @@ class DragManager:
 
             if (
                 self.selection.alignment_reference_mode == "key_object"
+                and len(self.selection.targets) < 2
+            ):
+                self.selection._restore_alignment_reference_state(
+                    "selection", None
+                )
+            if (
+                self.selection.alignment_reference_mode == "key_object"
+                and len(self.selection.targets) >= 2
                 and picked_element
                 in [target.target for target in self.selection.targets]
                 and not click_through
