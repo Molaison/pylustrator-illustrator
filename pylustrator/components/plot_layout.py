@@ -1,49 +1,37 @@
 import os
 import numpy as np
-from typing import TYPE_CHECKING, Optional
 
-if TYPE_CHECKING:
-    from PyQt5 import QtCore, QtGui, QtWidgets
+from matplotlib.backends.qt_compat import QtCore, QtGui, QtWidgets, _version_info
 
-    QActionGroup = QtWidgets.QActionGroup
+if _version_info[0] == 6:
+    QActionGroup = QtGui.QActionGroup
 else:
-    from matplotlib.backends.qt_compat import QtCore, QtGui, QtWidgets, _version_info
-
-    if _version_info[0] == 6:
-        QActionGroup = QtGui.QActionGroup
-    else:
-        QActionGroup = QtWidgets.QActionGroup
+    QActionGroup = QtWidgets.QActionGroup
 
 import matplotlib.transforms as transforms
 from matplotlib.figure import Figure
-from matplotlib.backend_bases import MouseEvent
 
 try:  # for matplotlib > 3.0
     from matplotlib.backends.backend_qtagg import (
-        FigureCanvas as Canvas,  # ty:ignore[unresolved-import]
+        FigureCanvas as Canvas,
         NavigationToolbar2QT as NavigationToolbar,
     )
 except ModuleNotFoundError:
     from matplotlib.backends.backend_qt5agg import (
-        FigureCanvas as Canvas,  # ty:ignore[unresolved-import]
+        FigureCanvas as Canvas,
         NavigationToolbar2QT as NavigationToolbar,
     )
 
 from .matplotlibwidget import MatplotlibWidget
 
 
-class GraphicsRectItemWithView(QtWidgets.QGraphicsRectItem):
-    view: QtWidgets.QGraphicsView | None = None
-    pass
-
-
 class MyScene(QtWidgets.QGraphicsScene):
     grabber_pressed = None
 
-    def mousePressEvent(self, e):  # ty:ignore[invalid-method-override]
+    def mousePressEvent(self, e):
         super().mousePressEvent(e)
 
-    def mouseReleaseEvent(self, e):  # ty:ignore[invalid-method-override]
+    def mouseReleaseEvent(self, e):
         super().mouseReleaseEvent(e)
         if self.grabber_pressed:
             self.grabber_pressed.mouseReleaseEvent(e)
@@ -57,13 +45,8 @@ class MyView(QtWidgets.QGraphicsView):
         super().__init__(*args)
         self.setMouseTracking(True)
 
-    def event(self, e: Optional["QtCore.QEvent"]) -> bool:  # ty:ignore[invalid-method-override]
-        if e is None:
-            return super().event(e)
-        if (
-            e.type() == QtCore.QEvent.Type.KeyPress
-            or e.type() == QtCore.QEvent.Type.KeyRelease
-        ):
+    def event(self, e):
+        if e.type() == QtCore.QEvent.KeyPress or e.type() == QtCore.QEvent.KeyRelease:
             self.canvas_canvas.event(e)
         super().event(e)
         return True
@@ -139,7 +122,7 @@ class Canvas(QtWidgets.QWidget):
     footer_label = None
     footer_label2 = None
 
-    canvas: MatplotlibWidget | None = None
+    canvas = None
 
     def __init__(self, signals):
         """The wrapper around the matplotlib canvas to create a more image editor like canvas with background and side rulers"""
@@ -154,8 +137,8 @@ class Canvas(QtWidgets.QWidget):
         self.fitted_to_view = False
         self._last_ruler_state = None
 
-        self.layout_main = QtWidgets.QHBoxLayout(self)
-        self.layout_main.setContentsMargins(0, 0, 0, 0)
+        self.layout = QtWidgets.QHBoxLayout(self)
+        self.layout.setContentsMargins(0, 0, 0, 0)
 
         self.canvas_scroll = QtWidgets.QScrollArea(self)
         self.canvas_scroll.setWidgetResizable(False)
@@ -168,7 +151,7 @@ class Canvas(QtWidgets.QWidget):
             QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed
         )
         self.canvas_canvas.setStyleSheet("background:#d1d1d1")
-        self.canvas_canvas.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
+        self.canvas_canvas.setFocusPolicy(QtCore.Qt.StrongFocus)
 
         self.shadow = QtWidgets.QLabel(self.canvas_canvas)
         self.shadow.setGraphicsEffect(QtWidgets.QGraphicsBlurEffect(self.shadow))
@@ -185,7 +168,7 @@ class Canvas(QtWidgets.QWidget):
         self.y_scale = QtWidgets.QLabel(self.canvas_canvas)
 
         self.selections_scene = MyScene()
-        self.selections_scene_origin = GraphicsRectItemWithView()
+        self.selections_scene_origin = QtWidgets.QGraphicsRectItem()
         self.selections_scene_origin.setTransform(QtGui.QTransform(1, 0, 0, -1, 0, 0))
 
         self.selections_scene.addItem(self.selections_scene_origin)
@@ -193,12 +176,8 @@ class Canvas(QtWidgets.QWidget):
         self.selections_scene_origin.view = self.selections_view
         self.selections_view.parent = self
         self.selections_view.setStyleSheet("background:transparent")
-        self.selections_view.setAttribute(
-            QtCore.Qt.WidgetAttribute.WA_TranslucentBackground
-        )
-        self.selections_view.setAttribute(
-            QtCore.Qt.WidgetAttribute.WA_NoSystemBackground
-        )
+        self.selections_view.setAttribute(QtCore.Qt.WA_TranslucentBackground)
+        self.selections_view.setAttribute(QtCore.Qt.WA_NoSystemBackground)
         self.selections_view.canvas_canvas = self.canvas_canvas
 
     def updateCanvasAreaSize(self):
@@ -259,8 +238,6 @@ class Canvas(QtWidgets.QWidget):
             del self.canvas
 
         self.canvas = MatplotlibWidget(self, figure=figure)
-        if self.canvas is None:
-            return
         self.canvas.window_pylustrator = self
         self.canvas_wrapper_layout.addWidget(self.canvas)
 
@@ -293,8 +270,6 @@ class Canvas(QtWidgets.QWidget):
         self.footer_label2 = footer2
 
     def updateRuler(self):
-        if self.canvas is None:
-            return
         """update the ruler around the figure to show the dimensions"""
         if self.canvas is None or getattr(self, "fig", None) is None:
             return
@@ -382,7 +357,7 @@ class Canvas(QtWidgets.QWidget):
                     int(o - 3),
                     int(self.fontMetrics().width(text)),
                     int(o + self.fontMetrics().height()),
-                    QtCore.Qt.AlignLeft,  # ty:ignore[unresolved-attribute]
+                    QtCore.Qt.AlignLeft,
                     text,
                 )
             elif pos_cm % medium_lines == 0:
@@ -425,7 +400,7 @@ class Canvas(QtWidgets.QWidget):
                         int(y + 3 + self.fontMetrics().height() * ti),
                         int(o + self.fontMetrics().width("0")),
                         int(self.fontMetrics().height()),
-                        QtCore.Qt.AlignmentFlag.AlignCenter,
+                        QtCore.Qt.AlignCenter,
                         t,
                     )
             elif pos_cm % medium_lines == 0:
@@ -490,12 +465,12 @@ class Canvas(QtWidgets.QWidget):
             self._centerFigureCanvas()
             self.updateRuler()
 
-    def canvas_key_press(self, event: QtGui.QKeyEvent):
+    def canvas_key_press(self, event: QtCore.QEvent):
         """when a key in the canvas widget is pressed"""
         if event.key == "control":
             self.control_modifier = True
 
-    def canvas_key_release(self, event: QtGui.QKeyEvent):
+    def canvas_key_release(self, event: QtCore.QEvent):
         """when a key in the canvas widget is released"""
         if event.key == "control":
             self.control_modifier = False
@@ -507,10 +482,8 @@ class Canvas(QtWidgets.QWidget):
 
         self.updateRuler()
 
-    def scroll_event(self, event: MouseEvent):
+    def scroll_event(self, event: QtCore.QEvent):
         """when the mouse wheel is used to zoom the figure"""
-        if self.canvas is None:
-            return
         if self.control_modifier:
             self.fitted_to_view = False
             new_dpi = self.fig.get_dpi() + 10 * event.step
@@ -547,12 +520,12 @@ class Canvas(QtWidgets.QWidget):
         """when the window is shown"""
         self.fitToView(True)
 
-    def button_press_event(self, event: MouseEvent):
+    def button_press_event(self, event: QtCore.QEvent):
         """when a mouse button is pressed"""
         if event.button == 2:
             self.drag = np.array([event.x, event.y])
 
-    def mouse_move_event(self, event: MouseEvent):
+    def mouse_move_event(self, event: QtCore.QEvent):
         """when the mouse is moved"""
         if self.drag is not None:
             pos = np.array([event.x, event.y])
@@ -564,39 +537,39 @@ class Canvas(QtWidgets.QWidget):
             + self.fig.dpi_scale_trans.inverted()
         )
         pos = trans.transform((event.x, event.y))
-        self.footer_label.setText(  # ty:ignore[possibly-missing-attribute]
+        self.footer_label.setText(
             "%.2f, %.2f (cm) [%d, %d]" % (pos[0], pos[1], event.x, event.y)
         )
 
         if event.ydata is not None:
-            self.footer_label2.setText("%.2f, %.2f" % (event.xdata, event.ydata))  # ty:ignore[possibly-missing-attribute]
+            self.footer_label2.setText("%.2f, %.2f" % (event.xdata, event.ydata))
         else:
-            self.footer_label2.setText("")  # ty:ignore[possibly-missing-attribute]
+            self.footer_label2.setText("")
 
-    def button_release_event(self, event: MouseEvent):
+    def button_release_event(self, event: QtCore.QEvent):
         """when the mouse button is released"""
         if event.button == 2:
             self.drag = None
 
-    def keyPressEvent(self, event: QtGui.QKeyEvent):
+    def keyPressEvent(self, event: QtCore.QEvent):
         """when a key is pressed"""
-        if event.key() == QtCore.Qt.Key.Key_Control:
+        if event.key() == QtCore.Qt.Key_Control:
             self.control_modifier = True
-        if event.key() == QtCore.Qt.Key.Key_Left:
+        if event.key() == QtCore.Qt.Key_Left:
             self.moveCanvasCanvas(-10, 0)
-        if event.key() == QtCore.Qt.Key.Key_Right:
+        if event.key() == QtCore.Qt.Key_Right:
             self.moveCanvasCanvas(10, 0)
-        if event.key() == QtCore.Qt.Key.Key_Up:
+        if event.key() == QtCore.Qt.Key_Up:
             self.moveCanvasCanvas(0, -10)
-        if event.key() == QtCore.Qt.Key.Key_Down:
+        if event.key() == QtCore.Qt.Key_Down:
             self.moveCanvasCanvas(0, 10)
 
-        if event.key() == QtCore.Qt.Key.Key_F:
+        if event.key() == QtCore.Qt.Key_F:
             self.fitToView(True)
 
-    def keyReleaseEvent(self, event: QtGui.QKeyEvent):
+    def keyReleaseEvent(self, event: QtCore.QEvent):
         """when a key is released"""
-        if event.key() == QtCore.Qt.Key.Key_Control:
+        if event.key() == QtCore.Qt.Key_Control:
             self.control_modifier = False
 
     def updateFigureSize(self):

@@ -121,7 +121,7 @@ class QPosAndSize(QtWidgets.QWidget):
         self.input_transform.editingFinished.connect(self.changeTransform)
 
         self.input_shape_transform = ComboWidget(
-            self.layout_main, "", ["scale", "bottom right", "top left"]
+            self.layout, "", ["scale", "bottom right", "top left"]
         )
         self.layout.addWidget(self.input_shape_transform, 1, 1)
         self.input_shape_transform.editingFinished.connect(self.changeTransform2)
@@ -158,7 +158,7 @@ class QPosAndSize(QtWidgets.QWidget):
             self.setElement(element)
 
     def selection_moved(self):
-        self.setElement(self.element)  # ty:ignore[invalid-argument-type]
+        self.setElement(self.element)
 
     def changeTransform(self):
         """change the transform and the units of the position and size widgets"""
@@ -168,7 +168,7 @@ class QPosAndSize(QtWidgets.QWidget):
             name = ""
         self.input_shape.setUnit(name)
         self.input_position.setUnit(name)
-        self.setElement(self.element)  # ty:ignore[invalid-argument-type]
+        self.setElement(self.element)
 
     def changeTransform2(self):  # , state: int, name: str):
         """when the dimension change type is changed from 'scale' to 'bottom right' or 'bottom left'"""
@@ -435,7 +435,7 @@ class QPosAndSize(QtWidgets.QWidget):
             elements = [self.element]
             elements += [
                 element.target
-                for element in self.element.figure.selection.targets  # ty:ignore[possibly-missing-attribute]
+                for element in self.element.figure.selection.targets
                 if element.target != self.element and isinstance(element.target, Axes)
             ]
 
@@ -550,7 +550,7 @@ class QPosAndSize(QtWidgets.QWidget):
             self.input_shape.setDisabled(True)
 
         try:
-            pos = element.get_position()  # ty:ignore[unresolved-attribute]
+            pos = element.get_position()
             self.input_position.setTransform(self.getTransform(element))
             try:
                 self.input_position.setValue(pos)

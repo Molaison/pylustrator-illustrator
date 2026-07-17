@@ -20,7 +20,6 @@
 # along with Pylustrator. If not, see <http://www.gnu.org/licenses/>
 import sys
 import traceback
-from typing import TYPE_CHECKING, Any, Optional, cast
 
 from matplotlib import _pylab_helpers
 
@@ -29,20 +28,12 @@ import qtawesome as qta
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 from matplotlib.axes._axes import Axes
+from matplotlib.backends.qt_compat import QtCore, QtGui, QtWidgets, _version_info
 
-if TYPE_CHECKING:
-    from PyQt5 import QtCore, QtGui, QtWidgets
-
-    QAction = QtWidgets.QAction
-    from PyQt5.QtCore import pyqtSignal as Signal
+if _version_info[0] == 6:
+    QAction = QtGui.QAction
 else:
-    from matplotlib.backends.qt_compat import QtCore, QtGui, QtWidgets, _version_info
-
-    if _version_info[0] == 6:
-        QAction = QtGui.QAction
-    else:
-        QAction = QtWidgets.QAction
-    from qtpy.QtCore import Signal
+    QAction = QtWidgets.QAction
 
 from .ax_rasterisation import rasterizeAxes, restoreAxes
 from .change_tracker import setFigureVariableNames
@@ -71,9 +62,6 @@ app = None
 keys_for_lines = {}
 
 no_save_allowed = False
-setting_use_global_variable_names = False
-old_pltshow: Optional[Any] = None
-old_pltfigure: Optional[Any] = None
 
 
 def initialize(
@@ -183,7 +171,7 @@ def initialize(
     # stack_call_position = traceback.extract_stack()[-2]
     # stack_call_position.filename
 
-    cast(Any, plt).keys_for_lines = keys_for_lines
+    plt.keys_for_lines = keys_for_lines
 
     # store the last figure save filename
     if not getattr(Figure.savefig, "_pylustrator_savefig_wrapper", False):
@@ -200,7 +188,7 @@ def initialize(
         Figure.savefig = savefig
 
 
-def pyl_show(hide_window: bool = False) -> None:
+def pyl_show(hide_window: bool = False):
     """the function overloads the matplotlib show function.
     It opens a DragManager window instead of the default matplotlib window.
     """
@@ -212,10 +200,6 @@ def pyl_show(hide_window: bool = False) -> None:
         myappid = "rgerum.pylustrator"  # arbitrary string
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
 
-    if app is None:
-        app = QtWidgets.QApplication(sys.argv)
-    if app is None:
-        app = QtWidgets.QApplication(sys.argv)
     if app is None:
         app = QtWidgets.QApplication(sys.argv)
     # iterate over figures
@@ -234,26 +218,21 @@ def pyl_show(hide_window: bool = False) -> None:
         DragManager(fig, no_save_allowed)
         init_figure(fig)
         window.setFigure(fig)
-        # add dragger (ChangeTracker.load() sets is_new_text on texts from generated code)
-        DragManager(fig, no_save_allowed)
-        # initialize figure defaults AFTER load, so is_new_text is properly set
-        init_figure(fig)
         window.addFigure(fig)
         window.update()
         # and show it
         if hide_window is False:
             window.show()
-    if hide_window is False and app is not None:
+    if hide_window is False:
         # execute the application
         app.exec_()
 
 
-def show(*args, **kwargs) -> None:
+def show(hide_window: bool = False):
     """the function overloads the matplotlib show function.
     It opens a DragManager window instead of the default matplotlib window.
     """
-    global figures, app, old_pltshow, old_pltfigure
-    hide_window = kwargs.pop("hide_window", False)
+    global figures
     # set an application id, so that windows properly stacks them in the task bar
     if sys.platform[:3] == "win":
         import ctypes
@@ -271,22 +250,19 @@ def show(*args, **kwargs) -> None:
         window.setFigure(_pylab_helpers.Gcf.figs[figure].canvas.figure)
         # warn about ticks not fitting tick labels
         warnAboutTicks(window.fig)
-        # add dragger (ChangeTracker.load() sets is_new_text on texts from generated code)
+        # add dragger
         DragManager(_pylab_helpers.Gcf.figs[figure].canvas.figure, no_save_allowed)
-        # initialize figure defaults AFTER load, so is_new_text is properly set
         init_figure(_pylab_helpers.Gcf.figs[figure].canvas.figure)
         window.update()
         # and show it
         if hide_window is False:
             window.show()
-    if hide_window is False and app is not None:
+    if hide_window is False:
         # execute the application
         app.exec_()
 
-    if old_pltshow is not None:
-        plt.show = old_pltshow
-    if old_pltfigure is not None:
-        plt.figure = old_pltfigure
+    plt.show = old_pltshow
+    plt.figure = old_pltfigure
 
 
 class CmapColor(list):
@@ -305,7 +281,7 @@ def patchColormapsWithMetaInfo():
         return
     cm_call = Colormap.__call__
 
-    def new_call(self, *args: Any, **kwargs: Any) -> Any:
+    def new_call(self, *args, **kwargs):
         c = cm_call(self, *args, **kwargs)
         if isinstance(c, (tuple, list)):
             c = CmapColor(c)
@@ -326,7 +302,7 @@ def figure(num=None, figsize=None, force_add=False, *args, **kwargs):
     # if number is not defined
     if force_add or num not in _pylab_helpers.Gcf.figs.keys():
         # create a new window and store it
-        canvas = PlotWindow(num).canvas
+        canvas = PlotWindow(num, figsize, *args, **kwargs).canvas
         canvas.figure.number = num
         canvas.figure.clf()
         canvas.manager.num = num
@@ -335,7 +311,7 @@ def figure(num=None, figsize=None, force_add=False, *args, **kwargs):
     manager = _pylab_helpers.Gcf.figs[num]
     # set the size if it is defined
     if figsize is not None:
-        cast(Any, _pylab_helpers.Gcf.figs[num]).window.setGeometry(
+        _pylab_helpers.Gcf.figs[num].window.setGeometry(
             100, 100, figsize[0] * 80, figsize[1] * 80
         )
     # set the figure as the active figure
@@ -380,19 +356,19 @@ def warnAboutTicks(fig):
 
 
 class Signals(QtWidgets.QWidget):
-    figure_changed = Signal(Figure)
-    canvas_changed = Signal(object)
-    figure_size_changed = Signal()
-    figure_element_selected = Signal(object)
-    figure_selection_moved = Signal()
-    figure_selection_property_changed = Signal()
-    figure_selection_update = Signal()
-    figure_element_child_created = Signal(object)
+    figure_changed = QtCore.Signal(Figure)
+    canvas_changed = QtCore.Signal(object)
+    figure_size_changed = QtCore.Signal()
+    figure_element_selected = QtCore.Signal(object)
+    figure_selection_moved = QtCore.Signal()
+    figure_selection_property_changed = QtCore.Signal()
+    figure_selection_update = QtCore.Signal()
+    figure_element_child_created = QtCore.Signal(object)
 
 
 class PlotWindow(QtWidgets.QWidget):
     fig = None
-    update_changes_signal = Signal(bool, bool, str, str)
+    update_changes_signal = QtCore.Signal(bool, bool, str, str)
 
     def setFigure(self, figure):
         if self.fig is not None:
@@ -434,8 +410,6 @@ class PlotWindow(QtWidgets.QWidget):
         # self.preview.addFigure(figure)
 
     def selectionProperyChanged(self):
-        if self.fig is None:
-            return
         self.fig.selection.update_selection_rectangles()
         self.fig.selection.update_extent()
 
@@ -455,7 +429,7 @@ class PlotWindow(QtWidgets.QWidget):
         file_menu.addAction(open_act)
 
         open_act = QAction("Exit", self)
-        open_act.triggered.connect(lambda checked=False: self.close())
+        open_act.triggered.connect(self.close)
         open_act.setShortcut("Ctrl+Q")
         file_menu.addAction(open_act)
 
@@ -534,13 +508,9 @@ class PlotWindow(QtWidgets.QWidget):
         layout_parent.addWidget(self.menuBar)
 
     def undo(self):
-        if self.fig is None:
-            return None
         self.fig.figure_dragger.undo()
 
     def redo(self):
-        if self.fig is None:
-            return None
         self.fig.figure_dragger.redo()
 
     def delete_selection(self):
@@ -865,8 +835,6 @@ class PlotWindow(QtWidgets.QWidget):
 
     def rasterize(self, rasterize: bool):
         """convert the figur elements to an image"""
-        if self.fig is None:
-            return
         if len(self.fig.selection.targets):
             self.fig.figure_dragger.select_element(None)
         if rasterize:
@@ -889,8 +857,6 @@ class PlotWindow(QtWidgets.QWidget):
 
     def actionSaveImage(self):
         """save figure as an image"""
-        if self.fig is None:
-            return
         path = QtWidgets.QFileDialog.getSaveFileName(
             self,
             "Save Image",
@@ -927,15 +893,11 @@ class PlotWindow(QtWidgets.QWidget):
 
     def update(self):
         """update the tree view"""
-        if self.fig is None:
-            return
 
         # self.input_size.setValue(np.array(self.fig.get_size_inches()) * 2.54)
 
         def wrap(func):
             def newfunc(element, event=None):
-                if self.fig is None:
-                    return
                 self.fig.no_figure_dragger_selection_update = True
                 self.signals.figure_element_selected.emit(element)
                 ret = func(element, event)
@@ -961,8 +923,6 @@ class PlotWindow(QtWidgets.QWidget):
 
     def updateTitle(self):
         """update the title of the window to display if it is saved or not"""
-        if self.fig is None:
-            return
         if self.fig.change_tracker.saved:
             self.setWindowTitle("Figure %s - Pylustrator" % self.fig.number)
         else:

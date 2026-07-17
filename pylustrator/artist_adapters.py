@@ -28,7 +28,7 @@ from matplotlib.artist import Artist
 try:  # starting from mpl version 3.6.0
     from matplotlib.axes import Axes
 except ImportError:
-    from matplotlib.axes._subplots import Axes
+    from matplotlib.axes._subplots import Axes  # ty: ignore[unresolved-import]
 from matplotlib.collections import LineCollection, PathCollection, PolyCollection
 from matplotlib.image import AxesImage
 from matplotlib.legend import Legend

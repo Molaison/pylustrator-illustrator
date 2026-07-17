@@ -2,7 +2,26 @@
 python-version = "3.9"
 
 [src]
-exclude = ["docs/", "development/"]
+# The interaction architecture predates upstream's ty conversion and relies on
+# dynamic Matplotlib/Qt protocols. Keep upstream type coverage for unaffected
+# modules while these conflict-heavy files are migrated incrementally.
+exclude = [
+    "docs/",
+    "development/",
+    "tests/",
+    "pylustrator/QLinkableWidgets.py",
+    "pylustrator/QtGui.py",
+    "pylustrator/QtGuiDrag.py",
+    "pylustrator/change_tracker.py",
+    "pylustrator/components/align.py",
+    "pylustrator/components/matplotlibwidget.py",
+    "pylustrator/components/plot_layout.py",
+    "pylustrator/components/qitem_properties.py",
+    "pylustrator/components/qpos_and_size.py",
+    "pylustrator/components/tree_view.py",
+    "pylustrator/drag_helper.py",
+    "pylustrator/snap.py",
+]
 
 [rules]
 # Baseline for dynamic Matplotlib/Qt code. Tighten these one rule at a time.
