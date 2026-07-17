@@ -62,7 +62,10 @@ class ReferencePointWidget(QtWidgets.QWidget):
                 layout.addWidget(button, row, column)
                 self._buttons[point] = button
         self._buttons[self._value].setChecked(True)
-        self.setToolTip("Reference point for numeric position and size transforms")
+        self.setToolTip(
+            "Reference point for numeric transforms; click any point to reset "
+            "a custom rotation pivot"
+        )
 
     def value(self) -> tuple[float, float]:
         return self._value
@@ -71,10 +74,9 @@ class ReferencePointWidget(QtWidgets.QWidget):
         point = tuple(float(value) for value in point)
         if point not in self._buttons:
             raise ValueError(f"Unsupported transform reference point: {point!r}")
-        changed = point != self._value
         self._value = point
         self._buttons[point].setChecked(True)
-        if emit and changed:
+        if emit:
             self.referenceChanged.emit(point)
 
 

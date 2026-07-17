@@ -99,9 +99,10 @@ The following behavior passes for every type that advertises it:
 - Native rotation renders and records correctly for Text, Annotation,
   Rectangle, and Ellipse. Rigid rotation uses an absolute destination plan for
   every supported leaf, so a mixed Text/Line2D/Patch/Collection selection
-  shares one 3x3 reference pivot instead of rotating each object in place.
-  Handle preview, toolbar commit, generated changes, and Undo/Redo consume the
-  same plan.
+  shares one pivot instead of rotating each object in place. A complete rigid
+  selection may move that pivot freely; native-only rotation retains its true
+  Artist pivot. Handle preview, toolbar commit, generated changes, and
+  Undo/Redo consume the same plan.
 - Snapshots restore before/after geometry and native rotation. Failed
   multi-target transforms restore both artist state and generated-change
   bookkeeping atomically.
@@ -181,6 +182,16 @@ bounds and stores absolute destinations. A single geometry-backed Artist uses
 the same Q path as a mixed selection; only a single object without a complete Q
 plan may fall back to a separately verified stable-visual native R contract.
 Multi-selection never silently applies equal local angle deltas.
+
+The movable shared pivot is non-document interaction state. It is stored in
+root-Figure physical inches, so DPI/HiDPI and Figure-size changes do not turn it
+into a stale raw-pixel position. Dragging it changes only the QGraphics overlay:
+no Artist, generated record, or undo item is touched. Escape restores the
+pre-drag pivot; selection membership changes clear it; primary/key changes keep
+it; and clicking any 3x3 reference point (including the already-active point)
+returns rotation to that reference. Both ordinary geometry restore closures and
+``InteractionState`` preserve it across Undo/Redo. Native-only and incomplete
+mixed selections never expose a movable marker.
 
 The initial permissive prototype exposed why type checks alone are not enough.
 Resize accepted off-diagonal matrices and reported success for objects whose

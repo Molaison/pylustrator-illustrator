@@ -350,10 +350,43 @@ undo item, while reference mode, key, and primary survive undo/redo. The formal
 Fig2 remains byte-identical at SHA-256
 `b0cd72abf3962cd6cd2354467ad57aa37ecc213332645d7cb56e6f4af598ad70`.
 
+### P1c: Movable custom rotation pivots
+
+Implemented as selection-level editor state, without changing the existing
+``RigidRotationPlan`` or any generated-source schema. A selection exposes the
+movable on-canvas pivot only when every member already has a complete
+``RIGID_ROTATE`` plan. Native-only rotation continues to use the Artist's true
+fixed pivot and cannot pretend to honor an arbitrary origin.
+
+The custom pivot is stored in root-Figure physical inches rather than raw
+display pixels or normalized Figure fractions. It therefore stays at the same
+physical artboard coordinate across DPI/HiDPI and Figure-size changes. Dragging
+the marker mutates only QGraphics state and creates no generated command or
+Undo item. Intermediate mouse frames update only the overlay; release, reset,
+or Escape emits one final UI-state notification. Escape restores the pre-drag
+pivot, changing selection membership clears it, changing only the primary/key
+preserves it, and clicking any point in the 3x3 locator resets it even when that
+point was already active. Handle and toolbar rotation both resolve the same
+pivot and destination plan; a coincident handle automatically moves to retain a
+nonzero lever arm.
+
+The pivot and 3x3 reference are captured by both geometry restore closures and
+``InteractionState``. A late history-insertion failure now restores Artist
+geometry, generated bookkeeping, edit history, reference/pivot state,
+selection, and primary object as one transaction. Synthetic Qt coverage spans
+drag/release/Escape, handle/toolbar, native denial, group and interaction-state
+Undo/Redo, clip rejection, DPI/Figure-size changes, and the 3x3 reset path. A
+read-only Fig2 fork accepted Line2D, LineCollection, and PathPatch with maximum
+commit/Undo error ``2.27e-13 px``; the clipped FillBetweenPolyCollection was an
+expected zero-mutation typed rejection. The formal editable Fig2 remained
+byte-identical at SHA-256
+`aba67bbd663fd16da535aa30d43f607c7205d096455f44544e518607cdce2dbb`.
+
 Remaining feature work:
 
-- Freely movable/custom rotation pivots and broader safe coverage such as
-  rotationally symmetric Line2D markers.
+- Safe rigid-rotation coverage for continuously symmetric Line2D markers. This
+  requires a marker-aware destination envelope; merely enabling the capability
+  produced up to ``242.99 px`` preview/commit error for subset ``markevery``.
 - Generic smart guides for edges, centers, baselines, anchors, and equal gaps.
 - Direct path/endpoint editing and inline text editing.
 - Content-following cached drag previews and spatial hit/snap indexes.
