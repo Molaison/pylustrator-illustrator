@@ -165,6 +165,35 @@ cd pylustrator-illustrator
 uv sync --locked --all-extras --dev
 ```
 
+## Offline Generated-Source Doctor
+
+Historical generated blocks can fail before Pylustrator starts—for example, an
+old block containing bare `nan` or `inf` cannot be repaired by a runtime
+migration because Python evaluates that block first. The fork therefore ships
+an offline doctor that reads Python source without importing or executing it:
+
+```bash
+# Diagnose one file or recursively scan a directory; never writes by default.
+pylustrator-source path/to/figure.py
+pylustrator-source path/to/figures/
+
+# Preview the exact changes, then opt in to an atomic migration.
+pylustrator-source --diff path/to/figure.py
+pylustrator-source --write path/to/figure.py
+```
+
+The doctor recognizes only exact Pylustrator marker comments, leaves user code
+outside those blocks byte-for-byte unchanged, and handles schema versions,
+legacy indexed Legend proxy locators, and non-finite NumPy literals. It
+preserves the source encoding, newline style, and file mode; refuses to replace
+symbolic links, break hardlinks, or overwrite a concurrently changed file; and
+never partially writes a file containing an unknown future schema or malformed
+block. `--json` provides
+machine-readable diagnostics. Exit status is `0` when clean (or fully
+migrated), `1` when source diagnostics remain, and `2` for an operational or
+usage error. See the [source doctor reference](docs/source_doctor.rst) for the
+full safety contract.
+
 ## Issues, Questions, and Suggestions
 
 Please submit your questions, suggestions, and bug reports to the

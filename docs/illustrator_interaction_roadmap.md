@@ -177,6 +177,14 @@ Acceptance:
 - Existing generated blocks can be migrated, including legacy legend proxy
   references.
 
+The offline migration boundary is now executable through `pylustrator-source`.
+It tokenizes exact generated-block comments without importing the inspected
+script, reports malformed/future schemas, and produces an idempotent candidate
+for legacy indexed Legend proxy locators and pre-runtime `nan`/`inf` failures.
+Writes are opt-in and atomic, preserve encoding/newlines/mode, reject symlinks
+and concurrent changes, and fail closed when any block cannot be migrated
+safely.
+
 ## P1: Illustrator productivity
 
 Foundation status (2026-07-15): visible/preview bounds are now explicit and

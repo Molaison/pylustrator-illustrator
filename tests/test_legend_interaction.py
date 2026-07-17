@@ -611,7 +611,9 @@ def test_generated_source_migration_rewrites_legacy_legend_proxy_locator() -> No
     from pylustrator.commands import migrate_generated_source
 
     source = (
+        '#% start: automatic generated code from pylustrator\n'
         'plt.figure(1).axes[0].get_legend_handles_labels()[0][1].set_alpha(0.5)\n'
+        '#% end: automatic generated code from pylustrator\n'
     )
 
     migrated = migrate_generated_source(source)

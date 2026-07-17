@@ -22,6 +22,9 @@ dependencies = [
     "qtpy>=2.4.3",
 ]
 
+[project.scripts]
+pylustrator-source = "pylustrator.source_doctor:main"
+
 [project.urls]
 Homepage = "https://github.com/Molaison/pylustrator-illustrator"
 Repository = "https://github.com/Molaison/pylustrator-illustrator"
