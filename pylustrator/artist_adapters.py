@@ -14,7 +14,8 @@ order of ``isinstance`` branches.
 
 from __future__ import annotations
 
-from copy import copy
+import hashlib
+from copy import copy, deepcopy
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
@@ -669,6 +670,9 @@ class RigidRotationPlan:
     selection_points: np.ndarray = field(repr=False, compare=False)
     rotation_value: Optional[float] = None
     member_plans: tuple["RigidRotationPlan", ...] = ()
+    source_fingerprint: object | None = field(
+        default=None, repr=False, compare=False
+    )
 
     @staticmethod
     def _immutable_points(points) -> np.ndarray:
@@ -715,6 +719,27 @@ class Line2DAppearanceState:
     linewidth: float
     markersize: float
     markeredgewidth: float
+
+
+@dataclass(frozen=True)
+class _Line2DAxisSpec:
+    """Read-only description of one raw Line2D coordinate container."""
+
+    raw: object = field(repr=False, compare=False)
+    data: np.ndarray = field(repr=False, compare=False)
+    shape: tuple[int, ...]
+    size: int
+    dtype: np.dtype
+    fixed_dtype: bool
+
+
+@dataclass(frozen=True)
+class _Line2DRawWrite:
+    """Preflighted Line2D destination, optionally with materialized containers."""
+
+    native_points: np.ndarray = field(repr=False, compare=False)
+    xdata: object | None = field(default=None, repr=False, compare=False)
+    ydata: object | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -1228,6 +1253,19 @@ class ArtistAdapter:
 
     def validate_native_control_points(self, points) -> None:
         """Reject destination-specific geometry before mutating an artist."""
+
+    def canonicalize_native_control_points(self, points):
+        """Return the exact writable native destination after preflight.
+
+        Most artists store ordinary floating-point coordinates, so validation
+        leaves their destination untouched.  Adapters with narrower storage
+        (for example, a float32 or integer ``Line2D``) may return the closest
+        representation that still round-trips through display space within the
+        interaction tolerance.
+        """
+
+        self.validate_native_control_points(points)
+        return points
 
     def display_clip_bounds(self) -> np.ndarray | None:
         """Return a conservative display-space bbox for the active paint clip."""
@@ -1850,9 +1888,14 @@ class ArtistAdapter:
             planned_native = self.point_array(
                 self.display_to_native(planned_control)
             )
+            planned_native = self.point_array(
+                self.canonicalize_native_control_points(planned_native)
+            )
             representable_control = self.point_array(
                 self.native_to_display(planned_native)
             )
+        except UnsupportedArtistError:
+            raise
         except (
             AttributeError,
             TypeError,
@@ -1865,7 +1908,6 @@ class ArtistAdapter:
                 f"{type(self.target).__name__} rigid rotation cannot convert its "
                 "display destination through native coordinates"
             ) from error
-        self.validate_native_control_points(planned_native)
         expected = self.point_array(planned_control)
         expected_finite = np.isfinite(expected)
         actual_finite = np.isfinite(representable_control)
@@ -1926,7 +1968,16 @@ class ArtistAdapter:
             rotation_value=(
                 None if rotation_value is None else float(rotation_value)
             ),
+            source_fingerprint=self.rigid_rotation_source_fingerprint(),
         )
+
+    def rigid_rotation_source_fingerprint(self):
+        """Return an inexpensive token used to reject stale absolute plans."""
+
+        return None
+
+    def validate_rigid_rotation_plan_source(self, plan: RigidRotationPlan) -> None:
+        """Reject a plan whose source storage changed after preflight."""
 
     def apply_rigid_rotation_plan(
         self, plan: RigidRotationPlan, *, record_changes: bool = True
@@ -1936,6 +1987,7 @@ class ArtistAdapter:
         support = self.operation_support(TransformOperation.RIGID_ROTATE)
         if not support.supported:
             raise UnsupportedArtistError(support.reason)
+        self.validate_rigid_rotation_plan_source(plan)
         if not self.rigid_rotation_plan_changes(plan):
             return
         native = plan.native_array()
@@ -4169,11 +4221,85 @@ class Line2DAdapter(ArtistAdapter):
         can_serialize=True,
     )
 
+    @staticmethod
+    def _plain_numeric_scalar(value) -> bool:
+        return bool(
+            not isinstance(value, (bool, np.bool_, complex, np.complexfloating))
+            and isinstance(value, (int, float, np.integer, np.floating))
+        )
+
+    @classmethod
+    def _raw_axis_metadata_reason(cls, raw, axis_name: str) -> str | None:
+        """Cheap domain probe used by frequently queried capability paths."""
+
+        if np.ma.isMaskedArray(raw):
+            data = np.asarray(raw.data)
+        elif type(raw) is np.ndarray:
+            data = raw
+        elif type(raw) in (list, tuple):
+            if not raw:
+                return f"Line2D raw {axis_name} coordinates are empty"
+            sample = raw[0]
+            depth = 1
+            while type(sample) in (list, tuple):
+                if not sample:
+                    return (
+                        f"Line2D raw {axis_name} coordinates have an empty "
+                        "nested dimension"
+                    )
+                sample = sample[0]
+                depth += 1
+                if depth > 2:
+                    return (
+                        f"Line2D raw {axis_name} coordinates have more than "
+                        "two dimensions"
+                    )
+            if isinstance(sample, np.ndarray):
+                data = sample
+            elif not cls._plain_numeric_scalar(sample):
+                return (
+                    f"Line2D raw {axis_name} coordinates use categorical, "
+                    "datetime, or custom-unit values"
+                )
+            else:
+                return None
+        else:
+            return (
+                f"Line2D raw {axis_name} coordinates use unsupported "
+                f"{type(raw).__name__} storage"
+            )
+        if data.ndim not in (1, 2):
+            return (
+                f"Line2D raw {axis_name} coordinates must be one- or "
+                "two-dimensional"
+            )
+        kind = data.dtype.kind
+        if kind in "fiu":
+            return None
+        if kind == "O" and data.size and cls._plain_numeric_scalar(data.flat[0]):
+            return None
+        return (
+            f"Line2D raw {axis_name} coordinates use categorical, datetime, "
+            f"complex, boolean, or custom-unit dtype {data.dtype}"
+        )
+
+    @classmethod
+    def _raw_metadata_reason(cls, target: Line2D) -> str | None:
+        for axis_name, raw in (
+            ("x", target.get_xdata(orig=True)),
+            ("y", target.get_ydata(orig=True)),
+        ):
+            reason = cls._raw_axis_metadata_reason(raw, axis_name)
+            if reason is not None:
+                return reason
+        return None
+
     @classmethod
     def capabilities_for(cls, target: Line2D) -> ArtistCapabilities:
         if not len(cls.finite_points(target.get_xydata())):
             return ArtistCapabilities()
         adapter = cls(target)
+        raw_reason = cls._raw_metadata_reason(target)
         try:
             marker_rotation_supported = adapter._marker_rigid_rotation_supported(
                 strict=True, resolve_positions=False
@@ -4185,7 +4311,8 @@ class Line2DAdapter(ArtistAdapter):
             marker_rotation_supported = False
             line_rotation_supported = False
         can_rigid_rotate = bool(
-            legend_owner_for_artist(target) is None
+            raw_reason is None
+            and legend_owner_for_artist(target) is None
             and active_layout_owner_for_artist(target) is None
             and cls.transform_is_invertible_affine(target.get_transform())
             and target.get_drawstyle() == "default"
@@ -4196,7 +4323,317 @@ class Line2DAdapter(ArtistAdapter):
             and target.get_sketch_params() is None
         )
         return replace(
-            cls.default_capabilities, can_rigid_rotate=can_rigid_rotate
+            cls.default_capabilities,
+            can_rigid_rotate=can_rigid_rotate,
+        )
+
+    @classmethod
+    def _raw_axis_spec(
+        cls, raw, axis_name: str, processed_length: int
+    ) -> _Line2DAxisSpec:
+        reason = cls._raw_axis_metadata_reason(raw, axis_name)
+        if reason is not None:
+            raise UnsupportedArtistError(reason)
+        if np.ma.isMaskedArray(raw):
+            data = np.asarray(raw.data)
+            fixed_dtype = True
+        else:
+            try:
+                data = np.asarray(raw)
+            except (TypeError, ValueError) as error:
+                raise UnsupportedArtistError(
+                    f"Line2D raw {axis_name} coordinates cannot be flattened "
+                    "losslessly"
+                ) from error
+            fixed_dtype = type(raw) is np.ndarray
+        if data.ndim not in (1, 2) or data.size not in (1, processed_length):
+            raise UnsupportedArtistError(
+                f"Line2D raw {axis_name} coordinate shape {data.shape} cannot "
+                f"represent {processed_length} processed vertices; only exact "
+                "ravel length or length-one broadcast storage is supported"
+            )
+        if data.dtype.kind == "O":
+            if not all(cls._plain_numeric_scalar(value) for value in data.flat):
+                raise UnsupportedArtistError(
+                    f"Line2D raw {axis_name} object coordinates contain "
+                    "categorical, datetime, or custom-unit values"
+                )
+        return _Line2DAxisSpec(
+            raw=raw,
+            data=data,
+            shape=tuple(int(value) for value in data.shape),
+            size=int(data.size),
+            dtype=data.dtype,
+            fixed_dtype=fixed_dtype,
+        )
+
+    @staticmethod
+    def _cast_axis_destination(
+        spec: _Line2DAxisSpec, values, axis_name: str
+    ) -> np.ndarray:
+        values = np.asarray(values, dtype=float)
+        if not np.all(np.isfinite(values)):
+            raise UnsupportedArtistError(
+                f"Line2D {axis_name} destination contains non-finite values "
+                "for a currently visible vertex"
+            )
+        if not spec.fixed_dtype:
+            return values
+        kind = spec.dtype.kind
+        if kind == "f":
+            with np.errstate(over="ignore", invalid="ignore"):
+                encoded = values.astype(spec.dtype, copy=False)
+        elif kind in "iu":
+            rounded = np.rint(values)
+            limits = np.iinfo(spec.dtype)
+            if np.any(rounded < limits.min) or np.any(rounded > limits.max):
+                raise UnsupportedArtistError(
+                    f"Line2D {axis_name} destination exceeds {spec.dtype} range"
+                )
+            encoded = rounded.astype(spec.dtype)
+        elif kind == "O":
+            encoded = values.astype(object)
+        else:  # protected by _raw_axis_spec; keep third-party subclasses typed
+            raise UnsupportedArtistError(
+                f"Line2D {axis_name} dtype {spec.dtype} is not losslessly writable"
+            )
+        numeric = np.asarray(encoded, dtype=float)
+        if not np.all(np.isfinite(numeric)):
+            raise UnsupportedArtistError(
+                f"Line2D {axis_name} destination overflows {spec.dtype} storage"
+            )
+        return encoded
+
+    @classmethod
+    def _sequence_with_values(cls, template, values):
+        if type(template) is list:
+            return [
+                cls._sequence_with_values(source, value)
+                for source, value in zip(template, values)
+            ]
+        if type(template) is tuple:
+            return tuple(
+                cls._sequence_with_values(source, value)
+                for source, value in zip(template, values)
+            )
+        if isinstance(template, np.ndarray):
+            return np.asarray(values, dtype=template.dtype).reshape(template.shape)
+        return values
+
+    @classmethod
+    def _materialize_raw_axis(
+        cls,
+        spec: _Line2DAxisSpec,
+        representable_axis: np.ndarray,
+        eligible: np.ndarray,
+        *,
+        promote: bool = False,
+    ):
+        raw = spec.raw
+        if spec.size == 1:
+            indices = np.array([0], dtype=int)
+            values = np.asarray([representable_axis[np.flatnonzero(eligible)[0]]])
+        else:
+            indices = np.flatnonzero(eligible)
+            values = representable_axis[eligible]
+        if promote:
+            if spec.dtype.kind == "f":
+                promoted_dtype = np.dtype(float)
+            else:
+                integers = np.asarray(spec.data).reshape(-1)
+                exactly_float64 = all(
+                    np.isfinite(float(value))
+                    and int(float(value)) == int(value)
+                    for value in integers
+                )
+                if np.ma.isMaskedArray(raw):
+                    fill = raw.fill_value
+                    try:
+                        exactly_float64 = bool(
+                            exactly_float64
+                            and np.isfinite(float(fill))
+                            and int(float(fill)) == int(fill)
+                        )
+                    except (OverflowError, TypeError, ValueError):
+                        exactly_float64 = False
+                promoted_dtype = np.dtype(float if exactly_float64 else object)
+            promoted_data = np.asarray(spec.data, dtype=promoted_dtype).copy()
+            promoted_data.reshape(-1)[indices] = values
+            if np.ma.isMaskedArray(raw):
+                mask = (
+                    np.ma.nomask
+                    if raw.mask is np.ma.nomask
+                    else np.array(raw.mask, dtype=bool, copy=True)
+                )
+                return np.ma.array(
+                    promoted_data,
+                    mask=mask,
+                    fill_value=raw.fill_value,
+                    hard_mask=bool(raw.hardmask),
+                    dtype=promoted_dtype,
+                )
+            return promoted_data
+        if (
+            type(raw) is np.ndarray
+            and spec.dtype == np.dtype(float)
+            and spec.size == len(representable_axis)
+            and np.all(eligible)
+        ):
+            return representable_axis.reshape(spec.shape)
+        if np.ma.isMaskedArray(raw):
+            result = deepcopy(raw)
+            result.data.reshape(-1)[indices] = values
+            return result
+        if type(raw) is np.ndarray:
+            result = raw.copy()
+            result.reshape(-1)[indices] = values
+            return result
+        result = np.asarray(raw, dtype=object).copy()
+        result.reshape(-1)[indices] = values
+        nested = result.reshape(spec.shape).tolist()
+        return cls._sequence_with_values(raw, nested)
+
+    def _prepare_raw_write(
+        self, points, *, materialize: bool
+    ) -> _Line2DRawWrite:
+        processed = np.asarray(self.target.get_xydata(), dtype=float)
+        destination = np.asarray(points, dtype=float)
+        if (
+            processed.ndim != 2
+            or processed.shape[1] != 2
+            or destination.shape != processed.shape
+        ):
+            raise UnsupportedArtistError(
+                "Line2D destination must match its processed Nx2 geometry"
+            )
+        length = len(processed)
+        xspec = self._raw_axis_spec(
+            self.target.get_xdata(orig=True), "x", length
+        )
+        yspec = self._raw_axis_spec(
+            self.target.get_ydata(orig=True), "y", length
+        )
+        eligible = np.all(np.isfinite(processed), axis=1)
+        if not np.any(eligible):
+            raise UnsupportedArtistError(
+                "Line2D has no jointly finite coordinate rows to transform"
+            )
+        all_eligible = bool(np.all(eligible))
+        desired_visible = destination if all_eligible else destination[eligible]
+        if not np.all(np.isfinite(desired_visible)):
+            raise UnsupportedArtistError(
+                "Line2D destination must stay finite for every visible vertex"
+            )
+
+        encoded_axes = []
+        for axis, (axis_name, spec) in enumerate(
+            (("x", xspec), ("y", yspec))
+        ):
+            encoded = self._cast_axis_destination(
+                spec, desired_visible[:, axis], axis_name
+            )
+            numeric = np.asarray(encoded, dtype=float)
+            if spec.size == 1:
+                first = numeric[0]
+                if not np.all(numeric == first):
+                    raise UnsupportedArtistError(
+                        f"Line2D length-one {axis_name} broadcast storage cannot "
+                        "represent different transformed vertex coordinates"
+                    )
+                original = float(np.asarray(spec.data).reshape(-1)[0])
+                if np.any(~eligible) and first != original:
+                    raise UnsupportedArtistError(
+                        f"Line2D length-one {axis_name} broadcast storage is shared "
+                        "with non-finite rows and cannot change their raw payload"
+                    )
+                numeric = np.full(np.count_nonzero(eligible), first, dtype=float)
+            encoded_axes.append(numeric)
+
+        def stores_float64_exactly(spec: _Line2DAxisSpec) -> bool:
+            return bool(
+                not spec.fixed_dtype
+                or spec.dtype.kind == "O"
+                or (spec.dtype.kind == "f" and spec.dtype.itemsize >= 8)
+            )
+
+        exact_storage = bool(
+            stores_float64_exactly(xspec)
+            and stores_float64_exactly(yspec)
+        )
+        exact_destination = bool(
+            exact_storage
+            and xspec.size == length
+            and yspec.size == length
+            and all_eligible
+        )
+        promotion = [False, False]
+        if exact_destination:
+            representable = destination
+        else:
+            representable = processed.copy()
+            representable[eligible, 0] = encoded_axes[0]
+            representable[eligible, 1] = encoded_axes[1]
+            if not exact_storage:
+                try:
+                    desired_display = np.asarray(
+                        self.target.get_transform().transform(desired_visible),
+                        dtype=float,
+                    )
+                    actual_display = np.asarray(
+                        self.target.get_transform().transform(
+                            representable[eligible]
+                        ),
+                        dtype=float,
+                    )
+                except (
+                    AttributeError,
+                    TypeError,
+                    ValueError,
+                    RuntimeError,
+                    np.linalg.LinAlgError,
+                ) as error:
+                    raise UnsupportedArtistError(
+                        "Line2D encoded coordinates cannot be checked in display "
+                        "space"
+                    ) from error
+                if (
+                    desired_display.shape != actual_display.shape
+                    or not np.all(np.isfinite(desired_display))
+                    or not np.all(np.isfinite(actual_display))
+                ):
+                    error_px = float("inf")
+                else:
+                    error_px = float(
+                        np.max(np.abs(desired_display - actual_display), initial=0.0)
+                    )
+                if error_px > 0.25:
+                    specs = (xspec, yspec)
+                    for axis, spec in enumerate(specs):
+                        promotion[axis] = bool(
+                            not stores_float64_exactly(spec)
+                            and not np.array_equal(
+                                encoded_axes[axis], desired_visible[:, axis]
+                            )
+                        )
+                        if promotion[axis]:
+                            representable[eligible, axis] = desired_visible[:, axis]
+                    if not any(promotion):
+                        raise UnsupportedArtistError(
+                            "Line2D numeric storage cannot represent its display "
+                            "destination within 0.25 px and cannot be promoted "
+                            "losslessly"
+                        )
+
+        if not materialize:
+            return _Line2DRawWrite(representable)
+        return _Line2DRawWrite(
+            representable,
+            self._materialize_raw_axis(
+                xspec, representable[:, 0], eligible, promote=promotion[0]
+            ),
+            self._materialize_raw_axis(
+                yspec, representable[:, 1], eligible, promote=promotion[1]
+            ),
         )
 
     def _line_stroke_is_configured(self) -> bool:
@@ -4552,6 +4989,13 @@ class Line2DAdapter(ArtistAdapter):
         self, operation: TransformOperation | str
     ) -> OperationSupport:
         operation = TransformOperation.coerce(operation)
+        if operation in {
+            TransformOperation.TRANSLATE,
+            TransformOperation.RIGID_ROTATE,
+        }:
+            raw_reason = self._raw_metadata_reason(self.target)
+            if raw_reason is not None:
+                return OperationSupport.denied(operation, raw_reason)
         if operation is not TransformOperation.SCALE_APPEARANCE:
             return super().operation_support(operation)
         if not self.capabilities.can_select or not self.capabilities.can_serialize:
@@ -4826,6 +5270,24 @@ class Line2DAdapter(ArtistAdapter):
             return self.bounds_points(np.concatenate(visible_groups))
         return super().selection_points()
 
+    def preview_rigid_rotation_control_points(
+        self, matrix, *, control_points=None
+    ) -> np.ndarray:
+        """Rotate only jointly finite Line2D vertices.
+
+        A row containing one masked/non-finite coordinate is a path break, not
+        a partially writable point.  Keeping that display row untouched lets
+        the raw codec preserve both hidden coordinate payloads exactly.
+        """
+
+        if control_points is None:
+            control_points = self.control_points()
+        result = self.point_array(control_points).copy()
+        eligible = np.all(np.isfinite(result), axis=1)
+        if np.any(eligible):
+            result[eligible] = self._transform_points(matrix, result[eligible])
+        return result
+
     def preview_rigid_rotation_selection_points(
         self,
         matrix,
@@ -4903,17 +5365,194 @@ class Line2DAdapter(ArtistAdapter):
     def local_control_points(self) -> np.ndarray:
         return self.point_array(self.display_to_native(self.control_points()))
 
+    def validate_native_control_points(self, points) -> None:
+        self._prepare_raw_write(points, materialize=False)
+
+    def canonicalize_native_control_points(self, points) -> np.ndarray:
+        return self._prepare_raw_write(points, materialize=False).native_points
+
+    @staticmethod
+    def _update_fingerprint_array(hasher, values) -> None:
+        array = np.asarray(values)
+        hasher.update(array.dtype.str.encode("ascii", errors="backslashreplace"))
+        hasher.update(repr(tuple(int(value) for value in array.shape)).encode())
+        if array.dtype.hasobject:
+            for value in array.flat:
+                encoded = repr(value).encode("utf-8", errors="backslashreplace")
+                hasher.update(len(encoded).to_bytes(8, "little"))
+                hasher.update(encoded)
+            return
+        if array.flags.c_contiguous:
+            hasher.update(memoryview(array).cast("B"))
+        else:
+            hasher.update(array.tobytes(order="C"))
+
+    @classmethod
+    def _update_raw_fingerprint(cls, hasher, raw, axis_name: str) -> None:
+        hasher.update(axis_name.encode("ascii"))
+        container = f"{type(raw).__module__}.{type(raw).__qualname__}"
+        hasher.update(container.encode("utf-8", errors="backslashreplace"))
+        if np.ma.isMaskedArray(raw):
+            cls._update_fingerprint_array(hasher, raw.data)
+            if raw.mask is np.ma.nomask:
+                hasher.update(b"nomask")
+            else:
+                hasher.update(b"mask")
+                cls._update_fingerprint_array(hasher, raw.mask)
+            fill = repr(raw.fill_value).encode(
+                "utf-8", errors="backslashreplace"
+            )
+            hasher.update(len(fill).to_bytes(8, "little"))
+            hasher.update(fill)
+            hasher.update(b"hard" if raw.hardmask else b"soft")
+            return
+        cls._update_fingerprint_array(hasher, raw)
+
+    def rigid_rotation_source_fingerprint(self):
+        xdata = self.target.get_xdata(orig=True)
+        ydata = self.target.get_ydata(orig=True)
+        # OpenSSL-backed SHA-256 is faster than hashlib.blake2b for the common
+        # pair of contiguous 100k-coordinate arrays on supported runtimes.
+        # Sixteen bytes retain a compact 128-bit stale-state token.
+        hasher = hashlib.sha256()
+        self._update_raw_fingerprint(hasher, xdata, "x")
+        self._update_raw_fingerprint(hasher, ydata, "y")
+        return id(xdata), id(ydata), hasher.digest()[:16]
+
+    def validate_rigid_rotation_plan_source(self, plan: RigidRotationPlan) -> None:
+        if plan.source_fingerprint != self.rigid_rotation_source_fingerprint():
+            raise UnsupportedArtistError(
+                "Line2D raw coordinate storage changed after rigid-rotation "
+                "preflight; discard the stale plan and start a new gesture"
+            )
+
+    def _atomic_set_raw_data(self, xdata, ydata, *, recache: bool = False) -> None:
+        """Set both raw axes or restore every touched Line2D cache field."""
+
+        missing = object()
+        cache_names = (
+            "_xorig",
+            "_yorig",
+            "_x",
+            "_y",
+            "_xy",
+            "_path",
+            "_transformed_path",
+            "_invalidx",
+            "_invalidy",
+            "_subslice",
+            "_x_filled",
+        )
+        cache = {
+            name: getattr(self.target, name, missing) for name in cache_names
+        }
+        stale_owners = []
+        for owner in (self.target, self.target.axes, self.figure):
+            if owner is not None and all(owner is not item[0] for item in stale_owners):
+                stale_owners.append((owner, getattr(owner, "_stale", missing)))
+        try:
+            self.target.set_data(xdata, ydata)
+            if recache:
+                self.target.recache(always=True)
+        except Exception:
+            for name, value in cache.items():
+                if value is missing:
+                    if hasattr(self.target, name):
+                        delattr(self.target, name)
+                else:
+                    setattr(self.target, name, value)
+            for owner, stale in stale_owners:
+                if stale is not missing:
+                    setattr(owner, "_stale", stale)
+            raise
+
+    @classmethod
+    def _raw_snapshot_metadata(cls, raw) -> tuple:
+        """Expose storage semantics that numeric ndarray equality would hide."""
+
+        def container_layout(value, depth: int = 0):
+            kind = f"{type(value).__module__}.{type(value).__qualname__}"
+            if depth >= 2 or type(value) not in (list, tuple) or not value:
+                return kind
+            return kind, container_layout(value[0], depth + 1)
+
+        try:
+            data = np.asarray(raw.data if np.ma.isMaskedArray(raw) else raw)
+            shape = tuple(int(value) for value in data.shape)
+            dtype = data.dtype.str
+            dtype_descriptor = repr(data.dtype.descr) if data.dtype.fields else ""
+        except (AttributeError, TypeError, ValueError):
+            shape = ()
+            dtype = "unavailable"
+            dtype_descriptor = ""
+        return container_layout(raw), shape, dtype, dtype_descriptor
+
     def _apply_native_control_points(self, points) -> None:
-        xy = np.asarray(points, dtype=float)
-        self.target.set_data(xy[:, 0], xy[:, 1])
+        prepared = self._prepare_raw_write(points, materialize=True)
+        self._atomic_set_raw_data(prepared.xdata, prepared.ydata)
+
+    def apply_native_control_points(self, points) -> None:
+        support = self.operation_support(TransformOperation.TRANSLATE)
+        if not support.supported:
+            raise UnsupportedArtistError(support.reason)
+        prepared = self._prepare_raw_write(points, materialize=True)
+        self._atomic_set_raw_data(prepared.xdata, prepared.ydata)
+        self.record_changes()
+        self.invalidate_geometry_cache()
+
+    def snapshot(self):
+        if not self.capabilities.can_snapshot:
+            raise UnsupportedArtistError(
+                "Line2D does not support interaction snapshots"
+            )
+        xdata = self.target.get_xdata(orig=True)
+        ydata = self.target.get_ydata(orig=True)
+        return {
+            "type": "positions",
+            "xdata": deepcopy(xdata),
+            "ydata": deepcopy(ydata),
+            "xdata_metadata": self._raw_snapshot_metadata(xdata),
+            "ydata_metadata": self._raw_snapshot_metadata(ydata),
+        }
+
+    def restore(self, state) -> None:
+        if state.get("type") != "positions":
+            raise ValueError(f"Unsupported snapshot for Line2DAdapter: {state!r}")
+        if "xdata" not in state or "ydata" not in state:
+            super().restore(state)
+            return
+        self._atomic_set_raw_data(
+            deepcopy(state["xdata"]),
+            deepcopy(state["ydata"]),
+            recache=True,
+        )
+        if _CHANGE_RECORDING_ENABLED.get():
+            try:
+                self._record_restored_state()
+            except UnsupportedArtistError:
+                # Snapshot restoration remains available for custom unit
+                # containers even when generated Python cannot reproduce them.
+                pass
+        self.invalidate_geometry_cache()
 
     def serialize_changes(self):
-        xy = np.asarray(self.target.get_xydata(), dtype=float)
+        support = self.operation_support(TransformOperation.SERIALIZE)
+        if not support.supported:
+            raise UnsupportedArtistError(support.reason)
+        xdata = self.target.get_xdata(orig=True)
+        ydata = self.target.get_ydata(orig=True)
+        try:
+            xliteral = replay_literal(xdata, preserve_ndarray=True)
+            yliteral = replay_literal(ydata, preserve_ndarray=True)
+        except TypeError as error:
+            raise UnsupportedArtistError(
+                "Line2D raw coordinates contain values that generated Python "
+                "cannot serialize losslessly"
+            ) from error
         return (
             ChangeRecord.command_change(
                 self.target,
-                f".set_data({replay_literal(xy[:, 0])}, "
-                f"{replay_literal(xy[:, 1])})",
+                f".set_data({xliteral}, {yliteral})",
             ),
         )
 
