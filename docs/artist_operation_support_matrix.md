@@ -1,7 +1,7 @@
 # Artist operation support matrix
 
 This document is an independent QA audit of the adapter contract on
-`refactor/artist-adapter-architecture`, updated 2026-07-16.  It treats the
+`main`, updated 2026-07-17. It treats the
 registry and `ArtistCapabilities`/`OperationSupport` as executable promises,
 not merely implementation metadata.
 
@@ -23,15 +23,17 @@ Advertised operations are abbreviated as:
 - `Z`: geometry resize
 - `R`: native rotation
 - `Q`: rigid display-space rotation around a shared reference pivot
+- `A`: appearance scaling without geometry or layout mutation
 - `N`: snapshot/restore
 - `C`: serialize to generated changes
 
 Every row was also tested against all ten `TransformOperation` values.
 Unsupported operations must return `OperationSupport.supported == False` with
 a nonempty reason.  Direct translate, resize, rotate, and snapshot entrypoints
-must reject without geometry or generated-change mutation.  `scale_appearance`,
-`reflow_layout`, and `edit_points` are currently denied for every built-in
-adapter.
+must reject without geometry or generated-change mutation. `scale_appearance`
+is implemented only for the lossless first-batch Text, Line2D, PathCollection,
+LineCollection, and PolyCollection contracts below. `reflow_layout` and
+`edit_points` remain denied for every built-in adapter.
 
 `PASS` means every advertised transform and its rejection paths satisfy the
 contract. `DENIED` means the absence of edit support is deliberate and the
@@ -55,10 +57,10 @@ Anchor-mode Text and ordinary similarity Patches use Q preferentially.
 | `Artist` fallback | `ArtistAdapter` | none | Registry resolution; all operation descriptors; direct M/display-transform/Z/R/N rejection and zero mutation | **PASS** | Deliberately uneditable. Semantic entrypoints reject through `UnsupportedArtistError` before geometry arithmetic. |
 | `EditorGroup` | `EditorGroupAdapter` | S M Z Q N C | Bounds; M/Z/Q preview and commit; recursive shared-pivot plan; per-leaf fixed-stroke resize; N; replay; direct and outer-plan failing-member rollback; single-emission recording | **PASS** | Native R is denied; Q is advertised only when every leaf has a complete rigid plan. |
 | `Axes` | `AxesAdapter` | S M Z N C | Bounds; M/Z; parent Figure size; N; real replay; nonuniform fixed-aspect preview/commit | **PASS** | R is explicitly unsupported. Fixed-aspect Axes advertise the `fixed_aspect` constraint and normalize preview/commit through the same native-space rule. |
-| `Text` | `TextAdapter` | S M R Q N C conditionally | Axes/data/figure/display transforms; visible text bounds; M; native R; anchor-mode Q; complete N; real replay; explicit Undo/Redo bookkeeping; Axis-owned property edits | **PASS** | Q requires `rotation_mode='anchor'`, an invertible affine position transform, and no wrap/bbox/path effect/transform-relative angle. Legend and layout-owned Text deny R/Q because Matplotlib rewrites their position. Formatter-owned tick labels are property-selectable but deny M; their content is edited through the Axis. Geometry resize remains denied. |
+| `Text` | `TextAdapter` | S M R Q A N C conditionally | Axes/data/figure/display transforms; visible text bounds; M; native R; anchor-mode Q; point-font A preview/commit/Undo/Redo/replay; complete N; real replay; Axis-owned property edits | **PASS** | A is limited to visible ordinary point Text with an invertible affine transform; Annotation, Legend/layout-owned, wrapped, bbox, TeX, filtered, sketched, or path-effect Text rejects. Q retains its stricter anchor-mode contract. Geometry resize remains denied. |
 | `Annotation` | `AnnotationAdapter` | S M R N C | Mixed data/axes endpoint coordinates; text and arrow-stroke bounds; two control points; M; R; complete N; real replay | **PASS** | Geometry resize is explicitly denied. |
 | `Legend` | `LegendAdapter` | S M N C | Visible handles/text/title union; `frameon=False/True`; M; logical-owner persistence; self-contained single-glyph proxy replay; N; real replay | **PASS** | Geometry resize and layout reflow are explicitly denied. Explicit composite handlers without a frozen entry specification remain selectable but dynamically deny transform/replay. |
-| `Line2D` | `Line2DAdapter` | S M Q N C conditionally | Data/log transforms; visible line, marker-path, and marker-edge bounds; M; affine shared-pivot Q; N; real `.set_data` replay | **PASS** | Q requires default drawstyle, no marker/path effect, an invertible affine transform, and no Legend layout owner. Geometry resize remains denied. |
+| `Line2D` | `Line2DAdapter` | S M Q A N C conditionally | Data/log transforms; visible line, marker-path, and marker-edge bounds; M; affine shared-pivot Q; linewidth/markersize/markeredgewidth A; appearance-only Undo/Redo and replay; N; real `.set_data` replay | **PASS** | A requires actual visible line segments or painted marker paths and rejects Legend/layout ownership, pixel markers, filters, path/sketch effects, invalid dimensions, and paint-free/degenerate paths. Q retains its affine marker-free contract. Geometry resize remains denied. |
 | `AxesImage` | `AxesImageAdapter` | S M Z N C | M/Z preview/commit; extent replay; N; x/y viewport and Axes position invariance | **PASS** | R is explicitly unsupported. Moving or resizing the image does not autoscale the camera. |
 | `Rectangle` | `RectangleAdapter` | S M Z R Q N C conditionally | Visible-stroke bounds; fixed-stroke M/Z; native R; common-pivot Q under similarity/reflection transforms; rotated M; rotated-resize denial; N; replay | **PASS** | Q additionally requires `rotation_point` `xy`/`center`, no hatch/effect, and no Legend/container owner. Tuple pivots need a richer plan. Z is only advertised at angles equivalent to 0 degrees modulo 360. |
 | `Ellipse` | `EllipseAdapter` | S M Z R Q N C conditionally | Visible-stroke bounds; fixed-stroke M/Z; native R; common-pivot Q under similarity/reflection transforms; rotated M; rotated-resize denial; N; replay | **PASS** | Q denies non-similarity transforms, hatch/effects, and Legend/container owners. Z is disabled for rotated ellipses. |
@@ -69,9 +71,9 @@ Anchor-mode Text and ordinary similarity Patches use Q preferentially.
 | `Wedge` | `WedgeAdapter` | S M N C | Visible-stroke bounds; center M; preview/commit; N; `.set_center` replay | **PASS** | Z/R are explicitly unsupported. |
 | `Polygon` | `PolygonAdapter` | S M Z Q N C conditionally | Visible-stroke bounds; fixed-stroke vertex M/Z; affine vertex Q; preview/commit; N; `.set_xy` replay | **PASS** | Native R is unsupported; Q requires invertible affine geometry with no hatch/effect or Legend owner. |
 | `PathPatch` | `PathPatchAdapter` | S M Z Q N C conditionally | Visible-stroke bounds; fixed-stroke path/codes M/Z; affine control-path Q; preview/commit; N; `Path` replay | **PASS** | Native R is unsupported; Q requires invertible affine geometry with no hatch/effect or Legend owner. |
-| `PathCollection` | `PathCollectionAdapter` | S M N C | Renderer item-count semantics; per-item marker-path/size/stroke envelopes; masked offsets; affine/log offset M; empty-path and singular-transform preflight; N; `.set_offsets` replay | **PASS** | Z and appearance scaling are explicitly denied. A singular offset transform remains selectable/serializable but cannot be moved or snapshotted. |
-| `LineCollection` | `LineCollectionAdapter` | S M Q N C conditionally | Per-segment linewidth envelopes; NaN path-break preservation; affine/log multi-segment and explicit-offset M; non-offset affine Q; N; path/offset replay | **PASS** | Q denies rendered offsets, non-affine/singular transforms, hatch/effects, and Legend owners. Z and appearance scaling remain denied. |
-| `PolyCollection` | `PolyCollectionAdapter` | S M Q N C conditionally | Per-polygon visible-edge envelopes; affine/log multi-path and explicit-offset M; non-offset affine Q; N; path/offset replay | **PASS** | Q has the same strict non-offset/affine/no-effect/no-owner contract. Invisible edges add no padding; Z and appearance scaling remain denied. |
+| `PathCollection` | `PathCollectionAdapter` | S M A N C conditionally | Renderer item-count semantics; per-item marker-path/size/stroke envelopes; masked offsets; affine/log offset M; marker-area × factor² and linewidth × factor A; appearance-only Undo/Redo/replay; N; `.set_offsets` replay | **PASS** | A requires a visible fill with non-zero path area or a visible strokable edge; hatch/effects/Legend/layout ownership reject. A remains valid when geometry cannot be snapshotted because its transaction stores appearance only. Z remains denied. |
+| `LineCollection` | `LineCollectionAdapter` | S M Q A N C conditionally | Per-segment linewidth envelopes; NaN path-break preservation; affine/log multi-segment and explicit-offset M; non-offset affine Q; linewidth A; appearance-only Undo/Redo/replay; N; path/offset replay | **PASS** | A requires a visible strokable rendered path and rejects hatch/effects/Legend/layout ownership. Q retains its non-offset affine contract. Z remains denied. |
+| `PolyCollection` | `PolyCollectionAdapter` | S M Q A N C conditionally | Per-polygon visible-edge envelopes; affine/log multi-path and explicit-offset M; non-offset affine Q; visible-edge linewidth A; appearance-only Undo/Redo/replay; N; path/offset replay | **PASS** | A scales only visible stroked edges; face-only polygons have no supported appearance dimension in v1. Q retains its strict non-offset/affine/no-effect/no-owner contract. Z remains denied. |
 
 Patch adapters share one common-stroke envelope implementation. Resizable
 patches additionally separate transformable geometry from fixed display-space
@@ -101,6 +103,15 @@ The following behavior passes for every type that advertises it:
 - Snapshots restore before/after geometry and native rotation. Failed
   multi-target transforms restore both artist state and generated-change
   bookkeeping atomically.
+- Appearance plans are frozen absolute destinations. Preflight never mutates
+  the target; post-draw bounds match the plan within 0.25 px; factor `1` is a
+  strict no-op while near-one factors remain real edits. Appearance Undo/Redo
+  stores only paint/font state, so normal geometry snapshots stay fast and an
+  appearance edit does not require an invertible geometry transform.
+- Appearance recording is semantically isolated: Line2D emits only linewidth,
+  markersize, and markeredgewidth commands; Collections emit only linewidths
+  and PathCollection sizes. Geometry moves and rigid rotations do not freeze
+  unrelated appearance, and appearance edits do not emit data/offset commands.
 - Real `ChangeTracker` commands replay translated rendered bounds for all 18
   serializable registry types. Axis-label replay additionally covers both
   label position and `labelpad`.

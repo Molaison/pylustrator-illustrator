@@ -89,6 +89,9 @@ Semantic transforms and replay
 ``OperationSupport`` distinguishes geometry resize from appearance scaling,
 layout reflow, rotation, and point editing.  ``TransformPlan`` preflights every
 target before mutation and rolls back earlier targets if an adapter fails.
+Appearance scaling uses a frozen ``AppearanceScalePlan`` and an independent
+appearance state/restore path; it does not enlarge geometry snapshots or emit
+geometry serialization records.
 
 Generated blocks carry a schema version.  Legacy proxy-legend references are
 accepted during replay and rewritten through the public migration helpers.
@@ -103,6 +106,9 @@ accepted during replay and rewritten through the public migration helpers.
    :members:
 
 .. autoclass:: pylustrator.TransformPlan
+   :members:
+
+.. autoclass:: pylustrator.AppearanceScalePlan
    :members:
 
 .. autofunction:: pylustrator.migrate_generated_source

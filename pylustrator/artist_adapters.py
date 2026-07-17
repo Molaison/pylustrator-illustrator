@@ -670,6 +670,41 @@ class RigidRotationPlan:
 
 
 @dataclass(frozen=True)
+class TextAppearanceState:
+    fontsize: float
+
+
+@dataclass(frozen=True)
+class Line2DAppearanceState:
+    linewidth: float
+    markersize: float
+    markeredgewidth: float
+
+
+@dataclass(frozen=True)
+class CollectionAppearanceState:
+    linewidths: tuple[float, ...]
+
+
+@dataclass(frozen=True)
+class PathCollectionAppearanceState(CollectionAppearanceState):
+    sizes: tuple[float, ...]
+
+
+@dataclass(frozen=True)
+class AppearanceScalePlan:
+    """Absolute, preflighted appearance destination for one Artist."""
+
+    target: Artist
+    factor: float
+    state: object
+    selection_points: tuple[tuple[float, float], ...]
+
+    def selection_array(self) -> np.ndarray:
+        return np.asarray(self.selection_points, dtype=float)
+
+
+@dataclass(frozen=True)
 class ChangeRecord:
     """One adapter-owned instruction for updating the ChangeTracker."""
 
@@ -899,6 +934,68 @@ class ArtistAdapter:
             dtype=float,
         )
 
+    @classmethod
+    def path_has_drawable_segment(
+        cls, path: Path, transform: Optional[Transform] = None
+    ) -> bool:
+        """Whether a Path contains a non-degenerate strokable segment."""
+
+        try:
+            if transform is not None:
+                path = transform.transform_path(path)
+            current = None
+            subpath_start = None
+            for vertices, code in path.iter_segments(
+                remove_nans=True, simplify=False, curves=True
+            ):
+                points = np.asarray(vertices, dtype=float).reshape(-1, 2)
+                if code == Path.MOVETO:
+                    current = points[-1]
+                    subpath_start = current
+                    continue
+                if code == Path.CLOSEPOLY:
+                    destination = subpath_start
+                    candidates = [] if destination is None else [destination]
+                else:
+                    destination = points[-1] if len(points) else None
+                    candidates = points
+                if current is not None and any(
+                    np.all(np.isfinite(point))
+                    and not np.array_equal(point, current)
+                    for point in candidates
+                ):
+                    return True
+                if destination is not None:
+                    current = destination
+            return False
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            return False
+
+    @classmethod
+    def path_has_fill_area(
+        cls, path: Path, transform: Optional[Transform] = None
+    ) -> bool:
+        """Whether filling a Path can cover a non-zero display area."""
+
+        try:
+            if transform is not None:
+                path = transform.transform_path(path)
+            polygons = path.to_polygons(closed_only=False)
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            return False
+        for polygon in polygons:
+            polygon = cls.finite_points(polygon)
+            if len(polygon) < 3:
+                continue
+            x = polygon[:, 0]
+            y = polygon[:, 1]
+            area = 0.5 * abs(
+                float(np.dot(x, np.roll(y, 1)) - np.dot(y, np.roll(x, 1)))
+            )
+            if np.isfinite(area) and area > np.finfo(float).eps:
+                return True
+        return False
+
     def _preview_points(self, attribute: str):
         preview = getattr(self.target, attribute, None)
         if preview is None:
@@ -949,6 +1046,15 @@ class ArtistAdapter:
         """Apply the active paint clip to a display-space selection envelope."""
 
         return _clip_selection_points(self.target, points)
+
+    def has_visible_selection_bounds(self) -> bool:
+        """Whether the current rendered envelope intersects its active clip."""
+
+        try:
+            points = self.clip_selection_points(self.selection_points())
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            return False
+        return bool(len(self.finite_points(points)))
 
     def hit_test(self, event) -> bool:
         """Return whether a canvas event hits the artist's visible paint.
@@ -1029,6 +1135,11 @@ class ArtistAdapter:
         )
 
     def serialize_changes(self) -> tuple[ChangeRecord, ...]:
+        return ()
+
+    def serialize_appearance_changes(self) -> tuple[ChangeRecord, ...]:
+        """Generated records owned specifically by appearance state."""
+
         return ()
 
     def _record_change_records(self, records) -> None:
@@ -1318,6 +1429,197 @@ class ArtistAdapter:
             )
         self.preflight_resize(matrix)
         self.apply_control_points(self.preview_resize_control_points(matrix))
+
+    @staticmethod
+    def validate_scale_factor(factor: float) -> float:
+        factor = float(factor)
+        if not np.isfinite(factor) or factor <= 0.0:
+            raise ValueError("Scale factor must be finite and positive")
+        return factor
+
+    @classmethod
+    def scale_nonnegative_dimensions(
+        cls, values, factor: float, *, power: int = 1, label: str
+    ) -> tuple[float, ...]:
+        """Scale point/area dimensions without overflow or lossy underflow."""
+
+        factor = cls.validate_scale_factor(factor)
+        values = np.asarray(values, dtype=float)
+        with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+            scaled = values.copy()
+            for _index in range(power):
+                scaled = scaled * factor
+        if not np.all(np.isfinite(scaled)):
+            raise ValueError(f"{label} would overflow to a non-finite value")
+        if np.any((values > 0.0) & (scaled <= 0.0)):
+            raise ValueError(f"{label} would underflow to zero")
+        return tuple(float(value) for value in scaled)
+
+    def appearance_state(self):
+        raise UnsupportedArtistError(
+            f"{type(self.target).__name__} has no lossless appearance state"
+        )
+
+    def scaled_appearance_state(self, factor: float):
+        raise UnsupportedArtistError(
+            f"{type(self.target).__name__} has no lossless appearance scale"
+        )
+
+    def _apply_appearance_state(self, state) -> None:
+        raise UnsupportedArtistError(
+            f"{type(self.target).__name__} has no lossless appearance scale"
+        )
+
+    def preview_appearance_state_selection_points(self, state) -> np.ndarray:
+        """Measure an absolute appearance state without mutating the target."""
+
+        clone = copy(self.target)
+        for attribute in (
+            "_pylustrator_preview_positions",
+            "_pylustrator_preview_selection_points",
+        ):
+            try:
+                delattr(clone, attribute)
+            except AttributeError:
+                pass
+        adapter = type(self)(clone)
+        adapter._apply_appearance_state(state)
+        return np.asarray(adapter.selection_points(), dtype=float)
+
+    def plan_appearance_scale(self, factor: float) -> AppearanceScalePlan:
+        support = self.operation_support(TransformOperation.SCALE_APPEARANCE)
+        if not support.supported:
+            raise UnsupportedArtistError(support.reason)
+        return self._plan_preflighted_appearance_scale(factor)
+
+    def _plan_preflighted_appearance_scale(
+        self, factor: float
+    ) -> AppearanceScalePlan:
+        """Build a plan after the outer selection capability preflight."""
+
+        factor = self.validate_scale_factor(factor)
+        state = self.scaled_appearance_state(factor)
+        planned = self.clip_selection_points(
+            self.preview_appearance_state_selection_points(state)
+        )
+        if not len(self.finite_points(planned)):
+            raise UnsupportedArtistError(
+                f"{type(self.target).__name__} appearance scaling would leave no "
+                "visible geometry inside the active clip region"
+            )
+        return AppearanceScalePlan(
+            self.target,
+            factor,
+            state,
+            tuple(tuple(float(value) for value in point) for point in planned),
+        )
+
+    def apply_appearance_scale_plan(
+        self, plan: AppearanceScalePlan, *, record_changes: bool = True
+    ) -> bool:
+        if plan.target is not self.target:
+            raise ValueError("Appearance-scale plan belongs to another artist")
+        support = self.operation_support(TransformOperation.SCALE_APPEARANCE)
+        if not support.supported:
+            raise UnsupportedArtistError(support.reason)
+        if plan.factor == 1.0:
+            return False
+        before = self.appearance_state()
+        tracker = None
+        tracker_state = None
+        if record_changes:
+            tracker = self.change_tracker()
+            capture = getattr(tracker, "capture_recording_state", None)
+            if callable(capture):
+                tracker_state = capture()
+        try:
+            self._apply_preflighted_appearance_scale_plan(plan)
+            if record_changes:
+                self._record_change_records(self.serialize_appearance_changes())
+        except Exception as error:
+            rollback_failures = []
+            try:
+                self._apply_appearance_state(before)
+            except Exception as rollback_error:
+                rollback_failures.append((self.target, rollback_error))
+            restore_tracker = getattr(tracker, "restore_recording_state", None)
+            if tracker_state is not None and callable(restore_tracker):
+                try:
+                    restore_tracker(tracker_state)
+                except Exception as rollback_error:
+                    rollback_failures.append((tracker, rollback_error))
+            self.annotate_rollback_failures(error, rollback_failures)
+            self.invalidate_geometry_cache()
+            raise
+        return True
+
+    def _apply_preflighted_appearance_scale_plan(
+        self, plan: AppearanceScalePlan
+    ) -> bool:
+        """Apply one immutable plan inside an existing outer transaction."""
+
+        if plan.target is not self.target:
+            raise ValueError("Appearance-scale plan belongs to another artist")
+        if plan.factor == 1.0:
+            return False
+        self._apply_appearance_state(plan.state)
+        self.invalidate_geometry_cache()
+        return True
+
+    @staticmethod
+    def annotate_rollback_failures(error: Exception, failures) -> None:
+        failures = tuple(failures)
+        if not failures:
+            return
+        try:
+            setattr(error, "pylustrator_rollback_failures", failures)
+        except (AttributeError, TypeError):
+            pass
+        add_note = getattr(error, "add_note", None)
+        if callable(add_note):
+            details = "; ".join(
+                f"{type(target).__name__}: {rollback_error}"
+                for target, rollback_error in failures
+            )
+            add_note(f"Pylustrator rollback failures: {details}")
+
+    def scale_appearance(self, factor: float) -> bool:
+        plan = self.plan_appearance_scale(factor)
+        return self.apply_appearance_scale_plan(plan)
+
+    def restore_appearance_state(
+        self, state, *, record_changes: bool = True
+    ) -> None:
+        """Restore only paint/font state, independent of geometry snapshots."""
+
+        before = self.appearance_state()
+        tracker = None
+        tracker_state = None
+        if record_changes:
+            tracker = self.change_tracker()
+            capture = getattr(tracker, "capture_recording_state", None)
+            if callable(capture):
+                tracker_state = capture()
+        try:
+            self._apply_appearance_state(state)
+            if record_changes:
+                self._record_change_records(self.serialize_appearance_changes())
+        except Exception as error:
+            rollback_failures = []
+            try:
+                self._apply_appearance_state(before)
+            except Exception as rollback_error:
+                rollback_failures.append((self.target, rollback_error))
+            restore_tracker = getattr(tracker, "restore_recording_state", None)
+            if tracker_state is not None and callable(restore_tracker):
+                try:
+                    restore_tracker(tracker_state)
+                except Exception as rollback_error:
+                    rollback_failures.append((tracker, rollback_error))
+            self.annotate_rollback_failures(error, rollback_failures)
+            self.invalidate_geometry_cache()
+            raise
+        self.invalidate_geometry_cache()
 
     @staticmethod
     def display_rotation_matrix(angle_degrees: float, pivot) -> np.ndarray:
@@ -1666,12 +1968,13 @@ class ArtistAdapter:
         self._record_change_records(records)
 
     def snapshot(self):
-        if not self.capabilities.can_snapshot:
+        capabilities = self.capabilities
+        if not capabilities.can_snapshot:
             raise UnsupportedArtistError(
                 f"{type(self.target).__name__} does not support interaction snapshots"
             )
         state = {"type": "positions", "positions": self.local_control_points()}
-        if self.capabilities.can_rotate:
+        if capabilities.can_rotate:
             state["rotation"] = self.rotation()
         return state
 
@@ -2534,9 +2837,6 @@ class TextAdapter(ArtistAdapter):
         TransformOperation.RESIZE_GEOMETRY: (
             "Text bounds come from font metrics; use appearance scaling instead of geometry resize"
         ),
-        TransformOperation.SCALE_APPEARANCE: (
-            "Text appearance scaling is not implemented yet"
-        ),
         TransformOperation.ROTATE: (
             "Legend-managed Text rotation reflows its layout and cannot preserve "
             "a stable native pivot"
@@ -2606,6 +2906,107 @@ class TextAdapter(ArtistAdapter):
         self, operation: TransformOperation | str
     ) -> OperationSupport:
         operation = TransformOperation.coerce(operation)
+        if operation is TransformOperation.SCALE_APPEARANCE:
+            if isinstance(self.target, Annotation):
+                return OperationSupport.denied(
+                    operation,
+                    "Annotation appearance scaling must include its text and arrow",
+                )
+            owner = legend_owner_for_text(self.target)
+            if owner is not None:
+                return OperationSupport.denied(
+                    operation,
+                    "Legend-managed Text must scale through its Legend layout",
+                )
+            layout_owner = layout_owner_for_text(self.target)
+            if layout_owner is not None:
+                return OperationSupport.denied(
+                    operation,
+                    f"Text is managed by {type(layout_owner).__name__} layout",
+                )
+            active_layout_owner = active_layout_owner_for_artist(self.target)
+            if active_layout_owner is not None:
+                return OperationSupport.denied(
+                    operation,
+                    "Text participates in active layout and cannot scale independently",
+                )
+            if self.target.get_agg_filter() is not None:
+                return OperationSupport.denied(
+                    operation,
+                    "Text has an Agg filter whose pixel effect cannot be scaled losslessly",
+                )
+            if self.target.get_bbox_patch() is not None:
+                return OperationSupport.denied(
+                    operation,
+                    "Text with a bbox must scale text and box appearance as one plan",
+                )
+            if self.target.get_wrap():
+                return OperationSupport.denied(
+                    operation,
+                    "Wrapped Text can reflow nonlinearly when its font size changes",
+                )
+            if self.target.get_path_effects():
+                return OperationSupport.denied(
+                    operation,
+                    "Text path effects have independent display-space dimensions",
+                )
+            if self.target.get_sketch_params() is not None:
+                return OperationSupport.denied(
+                    operation,
+                    "Text sketch effects have independent display-space dimensions",
+                )
+            if self.target.get_usetex():
+                return OperationSupport.denied(
+                    operation,
+                    "TeX Text metrics are external and cannot be previewed losslessly",
+                )
+            if bool(
+                getattr(self.target, "get_transform_rotates_text", lambda: False)()
+            ):
+                return OperationSupport.denied(
+                    operation,
+                    "Transform-relative Text angle cannot be previewed independently",
+                )
+            if not self.transform_is_invertible_affine(self.target.get_transform()):
+                return OperationSupport.denied(
+                    operation,
+                    "Text appearance scaling requires an invertible affine transform",
+                )
+            if not self.target.get_visible() or not self.target.get_text().strip():
+                return OperationSupport.denied(
+                    operation,
+                    "Text has no visible glyphs to scale",
+                )
+            try:
+                text_color = mpl.colors.to_rgba(
+                    self.target.get_color(), self.target.get_alpha()
+                )
+            except (TypeError, ValueError):
+                return OperationSupport.denied(
+                    operation,
+                    "Text color cannot be resolved to visible paint",
+                )
+            if not self.colors_are_visible(text_color):
+                return OperationSupport.denied(
+                    operation,
+                    "Text has no visible paint to scale",
+                )
+            if not self.has_visible_selection_bounds():
+                return OperationSupport.denied(
+                    operation,
+                    "Text has no visible geometry inside its active clip region",
+                )
+            fontsize = float(self.target.get_fontsize())
+            if not np.isfinite(fontsize) or fontsize <= 0.0:
+                return OperationSupport.denied(
+                    operation,
+                    "Text font size must be finite and positive",
+                )
+            return OperationSupport.allowed(
+                operation,
+                constraints=("positive_uniform_factor",),
+                preview_strategy="redraw",
+            )
         if (
             operation is TransformOperation.TRANSLATE
             and axis_tick_label_reference(self.target) is not None
@@ -2616,6 +3017,55 @@ class TextAdapter(ArtistAdapter):
                 "or Axis spacing instead of dragging the generated Text",
             )
         return super().operation_support(operation)
+
+    def appearance_state(self):
+        return TextAppearanceState(float(self.target.get_fontsize()))
+
+    def scaled_appearance_state(self, factor: float):
+        (fontsize,) = self.scale_nonnegative_dimensions(
+            [self.target.get_fontsize()], factor, label="Text font size"
+        )
+        return TextAppearanceState(fontsize)
+
+    @staticmethod
+    def validate_appearance_state(state) -> TextAppearanceState:
+        if not isinstance(state, TextAppearanceState):
+            raise TypeError("Text appearance plan has an invalid state type")
+        if not np.isfinite(state.fontsize) or state.fontsize <= 0.0:
+            raise ValueError("Text font size must be finite and positive")
+        return state
+
+    def _apply_appearance_state(self, state) -> None:
+        state = self.validate_appearance_state(state)
+        from .change_tracker import add_text_default
+
+        add_text_default(self.target)
+        self.target.set_fontsize(state.fontsize)
+
+    def preview_appearance_state_selection_points(self, state) -> np.ndarray:
+        """Measure font changes without sharing mutable FontProperties state."""
+
+        clone = copy(self.target)
+        clone.set_fontproperties(copy(self.target.get_fontproperties()))
+        for attribute in (
+            "_pylustrator_preview_positions",
+            "_pylustrator_preview_selection_points",
+        ):
+            try:
+                delattr(clone, attribute)
+            except AttributeError:
+                pass
+        adapter = type(self)(clone)
+        adapter._apply_appearance_state(state)
+        return np.asarray(adapter.selection_points(), dtype=float)
+
+    def serialize_appearance_changes(self):
+        return (
+            ChangeRecord.command_change(
+                self.target,
+                f".set_fontsize({replay_literal(self.target.get_fontsize())})",
+            ),
+        )
 
     def __init__(self, target: Text):
         super().__init__(target)
@@ -2817,8 +3267,13 @@ class AnnotationAdapter(TextAdapter):
         return self.target._get_xy_transform(self.renderer(), self.target.xycoords)
 
     def operation_support(self, operation: TransformOperation | str) -> OperationSupport:
-        support = super().operation_support(operation)
         operation = TransformOperation.coerce(operation)
+        if operation is TransformOperation.SCALE_APPEARANCE:
+            return OperationSupport.denied(
+                operation,
+                "Annotation appearance scaling must include its text and optional arrow",
+            )
+        support = super().operation_support(operation)
         if support.supported and operation is TransformOperation.TRANSLATE:
             clip = self.target.get_annotation_clip()
             if clip or (clip is None and self.target.xycoords == "data"):
@@ -3533,6 +3988,9 @@ class Line2DAdapter(ArtistAdapter):
             "Line common-pivot rotation requires an affine transform, default "
             "drawstyle, and no marker or path effect"
         ),
+        TransformOperation.SCALE_APPEARANCE: (
+            "Line appearance scaling requires finite stroke and marker dimensions"
+        ),
     }
     default_capabilities = ArtistCapabilities(
         can_select=True,
@@ -3558,6 +4016,187 @@ class Line2DAdapter(ArtistAdapter):
         return replace(
             cls.default_capabilities, can_rigid_rotate=can_rigid_rotate
         )
+
+    def _line_paint_is_visible(self) -> bool:
+        linestyle = self.target.get_linestyle()
+        if linestyle in (None, "", " ", "none", "None"):
+            return False
+        if float(self.target.get_linewidth()) <= 0.0:
+            return False
+        try:
+            color = mpl.colors.to_rgba(
+                self.target.get_color(), self.target.get_alpha()
+            )
+        except (TypeError, ValueError):
+            return False
+        if not self.colors_are_visible(color):
+            return False
+        return self.path_has_drawable_segment(self.target.get_path())
+
+    def _marker_painted_paths(self) -> list[tuple[Path, Transform]]:
+        marker = self.target._marker
+        if not marker:
+            return []
+        alpha = self.target.get_alpha()
+        edge_visible = False
+        if float(self.target.get_markeredgewidth()) > 0.0:
+            try:
+                edge_visible = self.colors_are_visible(
+                    mpl.colors.to_rgba(self.target.get_markeredgecolor(), alpha)
+                )
+            except (TypeError, ValueError):
+                pass
+
+        components = []
+        candidates = [
+            (
+                marker.get_path(),
+                marker.get_transform(),
+                self.target.get_markerfacecolor,
+            )
+        ]
+        alt_path = marker.get_alt_path()
+        if alt_path is not None:
+            candidates.append(
+                (
+                    alt_path,
+                    marker.get_alt_transform(),
+                    self.target.get_markerfacecoloralt,
+                )
+            )
+        for path, transform, face_getter in candidates:
+            try:
+                face_visible = self.colors_are_visible(
+                    mpl.colors.to_rgba(face_getter(), alpha)
+                )
+            except (TypeError, ValueError):
+                face_visible = False
+            fills = bool(
+                marker.is_filled()
+                and face_visible
+                and self.path_has_fill_area(path, transform)
+            )
+            strokes = bool(
+                edge_visible and self.path_has_drawable_segment(path, transform)
+            )
+            if fills or strokes:
+                components.append((path, transform))
+        return components
+
+    def _marker_paint_is_visible(self) -> bool:
+        marker = self.target._marker
+        if (
+            not marker
+            or float(self.target.get_markersize()) <= 0.0
+            or not len(self._marker_display_positions())
+        ):
+            return False
+        return bool(self._marker_painted_paths())
+
+    def operation_support(
+        self, operation: TransformOperation | str
+    ) -> OperationSupport:
+        operation = TransformOperation.coerce(operation)
+        if operation is not TransformOperation.SCALE_APPEARANCE:
+            return super().operation_support(operation)
+        if not self.capabilities.can_select or not self.capabilities.can_serialize:
+            return OperationSupport.denied(
+                operation,
+                "Line2D has no finite geometry for an atomic appearance edit",
+            )
+        if legend_owner_for_artist(self.target) is not None:
+            return OperationSupport.denied(
+                operation,
+                "Legend-managed Line2D appearance is owned by its Legend layout",
+            )
+        if active_layout_owner_for_artist(self.target) is not None:
+            return OperationSupport.denied(
+                operation,
+                "Line2D participates in active layout and cannot scale independently",
+            )
+        if self.target.get_agg_filter() is not None or self.target.get_path_effects():
+            return OperationSupport.denied(
+                operation,
+                "Line2D filters or path effects have independent pixel dimensions",
+            )
+        if self.target.get_sketch_params() is not None:
+            return OperationSupport.denied(
+                operation,
+                "Line2D sketch effects have independent display-space dimensions",
+            )
+        if self.target.get_marker() == "," and float(self.target.get_markersize()) > 0:
+            return OperationSupport.denied(
+                operation,
+                "The pixel marker has a renderer-fixed one-pixel appearance",
+            )
+        try:
+            values = np.asarray(
+                (
+                    self.target.get_linewidth(),
+                    self.target.get_markersize(),
+                    self.target.get_markeredgewidth(),
+                ),
+                dtype=float,
+            )
+        except (TypeError, ValueError):
+            values = np.asarray((np.nan,), dtype=float)
+        if not np.all(np.isfinite(values)) or np.any(values < 0.0):
+            return OperationSupport.denied(
+                operation,
+                "Line2D stroke and marker dimensions must be finite and non-negative",
+            )
+        if not self.target.get_visible() or not (
+            self._line_paint_is_visible() or self._marker_paint_is_visible()
+        ):
+            return OperationSupport.denied(
+                operation,
+                "Line2D has no visible stroke or marker paint to scale",
+            )
+        if not self.has_visible_selection_bounds():
+            return OperationSupport.denied(
+                operation,
+                "Line2D has no visible geometry inside its active clip region",
+            )
+        return OperationSupport.allowed(
+            operation,
+            constraints=("positive_uniform_factor",),
+            preview_strategy="redraw",
+        )
+
+    def appearance_state(self):
+        return Line2DAppearanceState(
+            float(self.target.get_linewidth()),
+            float(self.target.get_markersize()),
+            float(self.target.get_markeredgewidth()),
+        )
+
+    def scaled_appearance_state(self, factor: float):
+        state = self.appearance_state()
+        values = self.scale_nonnegative_dimensions(
+            (state.linewidth, state.markersize, state.markeredgewidth),
+            factor,
+            label="Line2D appearance",
+        )
+        return Line2DAppearanceState(*values)
+
+    @staticmethod
+    def validate_appearance_state(state) -> Line2DAppearanceState:
+        if not isinstance(state, Line2DAppearanceState):
+            raise TypeError("Line2D appearance plan has an invalid state type")
+        values = np.asarray(
+            (state.linewidth, state.markersize, state.markeredgewidth), dtype=float
+        )
+        if not np.all(np.isfinite(values)) or np.any(values < 0.0):
+            raise ValueError(
+                "Line2D stroke and marker dimensions must be finite and non-negative"
+            )
+        return state
+
+    def _apply_appearance_state(self, state) -> None:
+        state = self.validate_appearance_state(state)
+        self.target.set_linewidth(state.linewidth)
+        self.target.set_markersize(state.markersize)
+        self.target.set_markeredgewidth(state.markeredgewidth)
 
     def get_transform(self) -> Transform:
         return IdentityTransform()
@@ -3599,47 +4238,29 @@ class Line2DAdapter(ArtistAdapter):
         if not marker or float(self.target.get_markersize()) <= 0:
             return np.empty((0, 2), dtype=float)
         alpha = self.target.get_alpha()
-        colors = []
-        for getter in (
-            self.target.get_markerfacecolor,
-            self.target.get_markerfacecoloralt,
-            self.target.get_markeredgecolor,
-        ):
-            try:
-                colors.append(mpl.colors.to_rgba(getter(), alpha))
-            except (TypeError, ValueError):
-                continue
-        if not self.colors_are_visible(colors):
+        painted_paths = self._marker_painted_paths()
+        if not painted_paths:
             return np.empty((0, 2), dtype=float)
 
         positions = self._marker_display_positions(positions)
         if not len(positions):
             return np.empty((0, 2), dtype=float)
-        marker_transform = marker.get_transform().frozen()
         is_pixel = marker.get_marker() == ","
-        if not is_pixel:
-            marker_transform.scale(
-                self.points_to_pixels(float(self.target.get_markersize()))
-            )
-        relative = [
-            np.asarray(
-                marker.get_path().get_extents(marker_transform).get_points(),
-                dtype=float,
-            )
-        ]
-        alt_path = marker.get_alt_path()
-        if alt_path is not None:
-            alt_transform = marker.get_alt_transform().frozen()
+        relative = []
+        for path, transform in painted_paths:
+            transform = transform.frozen()
             if not is_pixel:
-                alt_transform.scale(
+                transform.scale(
                     self.points_to_pixels(float(self.target.get_markersize()))
                 )
             relative.append(
                 np.asarray(
-                    alt_path.get_extents(alt_transform).get_points(), dtype=float
+                    path.get_extents(transform).get_points(), dtype=float
                 )
             )
         relative = self.bounds_points(np.concatenate(relative))
+        if not len(relative):
+            return np.empty((0, 2), dtype=float)
         edge_padding = 0.0
         try:
             edge = mpl.colors.to_rgba(self.target.get_markeredgecolor(), alpha)
@@ -3734,6 +4355,24 @@ class Line2DAdapter(ArtistAdapter):
             ),
         )
 
+    def serialize_appearance_changes(self):
+        state = self.appearance_state()
+        return (
+            ChangeRecord.command_change(
+                self.target,
+                f".set_linewidth({replay_literal(state.linewidth)})",
+            ),
+            ChangeRecord.command_change(
+                self.target,
+                f".set_markersize({replay_literal(state.markersize)})",
+            ),
+            ChangeRecord.command_change(
+                self.target,
+                ".set_markeredgewidth("
+                f"{replay_literal(state.markeredgewidth)})",
+            ),
+        )
+
 
 class AxesImageAdapter(ArtistAdapter):
     default_capabilities = ArtistCapabilities(
@@ -3792,7 +4431,7 @@ class CollectionAdapter(ArtistAdapter):
             "Collection resize must distinguish item positions from marker appearance"
         ),
         TransformOperation.SCALE_APPEARANCE: (
-            "Collection appearance scaling is not implemented yet"
+            "Collection appearance scaling requires finite stroke/item dimensions"
         ),
         TransformOperation.RIGID_ROTATE: (
             "Collection common-pivot rotation requires writable non-offset paths "
@@ -3838,6 +4477,131 @@ class CollectionAdapter(ArtistAdapter):
         ):
             return ArtistCapabilities(can_select=True, can_serialize=True)
         return cls.default_capabilities
+
+    def operation_support(
+        self, operation: TransformOperation | str
+    ) -> OperationSupport:
+        operation = TransformOperation.coerce(operation)
+        if operation is not TransformOperation.SCALE_APPEARANCE:
+            return super().operation_support(operation)
+        if not self.capabilities.can_select or not self.capabilities.can_serialize:
+            return OperationSupport.denied(
+                operation,
+                "Collection has no finite serializable appearance target",
+            )
+        if legend_owner_for_artist(self.target) is not None:
+            return OperationSupport.denied(
+                operation,
+                "Legend-managed Collection appearance is owned by its Legend layout",
+            )
+        if active_layout_owner_for_artist(self.target) is not None:
+            return OperationSupport.denied(
+                operation,
+                "Collection participates in active layout and cannot scale independently",
+            )
+        if self.target.get_agg_filter() is not None or self.target.get_path_effects():
+            return OperationSupport.denied(
+                operation,
+                "Collection filters or path effects have independent pixel dimensions",
+            )
+        if self.target.get_sketch_params() is not None:
+            return OperationSupport.denied(
+                operation,
+                "Collection sketch effects have independent display-space dimensions",
+            )
+        if getattr(self.target, "get_hatch", lambda: None)():
+            return OperationSupport.denied(
+                operation,
+                "Hatch appearance has no complete public scaling contract",
+            )
+        linewidths = np.asarray(self.target.get_linewidths(), dtype=float)
+        if not np.all(np.isfinite(linewidths)) or np.any(linewidths < 0.0):
+            return OperationSupport.denied(
+                operation,
+                "Collection linewidths must be finite and non-negative",
+            )
+        if not self.has_scalable_appearance():
+            return OperationSupport.denied(
+                operation,
+                "Collection has no visible stroke or marker area to scale",
+            )
+        if not self.has_visible_selection_bounds():
+            return OperationSupport.denied(
+                operation,
+                "Collection has no visible geometry inside its active clip region",
+            )
+        return OperationSupport.allowed(
+            operation,
+            constraints=("positive_uniform_factor",),
+            preview_strategy="redraw",
+        )
+
+    def has_scalable_appearance(self) -> bool:
+        linewidths = np.asarray(self.target.get_linewidths(), dtype=float)
+        edgecolors = np.asarray(self.target.get_edgecolors(), dtype=float)
+        try:
+            _transform, _offset_transform, _offsets, paths, _transforms, count = (
+                self._prepared_offset_items()
+            )
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            paths = self.target.get_paths()
+            count = max(len(paths), len(linewidths), len(edgecolors))
+        if count == 0 or not len(paths):
+            return False
+        widths = self._cycle_values(linewidths, count)
+        edges = self._cycled_color_visibility(edgecolors, count)
+        path_drawable = np.asarray(
+            [self.path_has_drawable_segment(path) for path in paths], dtype=bool
+        )
+        drawable = path_drawable[np.arange(count) % len(path_drawable)]
+        return bool(np.any((widths > 0.0) & edges & drawable))
+
+    @staticmethod
+    def _cycled_color_visibility(colors, count: int) -> np.ndarray:
+        colors = np.asarray(colors, dtype=float)
+        if count <= 0 or colors.size == 0:
+            return np.zeros(max(count, 0), dtype=bool)
+        if colors.ndim == 1:
+            colors = colors.reshape(1, -1)
+        alpha = colors[:, 3] if colors.shape[1] >= 4 else np.ones(len(colors))
+        return alpha[np.arange(count) % len(alpha)] > 0.0
+
+    def appearance_state(self):
+        return CollectionAppearanceState(
+            tuple(float(value) for value in self.target.get_linewidths())
+        )
+
+    def scaled_appearance_state(self, factor: float):
+        state = self.appearance_state()
+        return CollectionAppearanceState(
+            self.scale_nonnegative_dimensions(
+                state.linewidths, factor, label="Collection linewidths"
+            )
+        )
+
+    @staticmethod
+    def validate_appearance_state(state) -> CollectionAppearanceState:
+        if not isinstance(state, CollectionAppearanceState):
+            raise TypeError("Collection appearance plan has an invalid state type")
+        linewidths = np.asarray(state.linewidths, dtype=float)
+        if not np.all(np.isfinite(linewidths)) or np.any(linewidths < 0.0):
+            raise ValueError(
+                "Collection linewidths must be finite and non-negative"
+            )
+        return state
+
+    def _apply_appearance_state(self, state) -> None:
+        state = self.validate_appearance_state(state)
+        self.target.set_linewidths(state.linewidths)
+
+    def serialize_appearance_changes(self):
+        state = self.appearance_state()
+        return (
+            ChangeRecord.command_change(
+                self.target,
+                f".set_linewidths({replay_literal(state.linewidths)})",
+            ),
+        )
 
     def local_groups(self) -> list[np.ndarray]:
         return []
@@ -4073,6 +4837,106 @@ class CollectionAdapter(ArtistAdapter):
 
 
 class PathCollectionAdapter(CollectionAdapter):
+    def has_scalable_appearance(self) -> bool:
+        sizes = np.asarray(self.target.get_sizes(), dtype=float)
+        facecolors = np.asarray(self.target.get_facecolors(), dtype=float)
+        edgecolors = np.asarray(self.target.get_edgecolors(), dtype=float)
+        linewidths = np.asarray(self.target.get_linewidths(), dtype=float)
+        try:
+            _transform, _offset_transform, _offsets, paths, _transforms, count = (
+                self._prepared_offset_items()
+            )
+            count = int(count)
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            paths = self.target.get_paths()
+            count = 0
+        count = max(count, len(sizes), len(facecolors), len(edgecolors), len(linewidths))
+        if count == 0 or not len(sizes) or not len(paths):
+            return False
+        item_sizes = self._cycle_values(sizes, count)
+        item_widths = self._cycle_values(linewidths, count)
+        faces = self._cycled_color_visibility(facecolors, count)
+        edges = self._cycled_color_visibility(edgecolors, count)
+        path_fillable = np.asarray(
+            [self.path_has_fill_area(path) for path in paths], dtype=bool
+        )
+        path_drawable = np.asarray(
+            [self.path_has_drawable_segment(path) for path in paths], dtype=bool
+        )
+        path_indices = np.arange(count) % len(paths)
+        fillable = path_fillable[path_indices]
+        drawable = path_drawable[path_indices]
+        painted = (faces & fillable) | (
+            edges & (item_widths > 0.0) & drawable
+        )
+        return bool(np.any((item_sizes > 0.0) & painted))
+
+    def operation_support(
+        self, operation: TransformOperation | str
+    ) -> OperationSupport:
+        operation = TransformOperation.coerce(operation)
+        if operation is TransformOperation.SCALE_APPEARANCE:
+            sizes = np.asarray(self.target.get_sizes(), dtype=float)
+            if not len(sizes):
+                return OperationSupport.denied(
+                    operation,
+                    "PathCollection marker sizes are implicit and cannot be scaled exactly",
+                )
+            if not np.all(np.isfinite(sizes)) or np.any(sizes < 0.0):
+                return OperationSupport.denied(
+                    operation,
+                    "PathCollection marker areas must be finite and non-negative",
+                )
+        return super().operation_support(operation)
+
+    def appearance_state(self):
+        state = super().appearance_state()
+        return PathCollectionAppearanceState(
+            state.linewidths,
+            tuple(float(value) for value in self.target.get_sizes()),
+        )
+
+    def scaled_appearance_state(self, factor: float):
+        state = self.appearance_state()
+        return PathCollectionAppearanceState(
+            self.scale_nonnegative_dimensions(
+                state.linewidths, factor, label="PathCollection linewidths"
+            ),
+            # Matplotlib collection sizes are marker areas in pt^2.
+            self.scale_nonnegative_dimensions(
+                state.sizes,
+                factor,
+                power=2,
+                label="PathCollection marker areas",
+            ),
+        )
+
+    @staticmethod
+    def validate_appearance_state(state) -> PathCollectionAppearanceState:
+        if not isinstance(state, PathCollectionAppearanceState):
+            raise TypeError("PathCollection appearance plan has an invalid state type")
+        CollectionAdapter.validate_appearance_state(state)
+        sizes = np.asarray(state.sizes, dtype=float)
+        if not np.all(np.isfinite(sizes)) or np.any(sizes < 0.0):
+            raise ValueError(
+                "PathCollection marker areas must be finite and non-negative"
+            )
+        return state
+
+    def _apply_appearance_state(self, state) -> None:
+        state = self.validate_appearance_state(state)
+        super()._apply_appearance_state(state)
+        self.target.set_sizes(state.sizes, dpi=float(self.figure.dpi))
+
+    def serialize_appearance_changes(self):
+        return (
+            *super().serialize_appearance_changes(),
+            ChangeRecord.command_change(
+                self.target,
+                f".set_sizes({replay_literal(self.appearance_state().sizes)})",
+            ),
+        )
+
     def local_groups(self):
         return [self.point_array(self.target.get_offsets())]
 
@@ -4241,6 +5105,7 @@ for _artist_type, _adapter_type in (
 __all__ = [
     "AdapterRegistration",
     "AnnotationAdapter",
+    "AppearanceScalePlan",
     "ArtistAdapter",
     "ArtistAdapterRegistry",
     "ArtistCapabilities",

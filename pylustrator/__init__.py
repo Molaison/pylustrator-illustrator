@@ -40,6 +40,7 @@ from .QtGui import initialize as StartColorChooser
 from .lab_colormap import LabColormap
 from .helper_functions import loadFigureFromFile as load
 from .artist_adapters import (
+    AppearanceScalePlan,
     ArtistAdapter,
     ArtistAdapterRegistry,
     ArtistCapabilities,
@@ -87,6 +88,7 @@ __all__ = [
     "StartColorChooser",
     "LabColormap",
     "load",
+    "AppearanceScalePlan",
     "ArtistAdapter",
     "ArtistAdapterRegistry",
     "ArtistCapabilities",

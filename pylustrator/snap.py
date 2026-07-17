@@ -28,6 +28,7 @@ from matplotlib.text import Text
 from qtpy import QtCore, QtGui, QtWidgets
 
 from .artist_adapters import (
+    AppearanceScalePlan,
     ArtistCapabilities,
     RigidRotationPlan,
     artist_adapter_registry,
@@ -171,6 +172,26 @@ class TargetWrapper:
 
     def resize(self, matrix) -> None:
         self.adapter.resize(matrix)
+
+    def plan_appearance_scale(self, factor: float) -> AppearanceScalePlan:
+        return self.adapter.plan_appearance_scale(factor)
+
+    def apply_appearance_scale_plan(
+        self, plan: AppearanceScalePlan, *, record_changes: bool = True
+    ) -> bool:
+        return self.adapter.apply_appearance_scale_plan(
+            plan, record_changes=record_changes
+        )
+
+    def get_appearance_state(self):
+        return self.adapter.appearance_state()
+
+    def restore_appearance_state(
+        self, state, *, record_changes: bool = True
+    ) -> None:
+        self.adapter.restore_appearance_state(
+            state, record_changes=record_changes
+        )
 
     def get_rotation(self) -> float:
         return self.adapter.rotation()

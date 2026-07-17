@@ -19,6 +19,7 @@ from matplotlib.transforms import Bbox, IdentityTransform
 
 from pylustrator.artist_adapters import (
     AnnotationAdapter,
+    AppearanceScalePlan,
     ArtistAdapter,
     ArtistAdapterRegistry,
     ArtistCapabilities,
@@ -58,6 +59,7 @@ def test_extension_contract_is_available_from_the_public_package() -> None:
     import pylustrator
 
     assert pylustrator.ArtistAdapter is ArtistAdapter
+    assert pylustrator.AppearanceScalePlan is AppearanceScalePlan
     assert pylustrator.ArtistAdapterRegistry is ArtistAdapterRegistry
     assert pylustrator.ArtistCapabilities is ArtistCapabilities
     assert pylustrator.register_artist_adapter is register_artist_adapter
