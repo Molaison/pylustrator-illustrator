@@ -4,7 +4,7 @@
 
 
 [![DOC](https://readthedocs.org/projects/pylustrator/badge/)](https://pylustrator.readthedocs.io)
-[![PyTest](https://github.com/rgerum/pylustrator/actions/workflows/pytest.yml/badge.svg)](https://github.com/rgerum/pylustrator/actions/workflows/pytest.yml)
+[![PyTest](https://github.com/Molaison/pylustrator-illustrator/actions/workflows/pytest.yml/badge.svg)](https://github.com/Molaison/pylustrator-illustrator/actions/workflows/pytest.yml)
 [![License](https://img.shields.io/badge/License-GPLv3-blue.svg)](http://www.gnu.org/licenses/gpl-3.0.html)
 [![DOI](https://img.shields.io/badge/DOI-10.21105/joss.01989-blue.svg)](https://doi.org/10.21105/joss.01989)
 
@@ -18,12 +18,104 @@ Pylustrator offers an interactive interface to find the best way to present your
 Added formatting and styling can be saved by automatically generated code. To compose multiple figures to panels,
 pylustrator can compose different subfigures to a single figure.
 
-Please also refer to the [Documentation](https://pylustrator.readthedocs.io) for more information.
+## About This Fork
+
+This repository is a downstream fork of
+[`rgerum/pylustrator`](https://github.com/rgerum/pylustrator). It keeps
+Pylustrator's reproducible, source-generating workflow while rebuilding its
+direct-manipulation layer around a more predictable, Adobe Illustrator-style
+interaction model.
+
+The refactor was motivated by a fundamental mismatch in the original editor:
+Matplotlib artists can look alike on screen while using very different
+coordinate systems, ownership rules, mutation APIs, and serialization paths.
+Treating every artist as a generic rectangle made selection, dragging,
+alignment, resize, undo, and the generated source behave inconsistently across
+objects such as text, axes labels, legends, patches, lines, and collections.
+
+This fork makes those differences explicit at the artist boundary and keeps
+the user-facing interaction rules shared.
+
+### Major Architectural Changes
+
+- **Artist adapter architecture.** Each supported Matplotlib artist resolves
+  to a specific adapter that owns its visible bounds, hit testing,
+  capabilities, display-space transforms, snapshots, mutations, undo state,
+  and reproducible replay commands.
+- **Unified selection model.** Object Selection and Direct Selection consume
+  the same ordered hit stack used by hover, click-through, candidate menus,
+  and marquee selection. Containers are excluded from marquee selection by
+  default and remain available through explicit selection modes.
+- **Logical editor groups.** Editor grouping and selection scope are separate
+  from Matplotlib's implementation ownership, so selecting a child no longer
+  implies that dragging must transform its parent axes, legend, or container.
+- **Semantic operation contracts.** Move, resize, native rotation,
+  shared-pivot rotation, property editing, alignment, and replay are explicit
+  capabilities. A mixed selection is fully preflighted before any target is
+  mutated, and controls are exposed only when the complete selection supports
+  the operation.
+- **Atomic transactions and replay.** One gesture produces one reversible undo
+  item. Failed or cancelled gestures restore artist geometry, generated-change
+  bookkeeping, selection state, and interaction scope; semantic and
+  floating-point no-ops are dropped.
+
+### Interaction and Geometry Improvements
+
+- Selection indicators, drag previews, alignment, and committed positions use
+  the same artist-aware visible geometry, including clipping, stroke width,
+  markers, transformed paths, and renderer-managed collection offsets.
+- Alignment supports selection bounds, the canvas/artboard, and an explicit
+  key object without allowing stale key-object mode to intercept ordinary
+  single-object drags.
+- Resize and rotation use preflighted transform plans and stable pivots;
+  multi-object rotation uses one shared display-space pivot rather than
+  unrelated local angle changes.
+- Legends have stable logical ownership across selection, frame changes,
+  movement, undo/redo, and source replay. Their selection bounds follow visible
+  handles, labels, title, and frame rather than invisible layout boxes.
+- Axis labels and formatter-owned tick labels are edited through their semantic
+  axis owner, allowing content and font properties to be changed without
+  accidentally moving the containing axes.
+- Interaction-scoped geometry and legend discovery caches reduce repeated
+  renderer work, while source-only saves avoid replaying unrelated figure
+  exports.
+
+### Explicit Capability Boundaries
+
+Not every Matplotlib artist can safely support every operation. This fork
+rejects an unsupported transform before mutation instead of applying a visual
+approximation that cannot be undone or reproduced. For example, some
+layout-owned legend children and formatter-owned tick labels are selectable and
+property-editable but intentionally not independently movable or resizable.
+
+The current per-type guarantees and deliberate limitations are documented in
+the [artist operation support matrix](docs/artist_operation_support_matrix.md).
+The longer-term design and remaining productivity work are tracked in the
+[Illustrator-style interaction roadmap](docs/illustrator_interaction_roadmap.md),
+and the extension API is introduced in the [API documentation](docs/api.rst).
+
+### Validation Status
+
+At the fork migration milestone on 2026-07-17:
+
+- the full test suite passed with **721 passed and 147 skipped**;
+- Ruff and Ty completed successfully, with an explicit incremental type-check
+  baseline for the dynamic Matplotlib/Qt interaction modules; and
+- the real multi-panel Fig2 workflow was used to validate selection, movement,
+  resize, rotation, alignment references, legends, axis-label editing,
+  save/replay, and undo/redo behavior.
+
+Please refer to the upstream
+[Pylustrator documentation](https://pylustrator.readthedocs.io) for the base
+application and usage guide. Fork-specific architecture and behavior are
+documented in this repository.
 
 ## Issues, Questions, and Suggestions
 
 Please submit your questions, suggestions, and bug reports to the
-[Issue Tracker](https://github.com/rgerum/pylustrator/issues)
+[fork issue tracker](https://github.com/Molaison/pylustrator-illustrator/issues).
+Issues that also reproduce in unmodified upstream Pylustrator can be reported
+to the [upstream issue tracker](https://github.com/rgerum/pylustrator/issues).
 
 
 ## Contributing
