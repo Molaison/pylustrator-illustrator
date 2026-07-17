@@ -57,6 +57,16 @@ from matplotlib.transforms import (
 from packaging import version
 
 from .editor_model import EditorGroup
+from .legend_layout import (
+    LegendLayoutError,
+    LegendLayoutPlan,
+    LegendLayoutSpec,
+    LegendLayoutState,
+    capture_legend_layout_state,
+    ensure_legend_layout_baseline,
+    plan_legend_layout,
+    restore_legend_layout_state,
+)
 from .operations import OperationSupport, TransformOperation
 from .property_adapters import axis_tick_label_reference
 from .replay import replay_literal
@@ -740,6 +750,10 @@ class ChangeRecord:
         return cls("legend", target)
 
     @classmethod
+    def legend_layout_change(cls, target: Legend) -> ChangeRecord:
+        return cls("legend_layout", target)
+
+    @classmethod
     def axes_change(cls, target: Axes) -> ChangeRecord:
         return cls("axes", target)
 
@@ -759,6 +773,15 @@ class ChangeRecord:
             tracker.addNewTextChange(self.target)
         elif self.kind == "legend":
             tracker.addNewLegendChange(self.target)
+        elif self.kind == "legend_layout":
+            add_layout = getattr(tracker, "addNewLegendLayoutChange", None)
+            if callable(add_layout):
+                add_layout(self.target)
+            else:
+                tracker.addChange(
+                    self.target,
+                    LegendLayoutSpec.from_legend(self.target).replay_command(),
+                )
         elif self.kind == "axes":
             tracker.addNewAxesChange(self.target)
         else:  # pragma: no cover - protects third-party adapter mistakes
@@ -1146,7 +1169,10 @@ class ArtistAdapter:
         if not _CHANGE_RECORDING_ENABLED.get():
             return
         records = tuple(records)
-        if records and not self.capabilities.can_serialize:
+        layout_only = records and all(
+            record.kind == "legend_layout" for record in records
+        )
+        if records and not self.capabilities.can_serialize and not layout_only:
             raise UnsupportedArtistError(
                 f"{type(self).__name__} emitted changes without serialization capability"
             )
@@ -3470,9 +3496,6 @@ class LegendAdapter(ArtistAdapter):
         TransformOperation.RESIZE_GEOMETRY: (
             "Legend size is controlled by layout; use legend reflow instead of stretching its bounds"
         ),
-        TransformOperation.REFLOW_LAYOUT: (
-            "Legend layout reflow is not implemented yet"
-        ),
     }
     default_capabilities = ArtistCapabilities(
         can_select=True,
@@ -3508,6 +3531,25 @@ class LegendAdapter(ArtistAdapter):
         super().__init__(target)
         if not hasattr(target, "_pylustrator_original_frameon"):
             target._pylustrator_original_frameon = target.get_frame_on()
+        ensure_legend_layout_baseline(target)
+
+    def operation_support(
+        self, operation: TransformOperation | str
+    ) -> OperationSupport:
+        operation = TransformOperation.coerce(operation)
+        if operation is not TransformOperation.REFLOW_LAYOUT:
+            return super().operation_support(operation)
+        try:
+            LegendLayoutPlan.preflight(
+                self.target, LegendLayoutSpec.from_legend(self.target)
+            )
+        except LegendLayoutError as error:
+            return OperationSupport.denied(operation, str(error))
+        return OperationSupport.allowed(
+            operation,
+            constraints=("standard_offsetbox_tree", "identity_preserving"),
+            preview_strategy="post_draw_layout",
+        )
 
     def get_transform(self) -> Transform:
         return IdentityTransform()
@@ -3615,6 +3657,122 @@ class LegendAdapter(ArtistAdapter):
         self.record_changes()
         self.invalidate_geometry_cache()
         return True
+
+    def layout_state(self) -> LegendLayoutState:
+        support = self.operation_support(TransformOperation.REFLOW_LAYOUT)
+        if not support.supported:
+            raise UnsupportedArtistError(support.reason)
+        return capture_legend_layout_state(self.target)
+
+    def plan_layout_reflow(
+        self,
+        destination: LegendLayoutSpec | dict[str, object],
+        *,
+        selected_artists: Iterable[Artist] = (),
+    ) -> LegendLayoutPlan:
+        try:
+            return plan_legend_layout(
+                self.target,
+                destination,
+                selected_artists=selected_artists,
+            )
+        except LegendLayoutError as error:
+            raise UnsupportedArtistError(str(error)) from error
+
+    def apply_layout_reflow_plan(
+        self,
+        plan: LegendLayoutPlan,
+        *,
+        record_changes: bool = True,
+    ) -> bool:
+        if plan.target is not self.target:
+            raise ValueError("Legend layout plan belongs to another object")
+        if plan.destination == plan.source_spec:
+            return False
+        before = capture_legend_layout_state(self.target)
+        tracker = None
+        tracker_state = None
+        if record_changes:
+            tracker = self.change_tracker()
+            capture = getattr(tracker, "capture_recording_state", None)
+            tracker_state = capture() if callable(capture) else None
+        try:
+            changed = plan.apply()
+            invalidate_legend_owner_inventory(self.figure)
+            self.invalidate_geometry_cache()
+            if record_changes:
+                self._record_change_records(
+                    (ChangeRecord.legend_layout_change(self.target),)
+                )
+        except Exception as error:
+            rollback_failures = []
+            try:
+                restore_legend_layout_state(self.target, before)
+                invalidate_legend_owner_inventory(self.figure)
+                self.invalidate_geometry_cache()
+            except Exception as rollback_error:
+                rollback_failures.append((self.target, rollback_error))
+            restore_tracker = getattr(tracker, "restore_recording_state", None)
+            if tracker_state is not None and callable(restore_tracker):
+                try:
+                    restore_tracker(tracker_state)
+                except Exception as rollback_error:
+                    rollback_failures.append((tracker, rollback_error))
+            self.annotate_rollback_failures(error, rollback_failures)
+            raise
+        return changed
+
+    def restore_layout_state(
+        self,
+        state: LegendLayoutState,
+        *,
+        record_changes: bool = True,
+    ) -> None:
+        before = capture_legend_layout_state(self.target)
+        tracker = None
+        tracker_state = None
+        if record_changes:
+            tracker = self.change_tracker()
+            capture = getattr(tracker, "capture_recording_state", None)
+            tracker_state = capture() if callable(capture) else None
+        try:
+            restore_legend_layout_state(self.target, state)
+            invalidate_legend_owner_inventory(self.figure)
+            self.invalidate_geometry_cache()
+            if record_changes:
+                self._record_change_records(
+                    (ChangeRecord.legend_layout_change(self.target),)
+                )
+        except Exception as error:
+            rollback_failures = []
+            try:
+                restore_legend_layout_state(self.target, before)
+                invalidate_legend_owner_inventory(self.figure)
+                self.invalidate_geometry_cache()
+            except Exception as rollback_error:
+                rollback_failures.append((self.target, rollback_error))
+            restore_tracker = getattr(tracker, "restore_recording_state", None)
+            if tracker_state is not None and callable(restore_tracker):
+                try:
+                    restore_tracker(tracker_state)
+                except Exception as rollback_error:
+                    rollback_failures.append((tracker, rollback_error))
+            self.annotate_rollback_failures(error, rollback_failures)
+            raise
+
+    def reflow_layout(
+        self,
+        destination: LegendLayoutSpec | dict[str, object],
+        *,
+        selected_artists: Iterable[Artist] = (),
+        record_changes: bool = True,
+    ) -> bool:
+        plan = self.plan_layout_reflow(
+            destination, selected_artists=selected_artists
+        )
+        return self.apply_layout_reflow_plan(
+            plan, record_changes=record_changes
+        )
 
     def snapshot(self):
         bbox = self.target.get_bbox_to_anchor()

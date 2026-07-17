@@ -58,6 +58,11 @@ from .legend_replay import (
     frozen_legend_handles_code,
     original_axes_legend_handles_labels,
 )
+from .legend_layout import (
+    LegendLayoutSpec,
+    ensure_legend_layout_baseline,
+    install_legend_layout_api,
+)
 from .replay import replay_literal
 
 
@@ -195,6 +200,9 @@ def init_figure(fig):
     from .commands import install_legacy_legend_replay_compatibility
 
     install_legacy_legend_replay_compatibility(fig)
+    install_legend_layout_api()
+    for legend in fig.findobj(match=Legend):
+        ensure_legend_layout_baseline(legend)
     for axes in fig.axes:
         add_axes_default(axes)
         add_text_default(axes.title)
@@ -736,6 +744,10 @@ class ChangeTracker:
                     commands.append(
                         [element, f".set_frame_on({element.get_frame_on()!r})"]
                     )
+                original_layout = ensure_legend_layout_baseline(element)
+                current_layout = LegendLayoutSpec.from_legend(element)
+                if not exclude_default or current_layout != original_layout:
+                    commands.append([element, current_layout.replay_command()])
                 return commands
             return parent, f".legend({kwargs_to_string(kwargs)})"
         elif isinstance(element, Axes):
@@ -935,6 +947,20 @@ class ChangeTracker:
             main_figure(element).change_tracker.addChange(
                 command_parent, command, element
             )
+
+    def addNewLegendLayoutChange(self, element):
+        """Persist only the identity-preserving Legend layout operation."""
+
+        baseline = ensure_legend_layout_baseline(element)
+        current = LegendLayoutSpec.from_legend(element)
+        key = (element, "._pylustrator_reflow_layout")
+        if current == baseline:
+            if key in self.changes:
+                del self.changes[key]
+                self.saved = False
+                self.changeCountChanged()
+            return
+        self.addChange(element, current.replay_command())
 
     def addNewAxesChange(self, element):
         desc_strings = self.get_describtion_string(element)
@@ -1360,10 +1386,12 @@ class ChangeTracker:
     def _save(self):
         """save the changes to the .py file"""
         from .commands import GENERATED_STATE_VERSION
+        from .legend_layout import legend_layout_replay_bootstrap
 
         # if saving is disabled
         if self.no_save is True:
             return
+        generated_changes = self.sorted_changes()
         header = [
             getReference(self.figure)
             + ".ax_dict = {ax.get_label(): ax for ax in "
@@ -1371,9 +1399,18 @@ class ChangeTracker:
             + ".axes}",
             "import matplotlib as mpl",
             "import numpy as np",
-            f"getattr({getReference(self.figure)}, '_pylustrator_init', lambda: ...)()",
-            f"{getReference(self.figure)}._pylustrator_generated_version = {GENERATED_STATE_VERSION}",
         ]
+        if any(
+            "._pylustrator_reflow_layout(" in line
+            for line in generated_changes
+        ):
+            header.extend(legend_layout_replay_bootstrap().splitlines())
+        header.extend(
+            [
+                f"getattr({getReference(self.figure)}, '_pylustrator_init', lambda: ...)()",
+                f"{getReference(self.figure)}._pylustrator_generated_version = {GENERATED_STATE_VERSION}",
+            ]
+        )
 
         # block = getTextFromFile(header[0], self.stack_position)
         output = [
@@ -1383,7 +1420,7 @@ class ChangeTracker:
         for line in header:
             output.append(line)
         # add all lines from the changes
-        for line in self.sorted_changes():
+        for line in generated_changes:
             output.append(line)
             if line.startswith("fig.add_axes"):
                 output.append(header[1])

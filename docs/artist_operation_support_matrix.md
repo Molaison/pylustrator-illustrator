@@ -24,6 +24,7 @@ Advertised operations are abbreviated as:
 - `R`: native rotation
 - `Q`: rigid display-space rotation around a shared reference pivot
 - `A`: appearance scaling without geometry or layout mutation
+- `L`: identity-preserving layout reflow
 - `N`: snapshot/restore
 - `C`: serialize to generated changes
 
@@ -32,8 +33,9 @@ Unsupported operations must return `OperationSupport.supported == False` with
 a nonempty reason.  Direct translate, resize, rotate, and snapshot entrypoints
 must reject without geometry or generated-change mutation. `scale_appearance`
 is implemented only for the lossless first-batch Text, Line2D, PathCollection,
-LineCollection, and PolyCollection contracts below. `reflow_layout` and
-`edit_points` remain denied for every built-in adapter.
+LineCollection, and PolyCollection contracts below. `reflow_layout` is limited
+to standard Legend OffsetBox trees; `edit_points` remains denied for every
+built-in adapter.
 
 `PASS` means every advertised transform and its rejection paths satisfy the
 contract. `DENIED` means the absence of edit support is deliberate and the
@@ -59,7 +61,7 @@ Anchor-mode Text and ordinary similarity Patches use Q preferentially.
 | `Axes` | `AxesAdapter` | S M Z N C | Bounds; M/Z; parent Figure size; N; real replay; nonuniform fixed-aspect preview/commit | **PASS** | R is explicitly unsupported. Fixed-aspect Axes advertise the `fixed_aspect` constraint and normalize preview/commit through the same native-space rule. |
 | `Text` | `TextAdapter` | S M R Q A N C conditionally | Axes/data/figure/display transforms; visible text bounds; M; native R; anchor-mode Q; point-font A preview/commit/Undo/Redo/replay; complete N; real replay; Axis-owned property edits | **PASS** | A is limited to visible ordinary point Text with an invertible affine transform; Annotation, Legend/layout-owned, wrapped, bbox, TeX, filtered, sketched, or path-effect Text rejects. Q retains its stricter anchor-mode contract. Geometry resize remains denied. |
 | `Annotation` | `AnnotationAdapter` | S M R N C | Mixed data/axes endpoint coordinates; text and arrow-stroke bounds; two control points; M; R; complete N; real replay | **PASS** | Geometry resize is explicitly denied. |
-| `Legend` | `LegendAdapter` | S M N C | Visible handles/text/title union; `frameon=False/True`; M; logical-owner persistence; self-contained single-glyph proxy replay; N; real replay | **PASS** | Geometry resize and layout reflow are explicitly denied. Explicit composite handlers without a frozen entry specification remain selectable but dynamically deny transform/replay. |
+| `Legend` | `LegendAdapter` | S M L N C conditionally | Visible handles/text/title union; `frameon=False/True`; M; logical-owner persistence; current/extra/Figure L through frozen plans; six-field layout Undo/Redo; Matplotlib-only replay; N; real replay | **PASS** | L preserves Legend/frame/handle/Text/title/DrawingArea/TextArea identity and replaces only verified standard HPacker/VPacker nodes. `mode="expand"`, custom packers/state, detached owners, and Legend/descendant co-selection reject. Explicit composite handlers can use L even when full Legend reconstruction/replay remains unavailable. Geometry resize remains denied. |
 | `Line2D` | `Line2DAdapter` | S M Q A N C conditionally | Data/log transforms; visible line, marker-path, and marker-edge bounds; M; affine shared-pivot Q; linewidth/markersize/markeredgewidth A; appearance-only Undo/Redo and replay; N; real `.set_data` replay | **PASS** | A requires actual visible line segments or painted marker paths and rejects Legend/layout ownership, pixel markers, filters, path/sketch effects, invalid dimensions, and paint-free/degenerate paths. Q retains its affine marker-free contract. Geometry resize remains denied. |
 | `AxesImage` | `AxesImageAdapter` | S M Z N C | M/Z preview/commit; extent replay; N; x/y viewport and Axes position invariance | **PASS** | R is explicitly unsupported. Moving or resizing the image does not autoscale the camera. |
 | `Rectangle` | `RectangleAdapter` | S M Z R Q N C conditionally | Visible-stroke bounds; fixed-stroke M/Z; native R; common-pivot Q under similarity/reflection transforms; rotated M; rotated-resize denial; N; replay | **PASS** | Q additionally requires `rotation_point` `xy`/`center`, no hatch/effect, and no Legend/container owner. Tuple pivots need a richer plan. Z is only advertised at angles equivalent to 0 degrees modulo 360. |
@@ -112,6 +114,11 @@ The following behavior passes for every type that advertises it:
   markersize, and markeredgewidth commands; Collections emit only linewidths
   and PathCollection sizes. Geometry moves and rigid rotations do not freeze
   unrelated appearance, and appearance edits do not emit data/offset commands.
+- Legend layout plans are absolute and layout-only. Current Axes, retained extra
+  Axes, and Figure Legends share one live path; mixed parent/descendant
+  selections reject before mutation, multi-Legend commits roll back atomically,
+  native draggable state is rebound, and generated replay embeds a Matplotlib-
+  only helper instead of depending on Pylustrator at runtime.
 - Real `ChangeTracker` commands replay translated rendered bounds for all 18
   serializable registry types. Axis-label replay additionally covers both
   label position and `labelpad`.
@@ -371,7 +378,7 @@ Explicitly unsupported and tested:
 
 - all operations on fallback Artist and ConnectionPatch;
 - text/annotation geometry resize and appearance scaling;
-- legend geometry resize and layout reflow;
+- legend geometry resize; Legend layout reflow for expand/custom/detached trees;
 - Line2D resize without affine preflight;
 - FancyArrowPatch, FancyBboxPatch, RegularPolygon, and Wedge resize;
 - resize and appearance scaling for all three collection adapters;

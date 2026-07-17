@@ -92,6 +92,10 @@ target before mutation and rolls back earlier targets if an adapter fails.
 Appearance scaling uses a frozen ``AppearanceScalePlan`` and an independent
 appearance state/restore path; it does not enlarge geometry snapshots or emit
 geometry serialization records.
+Legend reflow likewise uses a frozen ``LegendLayoutPlan`` and layout-only
+state.  Its v1 ``LegendLayoutSpec`` changes columns and spacing while retaining
+every persistent Legend leaf; unsupported/custom packer trees reject before
+mutation.
 
 Generated blocks carry a schema version.  Legacy proxy-legend references are
 accepted during replay and rewritten through the public migration helpers.
@@ -110,6 +114,14 @@ accepted during replay and rewritten through the public migration helpers.
 
 .. autoclass:: pylustrator.AppearanceScalePlan
    :members:
+
+.. autoclass:: pylustrator.LegendLayoutSpec
+   :members:
+
+.. autoclass:: pylustrator.LegendLayoutPlan
+   :members:
+
+.. autofunction:: pylustrator.reflow_legend_layout
 
 .. autofunction:: pylustrator.migrate_generated_source
 

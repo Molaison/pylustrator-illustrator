@@ -555,6 +555,7 @@ SEMANTIC_OPERATION_SUPPORT = {
         "LineCollection",
         "PolyCollection",
     },
+    TransformOperation.REFLOW_LAYOUT: {"Legend"},
 }
 
 

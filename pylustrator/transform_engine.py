@@ -11,10 +11,12 @@ from matplotlib.artist import Artist
 from .artist_adapters import (
     AppearanceScalePlan,
     ArtistAdapter,
+    ChangeRecord,
     RigidRotationPlan,
     get_artist_adapter,
     suspend_change_recording,
 )
+from .legend_layout import LegendLayoutPlan
 from .operations import OperationSupport, TransformIntent, TransformOperation
 
 
@@ -34,15 +36,18 @@ class TransformPlan:
     adapters: tuple[ArtistAdapter, ...]
     rigid_rotation_plans: tuple[RigidRotationPlan, ...] = ()
     appearance_scale_plans: tuple[AppearanceScalePlan, ...] = ()
+    legend_layout_plans: tuple[LegendLayoutPlan, ...] = ()
 
     @classmethod
     def preflight(
         cls, targets: Iterable[Artist], intent: TransformIntent
     ) -> "TransformPlan":
+        targets = tuple(targets)
         adapters = tuple(get_artist_adapter(target) for target in targets)
         failures = []
         rigid_rotation_plans = []
         appearance_scale_plans = []
+        legend_layout_plans = []
         for adapter in adapters:
             support = adapter.operation_support(intent.operation)
             if not support.supported:
@@ -67,6 +72,13 @@ class TransformPlan:
                             float(intent.factor)
                         )
                     )
+                elif intent.operation is TransformOperation.REFLOW_LAYOUT:
+                    legend_layout_plans.append(
+                        adapter.plan_layout_reflow(
+                            intent.layout_spec,
+                            selected_artists=targets,
+                        )
+                    )
             except (TypeError, ValueError) as error:
                 failures.append(
                     (
@@ -81,6 +93,7 @@ class TransformPlan:
             adapters,
             tuple(rigid_rotation_plans),
             tuple(appearance_scale_plans),
+            tuple(legend_layout_plans),
         )
 
     def preview_control_points(self) -> tuple[np.ndarray, ...]:
@@ -100,6 +113,10 @@ class TransformPlan:
         if operation is TransformOperation.RIGID_ROTATE:
             return tuple(
                 plan.control_array() for plan in self.rigid_rotation_plans
+            )
+        if operation is TransformOperation.REFLOW_LAYOUT:
+            raise ValueError(
+                "Legend layout has no geometry control-point preview; commit and draw"
             )
         return tuple(
             np.asarray(adapter.control_points(), dtype=float)
@@ -127,6 +144,10 @@ class TransformPlan:
             return tuple(
                 plan.selection_array() for plan in self.appearance_scale_plans
             )
+        if operation is TransformOperation.REFLOW_LAYOUT:
+            raise ValueError(
+                "Legend layout bounds are finalized by Matplotlib after commit and draw"
+            )
         return tuple(
             np.asarray(adapter.selection_points(), dtype=float)
             for adapter in self.adapters
@@ -136,8 +157,17 @@ class TransformPlan:
         appearance_only = (
             self.intent.operation is TransformOperation.SCALE_APPEARANCE
         )
+        layout_only = self.intent.operation is TransformOperation.REFLOW_LAYOUT
         snapshots = [
-            adapter.appearance_state() if appearance_only else adapter.snapshot()
+            (
+                adapter.appearance_state()
+                if appearance_only
+                else (
+                    adapter.layout_state()
+                    if layout_only
+                    else adapter.snapshot()
+                )
+            )
             for adapter in self.adapters
         ]
         tracker_states = []
@@ -173,6 +203,11 @@ class TransformPlan:
                     adapter._apply_preflighted_appearance_scale_plan(
                         self.appearance_scale_plans[index]
                     )
+                elif self.intent.operation is TransformOperation.REFLOW_LAYOUT:
+                    adapter.apply_layout_reflow_plan(
+                        self.legend_layout_plans[index],
+                        record_changes=False,
+                    )
                 else:
                     raise TransformPreflightError(
                         [
@@ -193,6 +228,14 @@ class TransformPlan:
                     adapter._record_change_records(
                         adapter.serialize_appearance_changes()
                     )
+            if self.intent.operation is TransformOperation.REFLOW_LAYOUT and any(
+                plan.destination != plan.source_spec
+                for plan in self.legend_layout_plans
+            ):
+                for adapter in self.adapters:
+                    adapter._record_change_records(
+                        (ChangeRecord.legend_layout_change(adapter.target),)
+                    )
         except Exception as error:
             rollback_failures = []
             with suspend_change_recording():
@@ -202,6 +245,10 @@ class TransformPlan:
                     try:
                         if appearance_only:
                             adapter.restore_appearance_state(
+                                state, record_changes=False
+                            )
+                        elif layout_only:
+                            adapter.restore_layout_state(
                                 state, record_changes=False
                             )
                         else:

@@ -13,6 +13,9 @@ class TestLegend(BaseTest):
             return fig.axes[2].get_legend()
 
         line_command = "plt.figure(1).axes[2].legend("
+        layout_command = (
+            "plt.figure(1).axes[2].get_legend()._pylustrator_reflow_layout("
+        )
         test_run = "Change legend in axes."
         x = 0.040748
         y = 0.854
@@ -82,7 +85,7 @@ class TestLegend(BaseTest):
                 "borderpad"
             ].setValue(0.2),
             get_legend,
-            line_command,
+            layout_command,
             test_run,
             get_function=lambda: get_legend().borderpad,
         )
@@ -94,7 +97,7 @@ class TestLegend(BaseTest):
                 "labelspacing"
             ].setValue(1.3),
             get_legend,
-            line_command,
+            layout_command,
             test_run,
             get_function=lambda: get_legend().labelspacing,
         )
@@ -118,7 +121,7 @@ class TestLegend(BaseTest):
                 "handlelength"
             ].setValue(3),
             get_legend,
-            line_command,
+            layout_command,
             test_run,
             get_function=lambda: get_legend().handlelength,
         )
@@ -130,7 +133,7 @@ class TestLegend(BaseTest):
                 "handletextpad"
             ].setValue(2),
             get_legend,
-            line_command,
+            layout_command,
             test_run,
             get_function=lambda: get_legend().handletextpad,
         )
@@ -142,7 +145,7 @@ class TestLegend(BaseTest):
                 "ncols"
             ].setValue(2),
             get_legend,
-            line_command,
+            layout_command,
             test_run,
             get_function=lambda: get_legend()._ncols,
         )
@@ -154,7 +157,7 @@ class TestLegend(BaseTest):
                 "columnspacing"
             ].setValue(2.3),
             get_legend,
-            line_command,
+            layout_command,
             test_run,
             get_function=lambda: get_legend().columnspacing,
         )
@@ -166,7 +169,7 @@ class TestLegend(BaseTest):
                 "columnspacing"
             ].setValue(2.3),
             get_legend,
-            line_command,
+            layout_command,
             test_run,
             get_function=lambda: get_legend().columnspacing,
         )
