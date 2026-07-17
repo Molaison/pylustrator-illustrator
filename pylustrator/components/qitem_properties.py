@@ -57,6 +57,7 @@ from pylustrator.legend_replay import (
     UnsupportedLegendEntry,
     replayable_legend_handles,
 )
+from pylustrator.legend_layout import LEGEND_LAYOUT_FIELDS
 from pylustrator.change_tracker import UndoRedo, add_text_default, add_axes_default
 
 
@@ -511,14 +512,14 @@ class LegendPropertiesWidget(QtWidgets.QWidget):
             if type_ is bool:
                 widget = CheckWidget(layout, name + ":")
                 widget.editingFinished.connect(
-                    lambda name=name, widget=widget: self.changePropertiy(
+                    lambda name=name, widget=widget: self._change_property_from_widget(
                         name, widget.get()
                     )
                 )
             elif type_ is str:
                 widget = TextWidget(layout, name + ":")
                 widget.editingFinished.connect(
-                    lambda name=name, widget=widget: self.changePropertiy(
+                    lambda name=name, widget=widget: self._change_property_from_widget(
                         name, widget.get()
                     )
                 )
@@ -535,7 +536,7 @@ class LegendPropertiesWidget(QtWidgets.QWidget):
                 widget.label = label
                 layout.addWidget(widget)
                 widget.valueChanged.connect(
-                    lambda x, name=name: self.changePropertiy(name, x)
+                    lambda x, name=name: self._change_property_from_widget(name, x)
                 )
 
             if icon is not None and getattr(widget, "label", None):
@@ -558,6 +559,137 @@ class LegendPropertiesWidget(QtWidgets.QWidget):
                 )
             self.widgets[name] = widget
 
+    def _change_property_from_widget(self, name: str, value: Any) -> None:
+        """Keep capability rejection inside the Qt event boundary."""
+
+        try:
+            self.changePropertiy(name, value)
+        except (TypeError, ValueError) as error:
+            target = self.target
+            if isinstance(target, Legend):
+                self.setTarget(target)
+            QtWidgets.QMessageBox.warning(self, "Pylustrator", str(error))
+
+    @staticmethod
+    def _selected_artists(fig) -> tuple[Artist, ...]:
+        selection = getattr(fig, "selection", None)
+        if selection is None:
+            dragger = getattr(fig, "figure_dragger", None)
+            selection = getattr(dragger, "selection", None)
+        return tuple(
+            target.target
+            for target in getattr(selection, "targets", ())
+            if isinstance(getattr(target, "target", None), Artist)
+        )
+
+    @staticmethod
+    def _refresh_selection_after_draw(fig) -> None:
+        dragger = getattr(fig, "figure_dragger", None)
+        if bool(getattr(dragger, "_selection_refresh_on_draw", False)):
+            return
+        refresh = getattr(dragger, "refresh_selection_geometry", None)
+        if callable(refresh):
+            refresh()
+            return
+        selection = getattr(fig, "selection", None)
+        if selection is not None:
+            update_extent = getattr(selection, "update_extent", None)
+            if callable(update_extent):
+                update_extent()
+            selection.update_selection_rectangles()
+
+    @staticmethod
+    def _notify_layout_changed(fig) -> None:
+        moved = getattr(
+            getattr(fig, "signals", None), "figure_selection_moved", None
+        )
+        emit = getattr(moved, "emit", None)
+        if callable(emit):
+            emit()
+
+    def _sync_layout_properties(self, state) -> None:
+        for property_name in tuple(self.properties):
+            normalized = "ncols" if property_name == "ncol" else property_name
+            if normalized in LEGEND_LAYOUT_FIELDS:
+                self.properties[property_name] = getattr(state.spec, normalized)
+
+    def _change_layout_property(self, name: str, value: Any) -> None:
+        target = self.target
+        adapter = get_artist_adapter(target)
+        fig = main_figure(target)
+        normalized = "ncols" if name == "ncol" else name
+        before = adapter.layout_state()
+        plan = adapter.plan_layout_reflow(
+            {normalized: value},
+            selected_artists=self._selected_artists(fig),
+        )
+        if plan.destination == plan.source_spec:
+            self.properties[name] = getattr(plan.destination, normalized)
+            return
+
+        tracker = getattr(fig, "change_tracker", None)
+        capture_recording = getattr(tracker, "capture_recording_state", None)
+        recording_before = (
+            capture_recording() if callable(capture_recording) else None
+        )
+        edit_history_before = None
+        if hasattr(tracker, "edits") and hasattr(tracker, "last_edit"):
+            edit_history_before = (list(tracker.edits), int(tracker.last_edit))
+
+        def restore(state):
+            live_adapter = get_artist_adapter(target)
+            live_adapter.restore_layout_state(state)
+            self.target = target
+            self._sync_layout_properties(state)
+            self.properties[name] = getattr(state.spec, normalized)
+            fig.canvas.draw()
+            self._refresh_selection_after_draw(fig)
+            self._notify_layout_changed(fig)
+
+        try:
+            adapter.apply_layout_reflow_plan(plan)
+            fig.canvas.draw()
+            self._refresh_selection_after_draw(fig)
+            self._notify_layout_changed(fig)
+            after = adapter.layout_state()
+            self._sync_layout_properties(after)
+            self.properties[name] = getattr(after.spec, normalized)
+            tracker.addEdit(
+                [
+                    lambda: restore(before),
+                    lambda: restore(after),
+                    f"Legend {name}",
+                ]
+            )
+        except Exception as error:
+            rollback_failures = []
+            try:
+                adapter.restore_layout_state(before, record_changes=False)
+            except Exception as rollback_error:
+                rollback_failures.append((target, rollback_error))
+            if edit_history_before is not None:
+                try:
+                    tracker.edits, tracker.last_edit = edit_history_before
+                except Exception as rollback_error:
+                    rollback_failures.append((tracker, rollback_error))
+            restore_recording = getattr(tracker, "restore_recording_state", None)
+            if recording_before is not None and callable(restore_recording):
+                try:
+                    restore_recording(recording_before)
+                except Exception as rollback_error:
+                    rollback_failures.append((tracker, rollback_error))
+            self.target = target
+            self._sync_layout_properties(before)
+            self.properties[name] = getattr(before.spec, normalized)
+            try:
+                fig.canvas.draw()
+                self._refresh_selection_after_draw(fig)
+                self._notify_layout_changed(fig)
+            except Exception as rollback_error:
+                rollback_failures.append((fig, rollback_error))
+            adapter.annotate_rollback_failures(error, rollback_failures)
+            raise
+
     def changePropertiy(self, name: str, value: Any):
         """change the property with the given name to the provided value"""
         if self.target is None:
@@ -565,6 +697,10 @@ class LegendPropertiesWidget(QtWidgets.QWidget):
 
         target = self.target
         adapter = get_artist_adapter(target)
+        normalized_name = "ncols" if name == "ncol" else name
+        if normalized_name in LEGEND_LAYOUT_FIELDS:
+            self._change_layout_property(name, value)
+            return
         if self.properties.get(name) != value:
             serialization = adapter.operation_support("serialize")
             if not serialization.supported:
@@ -601,30 +737,18 @@ class LegendPropertiesWidget(QtWidgets.QWidget):
                 )
             return current
 
-        def refresh_selection_after_draw() -> None:
-            dragger = getattr(fig, "figure_dragger", None)
-            # A live DragManager refreshes from Matplotlib's draw_event, after
-            # Legend packers have finalized their positions.  Lightweight
-            # embedding/test managers need the same post-draw refresh here.
-            if bool(getattr(dragger, "_selection_refresh_on_draw", False)):
-                return
-            refresh = getattr(dragger, "refresh_selection_geometry", None)
-            if callable(refresh):
-                refresh()
-                return
-            selection = getattr(fig, "selection", None)
-            if selection is not None:
-                update_extent = getattr(selection, "update_extent", None)
-                if callable(update_extent):
-                    update_extent()
-                selection.update_selection_rectangles()
-
         # Frame visibility is an appearance property.  Reconstructing a
         # Legend for it changes object identity, discards direct edits to its
         # children, and leaves stale selection/undo references behind.
         if name == "frameon":
             if old_properties[name] == new_properties[name]:
                 return
+
+            tracker = getattr(fig, "change_tracker", None)
+            capture_recording = getattr(tracker, "capture_recording_state", None)
+            recording_before = (
+                capture_recording() if callable(capture_recording) else None
+            )
 
             def setFrameOn(visible):
                 current = resolve_target()
@@ -633,17 +757,32 @@ class LegendPropertiesWidget(QtWidgets.QWidget):
                 self.target = current
                 fig.figure_dragger.select_element(current)
                 fig.canvas.draw()
-                refresh_selection_after_draw()
+                self._refresh_selection_after_draw(fig)
 
             def undo():
                 setFrameOn(old_properties[name])
+                restore_recording = getattr(
+                    tracker, "restore_recording_state", None
+                )
+                if recording_before is not None and callable(restore_recording):
+                    restore_recording(recording_before)
 
             def redo():
                 setFrameOn(new_properties[name])
+                restore_recording = getattr(
+                    tracker, "restore_recording_state", None
+                )
+                if recording_after is not None and callable(restore_recording):
+                    restore_recording(recording_after)
 
-            redo()
+            setFrameOn(new_properties[name])
+            recording_after = (
+                capture_recording() if callable(capture_recording) else None
+            )
             fig.change_tracker.addEdit([undo, redo, f"Legend {name}"])
             return
+
+        logical_legends = [target]
 
         def setProperties(properties):
             nonlocal target
@@ -660,6 +799,7 @@ class LegendPropertiesWidget(QtWidgets.QWidget):
             else:
                 axes.legend(handles=handles, labels=labels, **properties)
                 target = axes.get_legend()
+            logical_legends.append(target)
             with suspend_change_recording():
                 get_artist_adapter(target).restore(legend_state)
             get_artist_adapter(target).record_changes()
@@ -667,15 +807,50 @@ class LegendPropertiesWidget(QtWidgets.QWidget):
             fig.figure_dragger.select_element(target)
             self.target = target
             fig.canvas.draw()
-            refresh_selection_after_draw()
+            self._refresh_selection_after_draw(fig)
+
+        tracker = getattr(fig, "change_tracker", None)
+        capture_recording = getattr(tracker, "capture_recording_state", None)
+        recording_before = (
+            capture_recording() if callable(capture_recording) else None
+        )
+
+        def rebind_recording_state(state):
+            if state is None:
+                return None
+            changes, saved = state
+            logical_ids = {id(legend) for legend in logical_legends}
+
+            def rebind(candidate):
+                return target if id(candidate) in logical_ids else candidate
+
+            return (
+                {
+                    (rebind(reference), command_name): (
+                        rebind(command_target),
+                        command,
+                    )
+                    for (reference, command_name), (command_target, command) in changes.items()
+                },
+                saved,
+            )
 
         def undo():
             setProperties(old_properties)
+            restore_recording = getattr(tracker, "restore_recording_state", None)
+            if recording_before is not None and callable(restore_recording):
+                restore_recording(rebind_recording_state(recording_before))
 
         def redo():
             setProperties(new_properties)
+            restore_recording = getattr(tracker, "restore_recording_state", None)
+            if recording_after is not None and callable(restore_recording):
+                restore_recording(rebind_recording_state(recording_after))
 
-        redo()
+        setProperties(new_properties)
+        recording_after = (
+            capture_recording() if callable(capture_recording) else None
+        )
         main_figure(target).change_tracker.addEdit([undo, redo, f"Legend {name}"])
 
     def setTarget(self, element: Artist):
@@ -715,14 +890,23 @@ class LegendPropertiesWidget(QtWidgets.QWidget):
                 self.widgets[name].setValue(value)
             except AttributeError:
                 self.widgets[name].set(value)
-            property_supported = serialization.supported and (
-                name2 == "frameon" or reconstruction_supported
-            )
+            normalized_name = "ncols" if name == "ncol" else name
+            if normalized_name in LEGEND_LAYOUT_FIELDS:
+                support = get_artist_adapter(element).operation_support(
+                    "reflow_layout"
+                )
+                property_supported = support.supported
+                unsupported_reason = support.reason
+            else:
+                property_supported = serialization.supported and (
+                    name2 == "frameon" or reconstruction_supported
+                )
+                unsupported_reason = serialization.reason or reconstruction_reason
             self.widgets[name].setEnabled(property_supported)
             self.widgets[name].setToolTip(
                 name
                 if property_supported
-                else serialization.reason or reconstruction_reason
+                else unsupported_reason
             )
             self.properties[name] = value
 

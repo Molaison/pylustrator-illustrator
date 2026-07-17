@@ -170,7 +170,7 @@ def test_frameon_property_preserves_legend_identity_children_and_undo() -> None:
     plt.close(fig)
 
 
-def test_frameon_undo_resolves_the_live_legend_after_another_property_rebuild() -> None:
+def test_frameon_undo_keeps_live_legend_after_identity_preserving_reflow() -> None:
     from pylustrator.components.qitem_properties import LegendPropertiesWidget
 
     fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
@@ -190,9 +190,9 @@ def test_frameon_undo_resolves_the_live_legend_after_another_property_rebuild() 
     frame_undo, frame_redo, _name = fig.change_tracker.edit
 
     widget.changePropertiy("borderpad", 0.2)
-    rebuilt = ax.get_legend()
-    assert rebuilt is not legend
-    assert rebuilt.get_frame_on()
+    reflowed = ax.get_legend()
+    assert reflowed is legend
+    assert reflowed.get_frame_on()
 
     frame_undo()
     assert not ax.get_legend().get_frame_on()
@@ -652,7 +652,9 @@ def test_extra_axes_legend_uses_artist_reference_not_current_axes_legend() -> No
     assert commands[1][1].startswith(".set_bbox_to_anchor(")
     assert "transFigure" in commands[1][1]
     assert "get_legend()" not in commands[1][1]
-    assert commands[-1] == [method, ".set_frame_on(True)"]
+    assert [method, ".set_frame_on(True)"] in commands
+    assert commands[-1][0] is method
+    assert commands[-1][1].startswith("._pylustrator_reflow_layout(")
     for command_parent, command in commands:
         eval("command_parent" + command)
     assert ax.get_legend() is current

@@ -68,6 +68,7 @@ class TransformIntent:
     angle_degrees: Optional[float] = None
     pivot: Optional[tuple[float, float]] = None
     factor: Optional[float] = None
+    layout_spec: Optional[object] = None
     label: str = "Transform"
 
     @classmethod
@@ -116,6 +117,18 @@ class TransformIntent:
         return cls(
             TransformOperation.SCALE_APPEARANCE,
             factor=float(factor),
+            label=label,
+        )
+
+    @classmethod
+    def reflow_layout(
+        cls, layout_spec: object, *, label: str = "Reflow layout"
+    ) -> "TransformIntent":
+        """Rebuild layout structure without pretending it is geometry."""
+
+        return cls(
+            TransformOperation.REFLOW_LAYOUT,
+            layout_spec=layout_spec,
             label=label,
         )
 

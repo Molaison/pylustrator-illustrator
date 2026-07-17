@@ -239,16 +239,34 @@ emitted only their appearance-owned setters. The formal editable Fig2 remained
 byte-identical before and after at SHA-256
 `aba67bbd663fd16da535aa30d43f607c7205d096455f44544e518607cdce2dbb`.
 
-### P1b: Identity-preserving Legend reflow (next)
+### P1b: Identity-preserving Legend reflow
 
-Legend layout remains a separate operation. The discarded donor/transplant
-prototype preserved the outer Legend but replaced handles, Text, title, and
-packer identities, violating direct-selection and Undo/Redo contracts. The
-next implementation must reuse every existing Artist and DrawingArea/TextArea,
-replace only standard HPacker/VPacker structure, and preserve manual child
-offsets. Its v1 layout spec is limited to `ncols`, `borderpad`, `labelspacing`,
-`handlelength`, `handletextpad`, and `columnspacing`; `mode="expand"`, unknown
-packers, and simultaneous Legend/descendant selection reject before mutation.
+Implemented on 2026-07-17 as a separate semantic operation. The discarded
+donor/transplant prototype preserved the outer Legend but replaced handles,
+Text, title, and packer identities, violating direct-selection and Undo/Redo
+contracts. The replacement captures a frozen `LegendLayoutSpec/Plan/State`,
+reuses every existing Artist and DrawingArea/TextArea, and replaces only
+verified standard HPacker/VPacker structure. Manual child edits therefore stay
+relative to the newly packed entry instead of disappearing.
+
+The v1 layout spec is deliberately limited to `ncols`, `borderpad`,
+`labelspacing`, `handlelength`, `handletextpad`, and `columnspacing`. Current
+Axes Legends, retained extra Axes Legends, and Figure Legends use the same live
+path. Each control consumes one atomic layout-only history item; restoring the
+source spec removes the generated layout command. Multi-Legend semantic plans
+roll back every target and generated-change record if any commit step fails.
+
+Generated replay remains dependency-free: a saved block embeds a self-contained
+Matplotlib-only reflow primitive before its absolute layout command. It does not
+require Pylustrator to remain imported. Baselines are captured before replay,
+including legacy command ordering, and Matplotlib's native DraggableLegend is
+rebound to the active root across reflow and Undo/Redo.
+
+`mode="expand"`, unknown or customized packers, detached owners, invalid
+dimensions, stale plans, and simultaneous Legend/descendant selection reject
+before mutation. Compatibility probes cover Matplotlib 3.8.4 and 3.10.8; Qt
+signal tests prove that none of the six controls call `Axes.legend()`,
+`Figure.legend()`, or `Legend.remove()`.
 
 The transform bar now has a 3x3 reference locator. Numeric X/Y addresses that
 point on the exact visible selection bounds, while W/H resizes about the same

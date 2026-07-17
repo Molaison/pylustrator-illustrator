@@ -77,6 +77,10 @@ the user-facing interaction rules shared.
 - Legends have stable logical ownership across selection, frame changes,
   movement, undo/redo, and source replay. Their selection bounds follow visible
   handles, labels, title, and frame rather than invisible layout boxes.
+- The six core Legend layout controls reflow the existing OffsetBox tree rather
+  than rebuilding the Legend. Legend, frame, handle, Text, title, DrawingArea,
+  and TextArea identities survive column/spacing changes and Undo/Redo; only
+  verified standard HPacker/VPacker structure is replaced.
 - Axis labels and formatter-owned tick labels are edited through their semantic
   axis owner, allowing content and font properties to be changed without
   accidentally moving the containing axes.
@@ -102,7 +106,7 @@ and the extension API is introduced in the [API documentation](docs/api.rst).
 
 At the current fork milestone on 2026-07-17:
 
-- the full test suite passed with **800 passed and 147 skipped**;
+- the full test suite passed with **851 passed and 147 skipped**;
 - Ruff and Ty completed successfully, with an explicit incremental type-check
   baseline for the dynamic Matplotlib/Qt interaction modules; and
 - the real multi-panel Fig2 workflow was used to validate selection, movement,

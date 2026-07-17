@@ -52,6 +52,14 @@ from .artist_adapters import (
 )
 from .interaction import HitCandidate, HitStack, SelectionKernel, SelectionMode
 from .legend_replay import UnsupportedLegendEntry, register_legend_entry_serializer
+from .legend_layout import (
+    LegendLayoutError,
+    LegendLayoutPlan,
+    LegendLayoutSpec,
+    LegendLayoutState,
+    plan_legend_layout,
+    reflow_legend_layout,
+)
 from .editor_model import EditorGroup, EditorScene
 from .operations import OperationSupport, TransformIntent, TransformOperation
 from .transform_engine import TransformPlan, TransformPreflightError
@@ -99,6 +107,12 @@ __all__ = [
     "register_artist_adapter",
     "UnsupportedLegendEntry",
     "register_legend_entry_serializer",
+    "LegendLayoutError",
+    "LegendLayoutPlan",
+    "LegendLayoutSpec",
+    "LegendLayoutState",
+    "plan_legend_layout",
+    "reflow_legend_layout",
     "HitCandidate",
     "HitStack",
     "SelectionKernel",
