@@ -105,6 +105,27 @@ At the fork migration milestone on 2026-07-17:
   resize, rotation, alignment references, legends, axis-label editing,
   save/replay, and undo/redo behavior.
 
+### Supported Runtime
+
+The supported Python and direct-dependency contract reflects versions
+exercised by the complete automated suite, rather than the much older inherited
+package metadata:
+
+| Runtime | Dependency set | CI contract |
+|---|---|---|
+| Python 3.11 | Every declared direct dependency at its lower bound | Minimum-supported lane |
+| Python 3.12 | Versions resolved by `uv.lock` | Locked lane |
+| Python 3.13 | Versions resolved by `uv.lock` | Locked lane |
+
+The minimum lane currently exercises natsort 4.0.0, NumPy 1.23.5, Matplotlib
+3.8.4, PyQt5 5.15.2, qtawesome 0.5.0, scikit-image 0.21.0, qtpy 2.4.3,
+and pytest 7.2.0 in one environment.
+
+Python 3.9 and Matplotlib 2.x are not compatible with the current editor
+architecture. Python 3.10 is outside the supported matrix because the rollback
+diagnostic contract uses Python 3.11 exception notes. Environments outside the
+table may work, but are not part of the tested compatibility promise.
+
 Please refer to the upstream
 [Pylustrator documentation](https://pylustrator.readthedocs.io) for the base
 application and usage guide. Fork-specific architecture and behavior are
