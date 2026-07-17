@@ -20,29 +20,30 @@
 # along with Pylustrator. If not, see <http://www.gnu.org/licenses/>
 
 from typing import List, Optional
-from packaging import version
-from qtpy import QtCore, QtGui, QtWidgets
 
-import matplotlib as mpl
 import numpy as np
 from matplotlib.artist import Artist
-
-try:  # starting from mpl version 3.6.0
-    from matplotlib.axes import Axes
-except ImportError:
-    from matplotlib.axes._subplots import Axes
 from matplotlib.legend import Legend
-from matplotlib.lines import Line2D
-from matplotlib.patches import Rectangle, Ellipse, FancyArrowPatch
 from matplotlib.text import Text
-from matplotlib.figure import Figure
-from matplotlib.transforms import BboxTransformFrom, BboxTransformTo, IdentityTransform
+from qtpy import QtCore, QtGui, QtWidgets
 
-try:
-    from matplotlib.figure import SubFigure  # since matplotlib 3.4.0
-except ImportError:
-    SubFigure = None
+from .artist_adapters import (
+    ArtistCapabilities,
+    RigidRotationPlan,
+    artist_adapter_registry,
+    cached_selection_points,
+    checkXLabel,
+    checkYLabel,
+    get_artist_adapter,
+    legend_anchor_is_point as legend_anchor_is_point,
+    legend_anchor_transform as legend_anchor_transform,
+    legend_display_loc as legend_display_loc,
+    legend_loc_transform as legend_loc_transform,
+    set_legend_point_anchor_display as set_legend_point_anchor_display,
+    suspend_change_recording,
+)
 from .helper_functions import main_figure
+from .operations import OperationSupport, TransformOperation
 
 
 DIR_X0 = 1
@@ -51,469 +52,175 @@ DIR_X1 = 4
 DIR_Y1 = 8
 
 
-def checkXLabel(target: Artist):
-    """checks if the target is the xlabel of an axis"""
-    for axes in target.figure.axes:
-        if axes.xaxis.get_label() == target:
-            return axes
+class TargetWrapper:
+    """Backward-compatible facade over the artist adapter registry.
 
-
-def checkYLabel(target: Artist):
-    """checks if the target is the ylabel of an axis"""
-    for axes in target.figure.axes:
-        if axes.yaxis.get_label() == target:
-            return axes
-
-
-def cache_property(object, name):
-    if getattr(object, f"_pylustrator_cached_{name}", False) is True:
-        return
-    setattr(object, f"_pylustrator_cached_{name}", True)
-    getter = getattr(object, f"get_{name}")
-    setter = getattr(object, f"set_{name}")
-
-    def new_getter(*args, **kwargs):
-        if getattr(object, f"_pylustrator_cache_{name}", None) is None:
-            setattr(object, f"_pylustrator_cache_{name}", getter(*args, **kwargs))
-        return getattr(object, f"_pylustrator_cache_{name}", None)
-
-    def new_setter(*args, **kwargs):
-        result = setter(*args, **kwargs)
-        setattr(object, f"_pylustrator_cache_{name}", None)
-        return result
-
-    setattr(object, f"get_{name}", new_getter)
-    setattr(object, f"set_{name}", new_setter)
-
-
-def legend_loc_transform(legend: Legend):
-    return BboxTransformFrom(legend.get_bbox_to_anchor())
-
-
-def legend_anchor_transform(legend: Legend):
-    return getattr(
-        legend.get_bbox_to_anchor(),
-        "_transform",
-        BboxTransformTo(legend.parent.bbox),
-    )
-
-
-def legend_anchor_is_point(legend: Legend):
-    bbox = legend.get_bbox_to_anchor()
-    return bbox.width == 0 and bbox.height == 0
-
-
-def set_legend_point_anchor_display(legend: Legend, point, transform=None):
-    if transform is None:
-        transform = getattr(
-            legend.get_bbox_to_anchor(),
-            "_transform",
-            BboxTransformTo(legend.parent.bbox),
-        )
-    legend.set_bbox_to_anchor(
-        tuple(float(x) for x in transform.inverted().transform(point)),
-        transform=transform,
-    )
-
-
-def legend_display_loc(legend: Legend):
-    if legend_anchor_is_point(legend):
-        return np.array(legend.get_bbox_to_anchor().p0)
-    bbox = legend.get_frame().get_bbox()
-    if isinstance(legend._get_loc(), int):
-        return np.array([bbox.x0, bbox.y0])
-    return BboxTransformTo(legend.get_bbox_to_anchor()).transform(legend._get_loc())
-
-
-class TargetWrapper(object):
-    """a wrapper to add unified set and get position methods for any matplotlib artist"""
+    Existing selection and snapping callers keep their historical method names,
+    while every operation is delegated to one type-specific adapter.  New code
+    should prefer :mod:`pylustrator.artist_adapters` directly.
+    """
 
     target = None
 
     def __init__(self, target: Artist):
         self.target = target
-        self.figure = target.figure
-        self.do_scale = True
-        self.fixed_aspect = False
-        # a patch uses the data_transform
-        if isinstance(self.target, mpl.patches.Patch):
-            self.get_transform = self.target.get_data_transform
-        # axes use the figure_transform
-        elif isinstance(self.target, Axes):
-            # and optionally have a fixed aspect ratio
-            if (
-                self.target.get_aspect() != "auto"
-                and self.target.get_adjustable() != "datalim"
-            ):
-                self.fixed_aspect = True
-            # old matplotlib version
-            if version.parse(mpl.__version__) < version.parse("3.4.0"):
-                self.get_transform = lambda: self.target.figure.transFigure
-            else:
-                self.get_transform = (
-                    lambda: self.target.figure.transSubfigure
-                    if self.target.figure.transSubfigure
-                    else self.target.figure.transFigure
-                )
+        self.adapter = get_artist_adapter(target)
+        self.figure = self.adapter.figure
 
-            # cache the get_position
-            cache_property(self.target, "position")
-        # texts use get_transform
-        elif isinstance(self.target, Text):
-            if getattr(self.target, "xy", None) is not None:
-                self.do_scale = True
-            else:
-                self.do_scale = False
-            if checkXLabel(self.target):
-                self.label_factor = self.figure.dpi / 72.0
-                if getattr(self.target, "pad_offset", None) is None:
-                    self.target.pad_offset = (
-                        self.target.get_position()[1]
-                        + checkXLabel(self.target).xaxis.labelpad * self.label_factor
-                    )
-                self.label_y = self.target.get_position()[1]
-            elif checkYLabel(self.target):
-                self.label_factor = self.figure.dpi / 72.0
-                if getattr(self.target, "pad_offset", None) is None:
-                    self.target.pad_offset = (
-                        self.target.get_position()[0]
-                        + checkYLabel(self.target).yaxis.labelpad * self.label_factor
-                    )
-                self.label_x = self.target.get_position()[0]
-            self.get_transform = self.target.get_transform
-        elif isinstance(self.target, Legend):
-            self.get_transform = IdentityTransform
-            self.do_scale = False
-        elif isinstance(self.target, Line2D):
-            self.get_transform = IdentityTransform
-            self.do_scale = False
-        # the default is to use get_transform
-        else:
-            self.get_transform = self.target.get_transform
-            self.do_scale = False
+    @classmethod
+    def supports_target(cls, target: Artist) -> bool:
+        return artist_adapter_registry.supports(target)
 
-    def get_positions(
-        self, use_previous_offset=False, update_offset=False
-    ) -> (int, int, int, int):
-        """get the current position of the target Artist"""
-        preview = getattr(self.target, "_pylustrator_preview_positions", None)
-        if preview is not None:
-            return [np.array(point, dtype=float).copy() for point in preview]
+    @property
+    def capabilities(self) -> ArtistCapabilities:
+        return self.adapter.capabilities
 
-        points = []
-        if isinstance(self.target, Rectangle):
-            points.append(self.target.get_xy())
-            p2 = (
-                self.target.get_x() + self.target.get_width(),
-                self.target.get_y() + self.target.get_height(),
-            )
-            points.append(p2)
-        elif isinstance(self.target, Ellipse):
-            c = self.target.center
-            w = self.target.width
-            h = self.target.height
-            points.append((c[0] - w / 2, c[1] - h / 2))
-            points.append((c[0] + w / 2, c[1] + h / 2))
-        elif isinstance(self.target, FancyArrowPatch):
-            points.append(self.target._posA_posB[0])
-            points.append(self.target._posA_posB[1])
-            points.extend(self.target.get_path().vertices)
-        elif isinstance(self.target, Text):
-            points.append(self.target.get_position())
-            if checkXLabel(self.target):
-                points[0] = (points[0][0], self.label_y)
-            elif checkYLabel(self.target):
-                points[0] = (self.label_x, points[0][1])
-            if getattr(self.target, "xy", None) is not None:
-                points.append(self.target.xy)
-            if len(points) == 1:
-                renderer = self.figure.canvas.get_renderer()
-                bbox_patch = self.target.get_bbox_patch()
-                has_visible_bbox = False
-                if bbox_patch:
-                    face_alpha = bbox_patch.get_facecolor()[-1]
-                    edge_alpha = bbox_patch.get_edgecolor()[-1]
-                    has_visible_bbox = face_alpha > 0 or edge_alpha > 0
-                if has_visible_bbox:
-                    self.target.update_bbox_position_size(renderer)
-                    bbox = bbox_patch.get_window_extent(renderer)
-                else:
-                    bbox = self.target.get_window_extent(renderer)
-                points.extend(
-                    self.transform_inverted_points(
-                        [(bbox.x0, bbox.y0), (bbox.x1, bbox.y1)]
-                    )
-                )
-            if use_previous_offset is True:
-                offset = getattr(self.target, "_pylustrator_offset", None)
-                if offset is None:
-                    raise AttributeError("Text has no stored pylustrator offset")
-                points[2] = (
-                    points[0] + offset + points[2] - points[1]
-                )
-                points[1] = points[0] + offset
-            else:
-                if update_offset:
-                    self.target._pylustrator_offset = np.array(points[1]) - np.array(
-                        points[0]
-                    )
-        elif isinstance(self.target, Axes):
-            p1, p2 = np.array(self.target.get_position())
-            points.append(p1)
-            points.append(p2)
-        elif isinstance(self.target, SubFigure):
-            p1 = [self.target.bbox.x0, self.target.bbox.y0]
-            p2 = [self.target.bbox.x1, self.target.bbox.y1]
-            points.append(p1)
-            points.append(p2)
-        elif isinstance(self.target, Legend):
-            bbox = self.target.get_frame().get_bbox()
-            points.append(legend_display_loc(self.target))
-            # add points to span bounding box around the frame
-            points.append([bbox.x0, bbox.y0])
-            points.append([bbox.x1, bbox.y1])
-            if use_previous_offset is True:
-                offset = getattr(self.target, "_pylustrator_offset", None)
-                if offset is None:
-                    raise AttributeError("Legend has no stored pylustrator offset")
-                points[2] = (
-                    points[0] + offset + points[2] - points[1]
-                )
-                points[1] = points[0] + offset
-            else:
-                if update_offset:
-                    self.target._pylustrator_offset = points[1] - points[0]
-        elif isinstance(self.target, Line2D):
-            bbox = self.target.get_window_extent(self.figure.canvas.get_renderer())
-            points.append([bbox.x0, bbox.y0])
-            points.append([bbox.x1, bbox.y1])
-        return self.transform_points(points)
+    @property
+    def supported(self) -> bool:
+        return self.adapter.supported
 
-    def refresh_offset(self):
-        """Store the current display bbox offset for drag-time rectangle updates."""
-        if isinstance(self.target, (Text, Legend)):
-            self.get_positions(update_offset=True)
+    @property
+    def do_scale(self) -> bool:
+        return self.supports_operation(TransformOperation.RESIZE_GEOMETRY)
+
+    @property
+    def fixed_aspect(self) -> bool:
+        return self.capabilities.fixed_aspect
+
+    def operation_support(
+        self, operation: TransformOperation | str
+    ) -> OperationSupport:
+        return self.adapter.operation_support(operation)
+
+    def supports_operation(self, operation: TransformOperation | str) -> bool:
+        return self.adapter.supports_operation(operation)
+
+    def native_rotation_handle_support(self) -> OperationSupport:
+        return self.adapter.native_rotation_handle_support()
+
+    def get_transform(self):
+        return self.adapter.get_transform()
+
+    def get_selection_points(self) -> np.ndarray:
+        return cached_selection_points(self.target, self.adapter.selection_points)
+
+    def get_positions(self, use_previous_offset=False, update_offset=False):
+        return self.adapter.control_points()
 
     def get_local_positions(
         self, use_previous_offset=False, update_offset=False
     ) -> list[np.ndarray]:
-        """Return positions in the artist's own coordinate system.
+        return self.adapter.local_control_points()
 
-        Dragging happens in display coordinates, but undo/redo restore points must
-        survive later changes to a parent axes or figure transform.
-        """
-        points = self.get_positions(
-            use_previous_offset=use_previous_offset, update_offset=update_offset
+    def set_positions(self, points) -> None:
+        self.adapter.apply_control_points(points)
+
+    def set_local_positions(self, points) -> None:
+        self.adapter.apply_native_control_points(points)
+
+    def translate(self, delta) -> None:
+        self.adapter.translate(delta)
+
+    def preflight_translation(
+        self,
+        delta,
+        *,
+        control_points=None,
+        selection_points=None,
+        destination_selection_points=None,
+    ) -> None:
+        self.adapter.preflight_translation(
+            delta,
+            control_points=control_points,
+            selection_points=selection_points,
+            destination_selection_points=destination_selection_points,
         )
-        return [
-            np.array(point, dtype=float).copy()
-            for point in self.transform_inverted_points(points)
-        ]
 
-    def set_local_positions(self, points: list[np.ndarray]):
-        """Restore positions captured with get_local_positions."""
-        self.set_positions(self.transform_points(points))
+    def preview_translation_selection_points(self, delta) -> np.ndarray:
+        return self.adapter.preview_translation_selection_points(delta)
+
+    def preflight_rigid_visible_translation(self, delta) -> None:
+        self.adapter.preflight_rigid_visible_translation(delta)
+
+    def apply_display_transform(self, matrix) -> None:
+        self.adapter.apply_display_transform(matrix)
+
+    def preview_resize_control_points(
+        self, matrix, *, control_points=None, selection_points=None
+    ) -> np.ndarray:
+        return self.adapter.preview_resize_control_points(
+            matrix,
+            control_points=control_points,
+            selection_points=selection_points,
+        )
+
+    def preview_resize_selection_points(
+        self, matrix, *, control_points=None, selection_points=None
+    ) -> np.ndarray:
+        return self.adapter.preview_resize_selection_points(
+            matrix,
+            control_points=control_points,
+            selection_points=selection_points,
+        )
+
+    def preflight_resize(self, matrix) -> np.ndarray:
+        return self.adapter.preflight_resize(matrix)
+
+    def preflight_rigid_visible_resize(self, matrix) -> np.ndarray:
+        return self.adapter.preflight_rigid_visible_resize(matrix)
+
+    def resize(self, matrix) -> None:
+        self.adapter.resize(matrix)
+
+    def get_rotation(self) -> float:
+        return self.adapter.rotation()
+
+    def get_rotation_pivot(self) -> np.ndarray:
+        return self.adapter.rotation_pivot()
+
+    def set_rotation(self, value: float) -> None:
+        self.adapter.set_rotation(value)
+
+    def plan_rigid_rotation(
+        self, angle_degrees: float, pivot
+    ) -> RigidRotationPlan:
+        return self.adapter.plan_rigid_rotation(angle_degrees, pivot)
+
+    def apply_rigid_rotation_plan(
+        self, plan: RigidRotationPlan, *, record_changes: bool = True
+    ) -> None:
+        self.adapter.apply_rigid_rotation_plan(
+            plan, record_changes=record_changes
+        )
 
     def get_restore_state(self):
-        """Return a transform-independent state for undo/redo restore points."""
-        if isinstance(self.target, Legend):
-            bbox = self.target.get_bbox_to_anchor()
-            transform = legend_anchor_transform(self.target)
-            inverted = transform.inverted()
-            p0 = inverted.transform(bbox.p0)
-            p1 = inverted.transform(bbox.p1)
-            return {
-                "type": "legend",
-                "is_point": legend_anchor_is_point(self.target),
-                "anchor": (
-                    float(p0[0]),
-                    float(p0[1]),
-                    float(p1[0] - p0[0]),
-                    float(p1[1] - p0[1]),
-                ),
-                "transform": transform,
-                "loc": self.target._loc,
-            }
-        return {"type": "positions", "positions": self.get_local_positions()}
+        return self.adapter.snapshot()
 
-    def restore_state(self, state):
-        """Restore a state captured with get_restore_state."""
-        if state["type"] == "legend":
-            anchor = state["anchor"]
-            if state["is_point"]:
-                self.target.set_bbox_to_anchor(anchor[:2], transform=state["transform"])
-            else:
-                self.target.set_bbox_to_anchor(anchor, transform=state["transform"])
-            self.target._loc = state["loc"]
-            change_tracker = (
-                self.figure.figure.change_tracker
-                if self.figure.figure is not None
-                else self.figure.change_tracker
-            )
-            change_tracker.addNewLegendChange(self.target)
+    def restore_state(self, state, *, record_changes: bool = True) -> None:
+        if record_changes:
+            self.adapter.restore(state)
             return
-        self.set_local_positions(state["positions"])
-
-    def set_positions(self, points: (int, int)):
-        """set the position of the target Artist"""
-        points = self.transform_inverted_points(points)
-
-        if self.figure.figure is not None:
-            change_tracker = self.figure.figure.change_tracker
-        else:
-            change_tracker = self.figure.change_tracker
-
-        if isinstance(self.target, Rectangle):
-            self.target.set_xy(points[0])
-            self.target.set_width(points[1][0] - points[0][0])
-            self.target.set_height(points[1][1] - points[0][1])
-            if (
-                self.target.get_label() is None
-                or not self.target.get_label().startswith("_rect")
-            ):
-                change_tracker.addChange(
-                    self.target, ".set_xy([%f, %f])" % tuple(self.target.get_xy())
-                )
-                change_tracker.addChange(
-                    self.target, ".set_width(%f)" % self.target.get_width()
-                )
-                change_tracker.addChange(
-                    self.target, ".set_height(%f)" % self.target.get_height()
-                )
-        elif isinstance(self.target, Ellipse):
-            self.target.center = np.mean(points, axis=0)
-            self.target.width = points[1][0] - points[0][0]
-            self.target.height = points[1][1] - points[0][1]
-            change_tracker.addChange(
-                self.target, ".center = (%f, %f)" % tuple(self.target.center)
-            )
-            change_tracker.addChange(self.target, ".width = %f" % self.target.width)
-            change_tracker.addChange(self.target, ".height = %f" % self.target.height)
-        elif isinstance(self.target, FancyArrowPatch):
-            self.target.set_positions(points[0], points[1])
-            change_tracker.addChange(
-                self.target,
-                ".set_positions(%s, %s)" % (tuple(points[0]), tuple(points[1])),
-            )
-        elif isinstance(self.target, Line2D):
-            bbox = self.target.get_window_extent(self.figure.canvas.get_renderer())
-            dx = points[0][0] - bbox.x0
-            dy = points[0][1] - bbox.y0
-            xy = np.column_stack(
-                [
-                    self.target.get_xdata(orig=False),
-                    self.target.get_ydata(orig=False),
-                ]
-            )
-            moved_xy = self.target.get_transform().transform(xy) + [dx, dy]
-            new_xy = self.target.get_transform().inverted().transform(moved_xy)
-            self.target.set_data(new_xy[:, 0], new_xy[:, 1])
-            change_tracker.addChange(
-                self.target,
-                ".set_data(%s, %s)"
-                % (
-                    [float(value) for value in new_xy[:, 0]],
-                    [float(value) for value in new_xy[:, 1]],
-                ),
-            )
-        elif isinstance(self.target, Text):
-            if checkXLabel(self.target):
-                axes = checkXLabel(self.target)
-                axes.xaxis.labelpad = (
-                    (self.target.pad_offset - points[0][1]) / self.label_factor
-                )
-                change_tracker.addChange(
-                    axes, ".xaxis.labelpad = %f" % axes.xaxis.labelpad
-                )
-
-                self.target.set_position(points[0])
-                self.label_y = points[0][1]
-            elif checkYLabel(self.target):
-                axes = checkYLabel(self.target)
-                axes.yaxis.labelpad = (
-                    (self.target.pad_offset - points[0][0]) / self.label_factor
-                )
-                change_tracker.addChange(
-                    axes, ".yaxis.labelpad = %f" % axes.yaxis.labelpad
-                )
-
-                self.target.set_position(points[0])
-                self.label_x = points[0][0]
-            else:
-                self.target.set_position(points[0])
-                if isinstance(self.target, Text):
-                    change_tracker.addNewTextChange(self.target)
-                else:
-                    change_tracker.addChange(
-                        self.target,
-                        ".set_position([%f, %f])" % self.target.get_position(),
-                    )
-                if getattr(self.target, "xy", None) is not None:
-                    self.target.xy = points[1]
-                    change_tracker.addChange(
-                        self.target, ".xy = (%f, %f)" % tuple(self.target.xy)
-                    )
-        elif isinstance(self.target, Legend):
-            bbox = self.target.get_bbox_to_anchor()
-            if bbox.width == 0 and bbox.height == 0:
-                set_legend_point_anchor_display(
-                    self.target, self.transform_inverted_points(points)[0]
-                )
-            else:
-                point = legend_loc_transform(self.target).transform(
-                    self.transform_inverted_points(points)[0]
-                )
-                self.target._loc = tuple(point)
-            change_tracker.addNewLegendChange(self.target)
-            # change_tracker.addChange(self.target, "._set_loc((%f, %f))" % tuple(point))
-        elif isinstance(self.target, Axes):
-            position = np.array([points[0], points[1] - points[0]]).flatten()
-            if self.fixed_aspect:
-                position[3] = (
-                    position[2]
-                    * self.target.get_position().height
-                    / self.target.get_position().width
-                )
-            self.target.set_position(position)
-            change_tracker.addNewAxesChange(self.target)
-            # change_tracker.addChange(self.target, ".set_position([%f, %f, %f, %f])" % tuple(
-            #    np.array([points[0], points[1] - points[0]]).flatten()))
-        setattr(self.target, "_pylustrator_cached_get_extend", None)
+        with suspend_change_recording():
+            self.adapter.restore(state)
 
     def get_extent(self):
-        # get get_extent as it can be called very frequently when checking snap conditions
-        if getattr(self.target, "_pylustrator_cached_get_extend_added", False):
-            setattr(self.target, "_pylustrator_cached_get_extend_added", True)
-        if getattr(self.target, "_pylustrator_cached_get_extend", None) is None:
-            setattr(self.target, "_pylustrator_cached_get_extend", self.do_get_extent())
-        return getattr(self.target, "_pylustrator_cached_get_extend")
+        return self.adapter.get_extent()
 
-    def do_get_extent(self) -> (int, int, int, int):
-        """get the extent of the target"""
-        points = np.array(self.get_positions())
-        return [
-            np.min(points[:, 0]),
-            np.min(points[:, 1]),
-            np.max(points[:, 0]),
-            np.max(points[:, 1]),
-        ]
+    def do_get_extent(self):
+        return self.adapter.do_get_extent()
 
-    def transform_points(self, points: (int, int)) -> (int, int):
-        """transform points from the targets local coordinate system to the figure coordinate system"""
-        transform = self.get_transform()
-        return [transform.transform(p) for p in points]
+    def transform_points(self, points):
+        return self.adapter.native_to_display(points)
 
-    def transform_inverted_points(self, points: (int, int)) -> (int, int):
-        """transform points from the figure coordinate system to the targets local coordinate system"""
-        transform = self.get_transform()
-        return [transform.inverted().transform(p) for p in points]
+    def transform_inverted_points(self, points):
+        return self.adapter.display_to_native(points)
+
+    def refresh_offset(self) -> None:
+        """Compatibility hook retained for older drag code."""
 
 
 def _text_display_position(text: TargetWrapper) -> np.ndarray:
-    preview = getattr(text.target, "_pylustrator_preview_positions", None)
-    if preview is not None:
-        return np.array(preview[0], dtype=float)
-    return np.array(text.get_transform().transform(text.target.get_position()))
+    return np.array(text.get_positions()[0], dtype=float)
 
 
 class SnapBase:
@@ -813,7 +520,7 @@ class SnapCenterWith(SnapBase):
 
     def getPosition2(self, axes: TargetWrapper) -> int:
         """get the position of the second object"""
-        pos = np.array(axes.figure.transFigure.transform(axes.target.get_position()))
+        pos = np.array(axes.get_positions())
         p = pos[0, :]
         p[self.edge] = np.mean(pos, axis=0)[self.edge]
         return p
@@ -880,7 +587,6 @@ def getSnaps(targets: List[TargetWrapper], dir: int, no_height=False) -> List[Sn
                     if txt in targets or not txt.get_visible():
                         continue
                     # snap to the x and the y coordinate
-                    x, y = txt.get_transform().transform(txt.get_position())
                     snaps.append(SnapSamePos(target, txt, 0))
                     snaps.append(SnapSamePos(target, txt, 1))
             continue

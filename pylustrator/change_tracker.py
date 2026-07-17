@@ -53,6 +53,12 @@ except ImportError:
 from .exception_swallower import Dummy
 from .jupyter_cells import open
 from .helper_functions import main_figure
+from .legend_replay import (
+    axes_handles_reproduce_legend,
+    frozen_legend_handles_code,
+    original_axes_legend_handles_labels,
+)
+from .replay import replay_literal
 
 
 """ External overload """
@@ -95,28 +101,22 @@ def get_legend_reference(element: Artist):
     figure = getattr(element, "figure", None)
     if figure is None:
         return None
-    legends = list(
-        dict.fromkeys(
-            list(figure.legends)
-            + [
-                legend
-                for axes in figure.axes
-                for legend in [axes.get_legend()]
-                if legend is not None
-            ]
+    from .artist_adapters import legend_owner_for_artist
+
+    legend = legend_owner_for_artist(element)
+    if legend is None:
+        return None
+    if element in legend.legend_handles:
+        return (
+            getReference(legend)
+            + ".legend_handles[%d]" % legend.legend_handles.index(element)
         )
-    )
-    for legend in legends:
-        if element in legend.legend_handles:
-            return (
-                getReference(legend)
-                + ".legend_handles[%d]" % legend.legend_handles.index(element)
-            )
-        texts = legend.get_texts()
-        if element in texts:
-            return getReference(legend) + ".get_texts()[%d]" % texts.index(element)
-        if element == legend.get_title():
-            return getReference(legend) + ".get_title()"
+    texts = legend.get_texts()
+    if element in texts:
+        return getReference(legend) + ".get_texts()[%d]" % texts.index(element)
+    if element == legend.get_title():
+        return getReference(legend) + ".get_title()"
+    return None
 
 
 class CodeReference(str):
@@ -128,30 +128,16 @@ def is_scalar_number(v):
 
 
 def format_scalar_number(v):
-    if isinstance(v, (int, np.integer)):
-        return str(int(v))
-    return np.format_float_positional(float(v), 4, fractional=False, trim=".")
+    return replay_literal(v)
 
 
 def to_str(v):
     if isinstance(v, CodeReference):
         return str(v)
     if isinstance(v, list) and len(v) and is_scalar_number(v[0]):
-        return (
-            "["
-            + ", ".join(
-                format_scalar_number(a) for a in v
-            )
-            + "]"
-        )
+        return replay_literal(v)
     elif isinstance(v, tuple) and len(v) and is_scalar_number(v[0]):
-        return (
-            "("
-            + ", ".join(
-                format_scalar_number(a) for a in v
-            )
-            + ")"
-        )
+        return replay_literal(v)
     elif is_scalar_number(v):
         return format_scalar_number(v)
     return repr(v)
@@ -171,18 +157,44 @@ class UndoRedo:
 
     def __enter__(self):
         if len(self.elements):
-            self.undo = self.change_tracker.get_element_restore_function(self.elements)
+            self._geometry_undo = self.change_tracker.get_element_restore_function(
+                self.elements
+            )
+            capture = getattr(self.change_tracker, "capture_recording_state", None)
+            self._recording_before = capture() if capture is not None else None
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if len(self.elements):
-            self.redo = self.change_tracker.get_element_restore_function(self.elements)
-            self.redo()
+        if len(self.elements) and exc_type is None:
+            self._geometry_redo = self.change_tracker.get_element_restore_function(
+                self.elements
+            )
+            self._geometry_redo()
+            capture = getattr(self.change_tracker, "capture_recording_state", None)
+            self._recording_after = capture() if capture is not None else None
+
+            def undo():
+                self._geometry_undo()
+                restore = getattr(self.change_tracker, "restore_recording_state", None)
+                if self._recording_before is not None and restore is not None:
+                    restore(self._recording_before)
+
+            def redo():
+                self._geometry_redo()
+                restore = getattr(self.change_tracker, "restore_recording_state", None)
+                if self._recording_after is not None and restore is not None:
+                    restore(self._recording_after)
+
+            self.undo = undo
+            self.redo = redo
             self.figure.canvas.draw()
             self.figure.signals.figure_selection_property_changed.emit()
             self.change_tracker.addEdit([self.undo, self.redo, self.name])
 
 
 def init_figure(fig):
+    from .commands import install_legacy_legend_replay_compatibility
+
+    install_legacy_legend_replay_compatibility(fig)
     for axes in fig.axes:
         add_axes_default(axes)
         add_text_default(axes.title)
@@ -195,6 +207,15 @@ def init_figure(fig):
     for subfig in fig.subfigs:
         for text in subfig.texts:
             add_text_default(text)
+
+    # Axis tick labels, offset text, Legend children, and other Matplotlib-
+    # managed text are not present in ``Axes.texts``/``Figure.texts``.  They
+    # are nevertheless direct-selection targets and the property undo path
+    # needs the same baseline as ordinary text.  Register every live Text
+    # descendant once; ``add_text_default`` is idempotent and therefore keeps
+    # baselines restored from an existing generated block intact.
+    for text in fig.findobj(match=Text):
+        add_text_default(text)
 
 
 def add_text_default(element):
@@ -297,12 +318,22 @@ def getReference(element: Artist, allow_using_variable_names=True):
     legend_reference = get_legend_reference(element)
     if legend_reference is not None:
         return legend_reference
+    figure = getattr(element, "figure", None)
+    if (
+        figure is not None
+        and getattr(element, "axes", None) is None
+        and element in figure.artists
+    ):
+        return getReference(figure) + ".artists[%d]" % figure.artists.index(element)
     if isinstance(element, matplotlib.lines.Line2D):
         index = element.axes.lines.index(element)
         return getReference(element.axes) + ".lines[%d]" % index
     if isinstance(element, matplotlib.collections.Collection):
         index = element.axes.collections.index(element)
         return getReference(element.axes) + ".collections[%d]" % index
+    if isinstance(element, matplotlib.image.AxesImage):
+        index = element.axes.images.index(element)
+        return getReference(element.axes) + ".images[%d]" % index
     if isinstance(element, matplotlib.patches.Patch):
         if element.axes:
             index = element.axes.patches.index(element)
@@ -495,19 +526,45 @@ class ChangeTracker:
         self.saved = False
         self.changeCountChanged()
 
+    def addOwnedChange(
+        self,
+        command_obj: Artist,
+        command: str,
+        reference_obj: Artist,
+        reference_command: str = None,
+    ):
+        """Record a command whose logical owner differs from its call target."""
+
+        self.addChange(command_obj, command, reference_obj, reference_command)
+
+    def capture_recording_state(self):
+        """Snapshot generated-change bookkeeping for an atomic interaction."""
+
+        return dict(self.changes), bool(self.saved)
+
+    def restore_recording_state(self, state) -> None:
+        """Discard partial/no-op generated changes from an interaction."""
+
+        changes, saved = state
+        self.changes = dict(changes)
+        self.saved = bool(saved)
+        self.changeCountChanged()
+
     def get_element_restore_function(self, elements):
-        description_strings = []
-        for element in elements:
-            desc = self.get_describtion_string(element, exclude_default=False)
-            if isinstance(desc, list):
-                description_strings.extend(desc)
-            else:
-                description_strings.append(desc)
+        from .artist_adapters import legend_owner_snapshot
+
+        with legend_owner_snapshot():
+            description_strings = []
+            for element in elements:
+                desc = self.get_describtion_string(element, exclude_default=False)
+                if isinstance(desc, list):
+                    description_strings.extend(desc)
+                else:
+                    description_strings.append(desc)
 
         def restore():
             for element, string in description_strings:
                 # function, arguments = re.match(r"\.([^(]*)\((.*)\)", string)
-                print(f"eval {getReference(element)}{string}")
                 eval(f"{getReference(element)}{string}")
                 if isinstance(element, Text):
                     self.addNewTextChange(element)
@@ -519,28 +576,23 @@ class ChangeTracker:
                     raise NotImplementedError
                 # getattr(element, function)(eval(arg))
 
-        return restore
+        return legend_owner_snapshot()(restore)
 
     def get_describtion_string(self, element, exclude_default=True):
         if isinstance(element, Text):
-            # if the text is deleted we do not need to store all properties
-            if not element.get_visible() or element.get_text() == "":
+            # Deletion is represented by visibility for ordinary Text.  An
+            # empty string alone is not deletion: axis labels, titles, offset
+            # text, and user-created placeholders are stable semantic slots.
+            # Returning early for those objects used to discard every change
+            # except ``text=''`` (including font size, colour, position, and
+            # rotation) and made UndoRedo snapshots lossy.
+            if not element.get_visible():
                 if getattr(element, "is_new_text", False):
                     return (
                         element.axes or element.figure,
                         ".text(0, 0, , visible=False)",
                     )
-                else:
-                    is_label = np.any(
-                        [
-                            ax.xaxis.get_label() == element
-                            or ax.yaxis.get_label() == element
-                            for ax in element.figure.axes
-                        ]
-                    )
-                    if is_label:
-                        return element, ".set(text='')"
-                    return element, ".set(visible=False)"
+                return element, ".set(visible=False)"
 
             # properties to store
             properties = [
@@ -580,11 +632,11 @@ class ChangeTracker:
                 kwargs = kwargs_to_string(kwargs)
                 return (
                     element.axes or element.figure,
-                    f".text({position[0]:.4f}, {position[1]:.4f}, {repr(text)}, transform={transform}, {kwargs})  # id={getReference(element)}.new",
+                    f".text({format_scalar_number(position[0])}, "
+                    f"{format_scalar_number(position[1])}, {repr(text)}, "
+                    f"transform={transform}, {kwargs})  # id={getReference(element)}.new",
                 )
             else:
-                if "position" in kwargs:
-                    kwargs["position"] = tuple(np.round(kwargs["position"], 4))
                 kwargs = kwargs_to_string(kwargs)
                 return element, f".set({kwargs})"
         elif isinstance(element, Legend):
@@ -607,17 +659,27 @@ class ChangeTracker:
             ]
 
             parent = element.figure if element.axes is None else element.axes
+            labels = [text.get_text() for text in element.get_texts()]
             if element.axes is not None and element.axes.get_legend() is element:
-                handles = CodeReference(
-                    getReference(parent) + ".get_legend_handles_labels()[0]"
-                )
+                axes_handles, axes_labels = original_axes_legend_handles_labels(parent)
+                if axes_handles_reproduce_legend(
+                    element, axes_handles, axes_labels
+                ):
+                    handles = CodeReference(
+                        getReference(parent) + ".get_legend_handles_labels()[0]"
+                    )
+                else:
+                    # Explicit proxy handles may have no corresponding Axes
+                    # artists. Freeze each complete, single-glyph entry so the
+                    # creation command never references the Legend it creates.
+                    handles = CodeReference(frozen_legend_handles_code(element))
             else:
                 handles = CodeReference(getReference(element) + ".legend_handles")
 
             # get current property values
             kwargs = {
                 "handles": handles,
-                "labels": [text.get_text() for text in element.get_texts()],
+                "labels": labels,
                 "loc": element._loc,
             }
             kwargs.update(get_legend_anchor_kwargs(element))
@@ -658,6 +720,21 @@ class ChangeTracker:
                             f"{to_str(tuple(anchor_point))}, "
                             f"transform={getReference(element.figure)}.transFigure)",
                         ]
+                    )
+                # Non-current and figure-level legends already exist in the
+                # source tree, so appearance changes must be replayed in place.
+                # Emit this unconditionally: the source's original frameon
+                # value may differ from Matplotlib's rcParam default.
+                original_frameon = getattr(
+                    element, "_pylustrator_original_frameon", None
+                )
+                if (
+                    not exclude_default
+                    or original_frameon is None
+                    or element.get_frame_on() != original_frameon
+                ):
+                    commands.append(
+                        [element, f".set_frame_on({element.get_frame_on()!r})"]
                     )
                 return commands
             return parent, f".legend({kwargs_to_string(kwargs)})"
@@ -724,7 +801,15 @@ class ChangeTracker:
             for prop in list(kwargs.keys()):
                 value = kwargs[prop]
                 default = element._pylustrator_old_args[prop]
-                if to_str(default) == to_str(value) and exclude_default:
+                equal = to_str(default) == to_str(value)
+                if prop == "position":
+                    try:
+                        equal = bool(
+                            np.allclose(default, value, rtol=1e-14, atol=0)
+                        )
+                    except (TypeError, ValueError):
+                        pass
+                if equal and exclude_default:
                     del kwargs[prop]
 
             # the main properties that can be set directly
@@ -820,16 +905,36 @@ class ChangeTracker:
         if not isinstance(desc_strings, list):
             desc_strings = [desc_strings]
 
+        def same_logical_owner(candidate):
+            if candidate is element:
+                return True
+            if not isinstance(candidate, Legend):
+                return False
+            if element.axes is not None and element.axes.get_legend() is element:
+                return (
+                    candidate.axes is element.axes
+                    and candidate not in element.axes.artists
+                )
+            if element.axes is None and element in element.figure.legends:
+                return (
+                    candidate.figure is element.figure
+                    and candidate not in element.figure.legends
+                    and candidate not in element.figure.artists
+                )
+            return False
+
         # make sure there are no old changes to this element
         keys = [k for k in self.changes]
         for reference_obj, reference_command in keys:
-            if reference_obj == element:
+            if same_logical_owner(reference_obj):
                 del self.changes[reference_obj, reference_command]
         # store the changes
         # if not element.get_visible() and getattr(element, "is_new_text", False):
         #    return
         for command_parent, command in desc_strings:
-            main_figure(element).change_tracker.addChange(command_parent, command)
+            main_figure(element).change_tracker.addChange(
+                command_parent, command, element
+            )
 
     def addNewAxesChange(self, element):
         desc_strings = self.get_describtion_string(element)
@@ -915,6 +1020,31 @@ class ChangeTracker:
         """add an edit to the stored list of edits"""
         if self.last_edit < len(self.edits) - 1:
             self.edits = self.edits[: self.last_edit + 1]
+        metadata = edit[3] if len(edit) > 3 and isinstance(edit[3], dict) else None
+        if metadata is not None and self.edits and self.last_edit == len(self.edits) - 1:
+            previous = self.edits[-1]
+            previous_metadata = (
+                previous[3]
+                if len(previous) > 3 and isinstance(previous[3], dict)
+                else None
+            )
+            if (
+                previous_metadata is not None
+                and metadata.get("coalesce_key")
+                == previous_metadata.get("coalesce_key")
+                and metadata.get("targets") == previous_metadata.get("targets")
+                and float(metadata.get("timestamp", 0))
+                - float(previous_metadata.get("timestamp", 0))
+                <= 0.75
+            ):
+                # Preserve the first undo closure and use the newest redo/end
+                # state, turning a key-repeat sequence into one command.
+                previous[1] = edit[1]
+                previous[2] = edit[2]
+                previous[3] = metadata
+                self.saved = False
+                self.changeCountChanged()
+                return
         self.edits.append(edit)
         self.last_edit = len(self.edits) - 1
         self.last_edit = len(self.edits) - 1
@@ -948,6 +1078,11 @@ class ChangeTracker:
 
     def load(self):
         """load a set of changes from a script file. The changes are the code that pylustrator generated"""
+        from .commands import GENERATED_STATE_VERSION, migrate_generated_command
+
+        source_version = int(
+            getattr(self.figure, "_pylustrator_generated_version", 0)
+        )
         regex = re.compile(r"(\.[^\(= ]*)(.*)")
         command_obj_regexes = [
             getReference(self.figure),
@@ -960,10 +1095,15 @@ class ChangeTracker:
             r"\.{title|_left_title|_right_title}",
             r"\.lines\[\d*\]",
             r"\.collections\[\d*\]",
+            r"\.images\[\d*\]",
+            r"\.artists\[\d*\]",
             r"\.patches\[\d*\]",
             r"\.get_[xy]axis\(\)\.get_(major|minor)_ticks\(\)\[\d*\]",
             r"\.get_[xy]axis\(\)\.get_label\(\)",
             r"\.get_legend\(\)",
+            r"\.legend_handles\[\d*\]",
+            r"\.get_texts\(\)\[\d*\]",
+            r"\.get_title\(\)",
         ]
         command_obj_regexes = [re.compile(r) for r in command_obj_regexes]
 
@@ -971,6 +1111,10 @@ class ChangeTracker:
         header = []
         header += ["fig = plt.figure(%s)" % self.figure.number]
         header += ["import matplotlib as mpl"]
+        header += ["import numpy as np"]
+        header += [
+            f"{getReference(self.figure)}._pylustrator_generated_version = {GENERATED_STATE_VERSION}"
+        ]
 
         self.get_reference_cached = {}
 
@@ -986,10 +1130,13 @@ class ChangeTracker:
                 lineno += 1
                 if line == "" or line in header or line.startswith("#"):
                     continue
+                if "_pylustrator_generated_version" in line:
+                    continue
                 if re.match(r".*\.ax_dict =.*", line):
                     continue
 
                 raw_line = line
+                line = migrate_generated_command(line, source_version)
 
                 # try to identify the command object of the line
                 command_obj = ""
@@ -1017,6 +1164,17 @@ class ChangeTracker:
                 # by default reference and command object are the same
                 reference_obj = command_obj
                 reference_command = command
+
+                # Normalize commands addressed through the current Legend to
+                # the Axes call target while retaining the Legend as logical
+                # owner. This makes first-session and reloaded bookkeeping
+                # identical and keeps dependent commands valid after creation.
+                legend_suffix = ".get_legend()"
+                if command_obj.endswith(legend_suffix):
+                    reference_obj = command_obj
+                    reference_command = command
+                    command_obj = command_obj[: -len(legend_suffix)]
+                    command = legend_suffix + command
 
                 if (
                     command == ".set_xticks"
@@ -1055,6 +1213,15 @@ class ChangeTracker:
                     if command == ".text":
                         eval(reference_obj).is_new_text = True
 
+                # Axes.legend() creates the object targeted by later Legend
+                # commands. Keep its semantic owner separate from the Axes so
+                # a subsequent Axes serialization cannot discard it.
+                if command == ".legend":
+                    parent = eval(command_obj)
+                    if isinstance(parent, Axes) and parent.get_legend() is not None:
+                        reference_obj = command_obj + ".get_legend()"
+                        reference_command = ".legend"
+
                 command_obj = eval(command_obj)
                 reference_obj_str = reference_obj
                 reference_obj = eval(reference_obj)
@@ -1092,6 +1259,15 @@ class ChangeTracker:
     def sorted_changes(self):
         """sort the changes by their priority. For example setting to logscale needs to be executed before xlim."""
 
+        def command_dependency_priority(reference_command):
+            """Order object-producing commands before commands that consume them."""
+
+            if reference_command == ".legend":
+                return "0"
+            if reference_command.startswith(".get_legend"):
+                return "2"
+            return "1"
+
         def getRef(obj):
             try:
                 return getReference(obj)
@@ -1106,7 +1282,7 @@ class ChangeTracker:
         for reference_obj, reference_command in self.changes:
             try:
                 if isinstance(reference_obj, Figure):
-                    obj_indices = ("", "", "", "")
+                    obj_indices = ("", "", "", "", "")
                 else:
                     if getattr(
                         reference_obj, "axes", None
@@ -1141,10 +1317,17 @@ class ChangeTracker:
                             getRef(reference_obj.axes),
                             getRef(reference_obj),
                             index,
+                            command_dependency_priority(reference_command),
                             reference_command,
                         )
                     else:
-                        obj_indices = (getRef(reference_obj), "", "", reference_command)
+                        obj_indices = (
+                            getRef(reference_obj),
+                            "",
+                            "",
+                            command_dependency_priority(reference_command),
+                            reference_command,
+                        )
                 indices.append(
                     [
                         (reference_obj, reference_command),
@@ -1167,7 +1350,17 @@ class ChangeTracker:
         return output
 
     def save(self):
+        """Persist generated source without repeating structural discovery."""
+
+        from .artist_adapters import legend_owner_snapshot
+
+        with legend_owner_snapshot():
+            return self._save()
+
+    def _save(self):
         """save the changes to the .py file"""
+        from .commands import GENERATED_STATE_VERSION
+
         # if saving is disabled
         if self.no_save is True:
             return
@@ -1177,7 +1370,9 @@ class ChangeTracker:
             + getReference(self.figure)
             + ".axes}",
             "import matplotlib as mpl",
+            "import numpy as np",
             f"getattr({getReference(self.figure)}, '_pylustrator_init', lambda: ...)()",
+            f"{getReference(self.figure)}._pylustrator_generated_version = {GENERATED_STATE_VERSION}",
         ]
 
         # block = getTextFromFile(header[0], self.stack_position)
@@ -1195,8 +1390,6 @@ class ChangeTracker:
         output.append(
             "#% end: automatic generated code from pylustrator" + custom_append
         )
-        print("\n" + "\n".join(output) + "\n")
-
         block_id = getReference(self.figure)
         block = getTextFromFile(block_id, stack_position)
         if not block:
@@ -1206,9 +1399,12 @@ class ChangeTracker:
             insertTextToFile(output, stack_position, block_id)
         except FileNotFoundError:
             print(
-                "WARNING: no file to save the above changes was found, you are probably using pylustrator from a shell session.",
+                "WARNING: no file to save the changes was found; generated "
+                "source follows because pylustrator is probably running from "
+                "a shell session.",
                 file=sys.stderr,
             )
+            print("\n" + "\n".join(output) + "\n")
         self.saved = True
 
 

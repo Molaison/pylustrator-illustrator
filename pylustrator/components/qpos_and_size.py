@@ -1,9 +1,10 @@
 from typing import Optional
-from qtpy import QtWidgets
+from qtpy import QtCore, QtWidgets
 import qtawesome as qta
 
 import matplotlib as mpl
 import matplotlib.transforms as transforms
+import numpy as np
 from matplotlib.figure import Figure
 from matplotlib.artist import Artist
 
@@ -11,10 +12,70 @@ try:  # starting from mpl version 3.6.0
     from matplotlib.axes import Axes
 except ImportError:
     from matplotlib.axes._subplots import Axes
-from matplotlib.text import Text
-
 from pylustrator.helper_functions import changeFigureSize, main_figure
 from pylustrator.QLinkableWidgets import DimensionsWidget, ComboWidget
+from pylustrator.snap import TargetWrapper
+from pylustrator.artist_adapters import UnsupportedArtistError
+from pylustrator.operations import TransformOperation
+
+
+class ReferencePointWidget(QtWidgets.QWidget):
+    """Compact Illustrator-style 3x3 transform reference locator."""
+
+    referenceChanged = QtCore.Signal(tuple)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._value = (0.5, 0.5)
+        layout = QtWidgets.QGridLayout(self)
+        layout.setContentsMargins(1, 1, 1, 1)
+        layout.setHorizontalSpacing(1)
+        layout.setVerticalSpacing(1)
+        self._buttons = {}
+        labels = {
+            (0.0, 1.0): "Top left",
+            (0.5, 1.0): "Top center",
+            (1.0, 1.0): "Top right",
+            (0.0, 0.5): "Center left",
+            (0.5, 0.5): "Center",
+            (1.0, 0.5): "Center right",
+            (0.0, 0.0): "Bottom left",
+            (0.5, 0.0): "Bottom center",
+            (1.0, 0.0): "Bottom right",
+        }
+        for row, y in enumerate((1.0, 0.5, 0.0)):
+            for column, x in enumerate((0.0, 0.5, 1.0)):
+                point = (x, y)
+                button = QtWidgets.QToolButton(self)
+                button.setCheckable(True)
+                button.setAutoExclusive(True)
+                button.setFixedSize(9, 9)
+                button.setToolTip(f"Transform reference: {labels[point]}")
+                button.setStyleSheet(
+                    "QToolButton { border: 1px solid #666; border-radius: 4px; "
+                    "padding: 0; background: transparent; } "
+                    "QToolButton:checked { background: #1e88e5; border-color: #1e88e5; }"
+                )
+                button.clicked.connect(
+                    lambda checked, point=point: checked and self.setValue(point, True)
+                )
+                layout.addWidget(button, row, column)
+                self._buttons[point] = button
+        self._buttons[self._value].setChecked(True)
+        self.setToolTip("Reference point for numeric position and size transforms")
+
+    def value(self) -> tuple[float, float]:
+        return self._value
+
+    def setValue(self, point, emit: bool = False) -> None:
+        point = tuple(float(value) for value in point)
+        if point not in self._buttons:
+            raise ValueError(f"Unsupported transform reference point: {point!r}")
+        changed = point != self._value
+        self._value = point
+        self._buttons[point].setChecked(True)
+        if emit and changed:
+            self.referenceChanged.emit(point)
 
 
 class QPosAndSize(QtWidgets.QWidget):
@@ -39,7 +100,7 @@ class QPosAndSize(QtWidgets.QWidget):
 
         layout.addWidget(self)
         self.layout = QtWidgets.QGridLayout(self)
-        self.layout.setContentsMargins(10, 0, 10, 0)
+        self.layout.setContentsMargins(4, 0, 4, 0)
 
         self.input_position = DimensionsWidget(self.layout, "X:", "Y:", "cm")
         self.layout.addWidget(self.input_position, 0, 0)
@@ -72,6 +133,10 @@ class QPosAndSize(QtWidgets.QWidget):
         self.layout.addWidget(self.input_lock_aspect, 1, 2)
         self.input_lock_aspect.toggled.connect(self.changeLockAspect)
 
+        self.input_reference = ReferencePointWidget(self)
+        self.layout.addWidget(self.input_reference, 0, 2)
+        self.input_reference.referenceChanged.connect(self.changeReference)
+
         self.layout.setColumnStretch(3, 1)
 
     def setFigure(self, figure):
@@ -80,6 +145,9 @@ class QPosAndSize(QtWidgets.QWidget):
         if selection is not None:
             self.input_lock_aspect.setChecked(
                 bool(getattr(selection, "lock_aspect_ratio", False))
+            )
+            self.input_reference.setValue(
+                getattr(selection, "reference_point", (0.5, 0.5))
             )
 
     def select_element(self, element):
@@ -113,6 +181,33 @@ class QPosAndSize(QtWidgets.QWidget):
         if selection is not None:
             selection.lock_aspect_ratio = bool(state)
 
+    def changeReference(self, point) -> None:
+        selection = self._active_selection(self.element)
+        if selection is None:
+            return
+        selection.set_reference_point(point)
+        self.setElement(self.element)
+
+    def _active_selection(self, element):
+        if element is None or isinstance(element, Figure):
+            return None
+        try:
+            selection = main_figure(element).selection
+        except (AttributeError, RuntimeError):
+            return None
+        if not hasattr(selection, "selection_bounds"):
+            return None
+        if element not in [target.target for target in selection.targets]:
+            return None
+        return selection
+
+    def _display_size_transform(self, figure):
+        if self.transform_index == 0:
+            return figure.dpi_scale_trans.inverted() + transforms.Affine2D().scale(2.54)
+        if self.transform_index == 1:
+            return figure.dpi_scale_trans.inverted()
+        return transforms.IdentityTransform()
+
     def _lock_aspect_enabled(self) -> bool:
         selection = getattr(getattr(self, "fig", None), "selection", None)
         return bool(
@@ -128,11 +223,7 @@ class QPosAndSize(QtWidgets.QWidget):
     ) -> list[float]:
         new_size = [float(value[0]), float(value[1])]
         current_width, current_height = current_size
-        if (
-            changed_axis is None
-            or current_width == 0
-            or current_height == 0
-        ):
+        if changed_axis is None or current_width == 0 or current_height == 0:
             return new_size
         if changed_axis == 0:
             new_size[1] = new_size[0] * current_height / current_width
@@ -187,69 +278,100 @@ class QPosAndSize(QtWidgets.QWidget):
         self.signals.figure_size_changed.emit()
 
     def changePos(self, value_x: float, value_y: float):
-        """change the position of an axes"""
-        elements = [self.element]
-        elements += [
-            element.target for element in main_figure(self.element).selection.targets
-        ]
+        """Move the selection by one display-space delta.
 
-        old_positions = []
-        new_positions = []
-        for element in elements:
-            old_pos = element.get_position()
-            try:
-                old_positions.append(
-                    [old_pos.x0, old_pos.y0, old_pos.width, old_pos.height]
-                )
-            except AttributeError:
-                old_positions.append(old_pos)
-            if getattr(old_pos, "width", None) is not None:
-                pos = [old_pos.x0, old_pos.y0, old_pos.width, old_pos.height]
-            else:
-                pos = [old_pos[0], old_pos[1]]
+        Native Matplotlib positions can be data, axes, figure, or display
+        coordinates.  Assigning one raw X/Y value to a mixed selection corrupts
+        every element whose transform differs from the primary element.
+        """
+        selection = main_figure(self.element).selection
+        active_selection = self._active_selection(self.element)
+        if active_selection is not None:
+            primary = TargetWrapper(self.element)
+            current_display = active_selection.reference_position()
+            desired_native = np.asarray(
+                primary.transform_inverted_points([current_display])[0], dtype=float
+            )
             if value_x is not None:
-                pos[0] = value_x
+                desired_native[0] = value_x
             if value_y is not None:
-                pos[1] = value_y
-            new_positions.append(pos)
+                desired_native[1] = value_y
+            desired_display = np.asarray(
+                primary.transform_points([desired_native])[0], dtype=float
+            )
+            try:
+                changed = active_selection.translate_reference_to(desired_display)
+            except UnsupportedArtistError as error:
+                self.input_position.setToolTip(str(error))
+                QtWidgets.QMessageBox.warning(self, "Pylustrator", str(error))
+                self.setElement(self.element)
+                return
+            if changed:
+                self.setElement(self.element)
+            return
 
-        fig = self.fig
+        elements = [target.target for target in selection.targets]
+        if self.element not in elements:
+            elements.append(self.element)
+        wrappers = []
+        seen = set()
+        for element in elements:
+            if id(element) in seen or not TargetWrapper.supports_target(element):
+                continue
+            seen.add(id(element))
+            wrappers.append(TargetWrapper(element))
+        if not wrappers:
+            return
+
+        primary = TargetWrapper(self.element)
+        old_position = self.element.get_position()
+        if getattr(old_position, "width", None) is not None:
+            desired_native = [old_position.x0, old_position.y0]
+        else:
+            desired_native = [old_position[0], old_position[1]]
+        if value_x is not None:
+            desired_native[0] = value_x
+        if value_y is not None:
+            desired_native[1] = value_y
+
+        current_display = np.asarray(primary.get_positions()[0], dtype=float)
+        desired_display = np.asarray(
+            primary.transform_points([desired_native])[0], dtype=float
+        )
+        delta = desired_display - current_display
+        if np.allclose(delta, 0):
+            return
+
+        tracker = self.fig.change_tracker
+        capture = getattr(tracker, "capture_recording_state", None)
+        recording_before = capture() if capture is not None else None
+        old_states = [wrapper.get_restore_state() for wrapper in wrappers]
+        for wrapper in wrappers:
+            wrapper.translate(delta)
+        new_states = [wrapper.get_restore_state() for wrapper in wrappers]
+        recording_after = capture() if capture is not None else None
+
+        def apply(states, recording_state):
+            for wrapper, state in zip(wrappers, states):
+                wrapper.restore_state(
+                    state, record_changes=recording_state is None
+                )
+            restore_recording = getattr(tracker, "restore_recording_state", None)
+            if recording_state is not None and restore_recording is not None:
+                restore_recording(recording_state)
+            selection.update_extent()
+            selection.update_selection_rectangles()
+            self.fig.canvas.draw()
 
         def redo():
-            for element, pos in zip(elements, new_positions):
-                element.set_position(pos)
-                if isinstance(element, Text):
-                    fig.change_tracker.addNewTextChange(element)
-                elif isinstance(element, Axes):
-                    fig.change_tracker.addNewAxesChange(element)
-                elif len(pos) == 4:
-                    fig.change_tracker.addChange(
-                        element, ".set_position([%f, %f, %f, %f])" % tuple(pos)
-                    )
-                else:
-                    fig.change_tracker.addChange(
-                        element, ".set_position([%f, %f])" % tuple(pos)
-                    )
+            apply(new_states, recording_after)
 
         def undo():
-            for element, pos in zip(elements, old_positions):
-                element.set_position(pos)
-                if isinstance(element, Text):
-                    fig.change_tracker.addNewTextChange(element)
-                elif isinstance(element, Axes):
-                    fig.change_tracker.addNewAxesChange(element)
-                elif len(pos) == 4:
-                    fig.change_tracker.addChange(
-                        element, ".set_position([%f, %f, %f, %f])" % tuple(pos)
-                    )
-                else:
-                    fig.change_tracker.addChange(
-                        element, ".set_position([%f, %f])" % tuple(pos)
-                    )
+            apply(old_states, recording_before)
 
-        redo()
         self.fig.change_tracker.addEdit([undo, redo, "Change position"])
-
+        selection.update_extent()
+        selection.update_selection_rectangles()
         self.fig.signals.figure_selection_property_changed.emit()
         self.fig.canvas.draw()
 
@@ -293,6 +415,23 @@ class QPosAndSize(QtWidgets.QWidget):
             self.setElement(self.element)
             self.signals.figure_size_changed.emit()
         else:
+            active_selection = self._active_selection(self.element)
+            if active_selection is not None:
+                try:
+                    changed = active_selection.resize_selection_to(
+                        value,
+                        keep_aspect_ratio=self._lock_aspect_enabled(),
+                        changed_axis=changed_axis,
+                    )
+                except UnsupportedArtistError as error:
+                    self.input_shape.setToolTip(str(error))
+                    QtWidgets.QMessageBox.warning(self, "Pylustrator", str(error))
+                    self.setElement(self.element)
+                    return
+                if changed:
+                    self.setElement(self.element)
+                return
+
             elements = [self.element]
             elements += [
                 element.target
@@ -308,9 +447,7 @@ class QPosAndSize(QtWidgets.QWidget):
                 pos = [pos.x0, pos.y0, pos.width, pos.height]
                 size = list(value)
                 if self._lock_aspect_enabled():
-                    size = self._locked_size(
-                        size, (pos[2], pos[3]), changed_axis
-                    )
+                    size = self._locked_size(size, (pos[2], pos[3]), changed_axis)
                 pos[2] = size[0]
                 pos[3] = size[1]
                 new_positions.append(pos)
@@ -344,32 +481,22 @@ class QPosAndSize(QtWidgets.QWidget):
         if isinstance(element, Figure):
             if self.transform_index == 0:
                 return transforms.Affine2D().scale(2.54, 2.54)
-            return None
-        if isinstance(element, Axes):
-            if self.transform_index == 0:
-                return (
-                    transforms.Affine2D().scale(2.54, 2.54)
-                    + element.figure.dpi_scale_trans.inverted()
-                    + element.figure.transFigure
-                )
             if self.transform_index == 1:
-                return (
-                    element.figure.dpi_scale_trans.inverted()
-                    + element.figure.transFigure
-                )
+                return transforms.IdentityTransform()
             if self.transform_index == 2:
-                return element.figure.transFigure
+                return element.dpi_scale_trans
             return None
+        display_transform = TargetWrapper(element).get_transform()
         if self.transform_index == 0:
             return (
-                transforms.Affine2D().scale(2.54, 2.54)
+                display_transform
                 + element.figure.dpi_scale_trans.inverted()
-                + element.get_transform()
+                + transforms.Affine2D().scale(2.54, 2.54)
             )
         if self.transform_index == 1:
-            return element.figure.dpi_scale_trans.inverted() + element.get_transform()
+            return display_transform + element.figure.dpi_scale_trans.inverted()
         if self.transform_index == 2:
-            return element.get_transform()
+            return display_transform
         return None
 
     def setElement(self, element: Artist):
@@ -380,6 +507,30 @@ class QPosAndSize(QtWidgets.QWidget):
         self.input_shape_transform.setDisabled(True)
         self.input_transform.setDisabled(True)
         self.input_lock_aspect.setEnabled(True)
+        self.input_reference.setDisabled(True)
+
+        active_selection = self._active_selection(element)
+        if active_selection is not None:
+            self.input_reference.setEnabled(True)
+            self.input_reference.setValue(active_selection.reference_point)
+            primary = TargetWrapper(element)
+            reference_display = active_selection.reference_position()
+            reference_native = primary.transform_inverted_points([reference_display])[0]
+            self.input_position.setTransform(self.getTransform(element))
+            self.input_position.setValue(reference_native)
+            self.input_position.setEnabled(True)
+            self.input_transform.setEnabled(True)
+
+            bounds = active_selection.selection_bounds()
+            self.input_shape.setTransform(self._display_size_transform(self.fig))
+            self.input_shape.setValue(bounds[2:] - bounds[:2])
+            support = active_selection.operation_support(
+                TransformOperation.RESIZE_GEOMETRY
+            )
+            self.input_shape.setEnabled(support.supported)
+            self.input_shape.setToolTip("" if support.supported else support.reason)
+            self.input_lock_aspect.setEnabled(support.supported)
+            return
 
         if isinstance(element, Figure):
             pos = element.get_size_inches()

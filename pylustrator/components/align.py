@@ -56,9 +56,9 @@ class Align(QtWidgets.QWidget):
             "mdi.rotate-right",
         ]
         tooltips = {
-            "same_width": "match width to first selected object",
-            "same_height": "match height to first selected object",
-            "same_size": "match size to first selected object",
+            "same_width": "match width to the key object, or first selected object",
+            "same_height": "match height to the key object, or first selected object",
+            "same_size": "match size to the key object, or first selected object",
             "scale_up": "enlarge selected objects",
             "scale_down": "shrink selected objects",
             "rotate_left": "rotate selected objects 15 degrees counterclockwise",
@@ -66,6 +66,7 @@ class Align(QtWidgets.QWidget):
         }
         columns = 4
         self.buttons = []
+        self.buttons_by_action = {}
         align_group = QtWidgets.QButtonGroup(self)
         for index, act in enumerate(actions):
             icon_name = icons[index]
@@ -86,7 +87,101 @@ class Align(QtWidgets.QWidget):
             self.layout_main.addWidget(button, index // columns, index % columns)
             button.clicked.connect(lambda x, act=act: self.execute_action(act))
             self.buttons.append(button)
+            self.buttons_by_action[act] = button
             align_group.addButton(button)
+
+        self.reference_combo = QtWidgets.QComboBox(self)
+        self.reference_combo.addItem("Align to Selection", "selection")
+        self.reference_combo.addItem("Align to Key Object", "key_object")
+        self.reference_combo.addItem("Align to Artboard", "artboard")
+        self.reference_combo.setToolTip(
+            "Choose the visible bounds used as the alignment reference"
+        )
+        self.layout_main.addWidget(self.reference_combo, 4, 0, 1, columns)
+        self.reference_combo.currentIndexChanged.connect(
+            self.change_reference_mode
+        )
+
+        self.spacing_enabled = QtWidgets.QCheckBox("Spacing", self)
+        self.spacing_enabled.setToolTip(
+            "Use an exact gap around the key object when distributing"
+        )
+        self.layout_main.addWidget(self.spacing_enabled, 5, 0)
+        self.spacing_input = QtWidgets.QDoubleSpinBox(self)
+        self.spacing_input.setRange(-10000.0, 10000.0)
+        self.spacing_input.setDecimals(2)
+        self.spacing_input.setSuffix(" px")
+        self.spacing_input.setToolTip(
+            "Exact display-space gap; negative values overlap objects"
+        )
+        self.layout_main.addWidget(self.spacing_input, 5, 1, 1, columns - 1)
+        self.spacing_enabled.toggled.connect(self.refresh_controls)
+
+        self.fig = None
+        self._updating_reference = False
+        signals.figure_element_selected.connect(self.selection_changed)
+        selection_update = getattr(signals, "figure_selection_update", None)
+        if selection_update is not None:
+            selection_update.connect(self.refresh_controls)
+
+    def selection_changed(self, _element) -> None:
+        self.refresh_controls()
+
+    def refresh_controls(self, *_args) -> None:
+        selection = getattr(getattr(self, "fig", None), "selection", None)
+        if selection is None:
+            self.reference_combo.setEnabled(False)
+            self.spacing_enabled.setEnabled(False)
+            self.spacing_input.setEnabled(False)
+            self.buttons_by_action["rotate_left"].setEnabled(False)
+            self.buttons_by_action["rotate_right"].setEnabled(False)
+            return
+        self.reference_combo.setEnabled(True)
+        rotation_enabled = bool(
+            getattr(selection, "rotation_handle_supported", lambda: False)()
+        )
+        self.buttons_by_action["rotate_left"].setEnabled(rotation_enabled)
+        self.buttons_by_action["rotate_right"].setEnabled(rotation_enabled)
+        mode = getattr(selection, "alignment_reference_mode", "selection")
+        index = self.reference_combo.findData(mode)
+        self._updating_reference = True
+        try:
+            if index >= 0:
+                self.reference_combo.setCurrentIndex(index)
+        finally:
+            self._updating_reference = False
+        key = getattr(selection, "alignment_key", None)
+        key_enabled = (
+            mode == "key_object"
+            and len(selection.targets) >= 2
+            and key is not None
+        )
+        self.spacing_enabled.setEnabled(key_enabled)
+        self.spacing_input.setEnabled(
+            key_enabled and self.spacing_enabled.isChecked()
+        )
+        if mode == "key_object" and key is not None:
+            self.reference_combo.setToolTip(
+                f"Key object: {type(key).__name__}; click another selected object to change it"
+            )
+        elif mode == "key_object":
+            self.reference_combo.setToolTip(
+                "Click a selected object to choose the alignment key"
+            )
+        else:
+            self.reference_combo.setToolTip(
+                "Choose the visible bounds used as the alignment reference"
+            )
+
+    def change_reference_mode(self, index: int) -> None:
+        if self._updating_reference or self.fig is None:
+            return
+        mode = self.reference_combo.itemData(index)
+        try:
+            self.fig.selection.set_alignment_reference(mode)
+        except ValueError as error:
+            QtWidgets.QMessageBox.warning(self, "Pylustrator", str(error))
+        self.refresh_controls()
 
     def execute_action(self, act: str):
         """execute an alignment action"""
@@ -102,12 +197,21 @@ class Align(QtWidgets.QWidget):
             elif act == "rotate_right":
                 self.fig.selection.rotate_selection(-15)
             else:
-                self.fig.selection.align_points(act)
-        except ValueError as exc:
+                spacing = None
+                if (
+                    act in ("distribute_x", "distribute_y")
+                    and self.spacing_input.isEnabled()
+                    and self.spacing_enabled.isChecked()
+                ):
+                    spacing = self.spacing_input.value()
+                self.fig.selection.align_points(act, spacing=spacing)
+        except (TypeError, ValueError) as exc:
             QtWidgets.QMessageBox.warning(self, "Pylustrator", str(exc))
             return
         self.fig.selection.update_selection_rectangles()
         self.fig.canvas.draw()
+        self.refresh_controls()
 
     def setFigure(self, fig):
         self.fig = fig
+        self.refresh_controls()

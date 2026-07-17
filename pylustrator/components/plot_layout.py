@@ -79,10 +79,14 @@ class MyEvent:
 
 
 def canvas_device_pixel_ratio(canvas) -> float:
-    return float(getattr(canvas, "device_pixel_ratio", getattr(canvas, "_dpi_ratio", 1.0)) or 1.0)
+    return float(
+        getattr(canvas, "device_pixel_ratio", getattr(canvas, "_dpi_ratio", 1.0)) or 1.0
+    )
 
 
-def selection_scene_transform(device_pixel_ratio: float, height: float) -> QtGui.QTransform:
+def selection_scene_transform(
+    device_pixel_ratio: float, height: float
+) -> QtGui.QTransform:
     ratio = float(device_pixel_ratio or 1.0)
     return QtGui.QTransform(1 / ratio, 0, 0, -1 / ratio, 0, height)
 
@@ -211,6 +215,8 @@ class Canvas(QtWidgets.QWidget):
             self.canvas.updateGeometry()
 
     def _centerFigureCanvas(self):
+        if self.canvas is None:
+            return
         w, h = self.canvas.get_width_height()
         target_pos = QtCore.QPoint(
             max(int((self.canvas_canvas.width() - w) / 2), 0),
@@ -279,7 +285,9 @@ class Canvas(QtWidgets.QWidget):
         p = self.canvas_container.pos()
         self.selections_view.move(p.x(), p.y())
         self.selections_view.device_pixel_ratio = device_pixel_ratio
-        self.selections_scene_origin.setTransform(selection_scene_transform(device_pixel_ratio, h))
+        self.selections_scene_origin.setTransform(
+            selection_scene_transform(device_pixel_ratio, h)
+        )
 
         self.selections_view.h = h
 

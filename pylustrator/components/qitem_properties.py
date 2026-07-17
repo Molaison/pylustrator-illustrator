@@ -34,9 +34,17 @@ except ImportError:
 import matplotlib as mpl
 from matplotlib.artist import Artist
 from matplotlib.figure import Figure
+from matplotlib.legend import Legend
 from matplotlib.ticker import AutoLocator
 
+from pylustrator.artist_adapters import (
+    UnsupportedArtistError,
+    get_artist_adapter,
+    suspend_change_recording,
+)
 from pylustrator.change_tracker import getReference
+from pylustrator.commands import ObjectLocator
+from pylustrator.editor_model import EditorScene
 from pylustrator.QLinkableWidgets import (
     QColorWidget,
     CheckWidget,
@@ -46,8 +54,11 @@ from pylustrator.QLinkableWidgets import (
     ComboWidget,
 )
 from pylustrator.helper_functions import main_figure
+from pylustrator.legend_replay import (
+    UnsupportedLegendEntry,
+    replayable_legend_handles,
+)
 from pylustrator.change_tracker import UndoRedo, add_text_default, add_axes_default
-from pylustrator.snap import legend_anchor_is_point, legend_loc_transform, set_legend_point_anchor_display
 
 
 class TextPropertiesWidget(QtWidgets.QWidget):
@@ -542,21 +553,94 @@ class LegendPropertiesWidget(QtWidgets.QWidget):
         if self.target is None:
             return
 
+        target = self.target
+        adapter = get_artist_adapter(target)
+        if self.properties.get(name) != value:
+            serialization = adapter.operation_support("serialize")
+            if not serialization.supported:
+                raise UnsupportedArtistError(serialization.reason)
+            if name != "frameon":
+                try:
+                    replayable_legend_handles(target)
+                except UnsupportedLegendEntry as exc:
+                    raise UnsupportedArtistError(str(exc)) from exc
+
         old_properties = self.properties.copy()
         self.properties[name] = value
         new_properties = self.properties.copy()
-        target = self.target
+        fig = main_figure(target)
+        locator = ObjectLocator.from_artist(target)
+        axes_owner = target.axes
+        is_current_axes_legend = bool(
+            axes_owner is not None and axes_owner.get_legend() is target
+        )
+
+        def resolve_target() -> Legend:
+            if is_current_axes_legend:
+                current = axes_owner.get_legend()
+            else:
+                dragger = getattr(fig, "figure_dragger", None)
+                ensure_scene = getattr(dragger, "_ensure_editor_scene", None)
+                scene = ensure_scene() if callable(ensure_scene) else EditorScene(
+                    fig, ownership_parent=lambda _artist: None
+                )
+                current = locator.resolve(scene)
+            if not isinstance(current, Legend):
+                raise RuntimeError(
+                    "The logical Legend no longer resolves to a live object"
+                )
+            return current
+
+        def refresh_selection_after_draw() -> None:
+            dragger = getattr(fig, "figure_dragger", None)
+            # A live DragManager refreshes from Matplotlib's draw_event, after
+            # Legend packers have finalized their positions.  Lightweight
+            # embedding/test managers need the same post-draw refresh here.
+            if bool(getattr(dragger, "_selection_refresh_on_draw", False)):
+                return
+            refresh = getattr(dragger, "refresh_selection_geometry", None)
+            if callable(refresh):
+                refresh()
+                return
+            selection = getattr(fig, "selection", None)
+            if selection is not None:
+                update_extent = getattr(selection, "update_extent", None)
+                if callable(update_extent):
+                    update_extent()
+                selection.update_selection_rectangles()
+
+        # Frame visibility is an appearance property.  Reconstructing a
+        # Legend for it changes object identity, discards direct edits to its
+        # children, and leaves stale selection/undo references behind.
+        if name == "frameon":
+            if old_properties[name] == new_properties[name]:
+                return
+
+            def setFrameOn(visible):
+                current = resolve_target()
+                get_artist_adapter(current).set_frame_on(visible)
+                self.properties[name] = bool(visible)
+                self.target = current
+                fig.figure_dragger.select_element(current)
+                fig.canvas.draw()
+                refresh_selection_after_draw()
+
+            def undo():
+                setFrameOn(old_properties[name])
+
+            def redo():
+                setFrameOn(new_properties[name])
+
+            redo()
+            fig.change_tracker.addEdit([undo, redo, f"Legend {name}"])
+            return
 
         def setProperties(properties):
             nonlocal target
-            handles = target.legend_handles
+            target = resolve_target()
+            handles = replayable_legend_handles(target)
             labels = [text.get_text() for text in target.get_texts()]
-            old_loc = target._loc
-            old_anchor = target.get_bbox_to_anchor()
-            old_point_anchor = legend_anchor_is_point(target)
-            if old_point_anchor:
-                anchor_point = old_anchor.p0
-            bbox = target.get_frame().get_bbox()
+            legend_state = get_artist_adapter(target).snapshot()
             axes = target.axes
             fig = main_figure(target)
             if axes is None:
@@ -566,20 +650,14 @@ class LegendPropertiesWidget(QtWidgets.QWidget):
             else:
                 axes.legend(handles=handles, labels=labels, **properties)
                 target = axes.get_legend()
-            if old_point_anchor:
-                set_legend_point_anchor_display(target, anchor_point)
-                target._set_loc(old_loc)
-            else:
-                target._set_loc(
-                    tuple(
-                        legend_loc_transform(target).transform(tuple([bbox.x0, bbox.y0]))
-                    )
-                )
-            fig.change_tracker.addNewLegendChange(target)
+            with suspend_change_recording():
+                get_artist_adapter(target).restore(legend_state)
+            get_artist_adapter(target).record_changes()
             fig.figure_dragger.make_draggable(target)
             fig.figure_dragger.select_element(target)
+            self.target = target
             fig.canvas.draw()
-            fig.selection.update_selection_rectangles()
+            refresh_selection_after_draw()
 
         def undo():
             setProperties(old_properties)
@@ -600,6 +678,15 @@ class LegendPropertiesWidget(QtWidgets.QWidget):
                 self.target_list = []
             else:
                 self.target_list = [element]
+        serialization = get_artist_adapter(element).operation_support("serialize")
+        try:
+            replayable_legend_handles(element)
+        except UnsupportedLegendEntry as exc:
+            reconstruction_supported = False
+            reconstruction_reason = str(exc)
+        else:
+            reconstruction_supported = True
+            reconstruction_reason = None
         self.target = None
         for name, name2, type_, default_, icon in self.property_names:
             if name2 == "frameon":
@@ -618,6 +705,15 @@ class LegendPropertiesWidget(QtWidgets.QWidget):
                 self.widgets[name].setValue(value)
             except AttributeError:
                 self.widgets[name].set(value)
+            property_supported = serialization.supported and (
+                name2 == "frameon" or reconstruction_supported
+            )
+            self.widgets[name].setEnabled(property_supported)
+            self.widgets[name].setToolTip(
+                name
+                if property_supported
+                else serialization.reason or reconstruction_reason
+            )
             self.properties[name] = value
 
         self.target = element
@@ -1525,8 +1621,11 @@ class QItemProperties(QtWidgets.QWidget):
     def buttonLegendClicked(self):
         """add a legend to the target"""
         self.element.legend()
-        self.fig.change_tracker.addChange(self.element, ".legend()")
-        self.fig.figure_dragger.make_draggable(self.element.get_legend())
+        legend = self.element.get_legend()
+        self.fig.change_tracker.addChange(
+            self.element, ".legend()", legend, ".legend"
+        )
+        self.fig.figure_dragger.make_draggable(legend)
         self.fig.canvas.draw()
         self.signals.figure_element_child_created.emit(self.element)
 
