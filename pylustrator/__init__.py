@@ -39,6 +39,27 @@ from .helper_functions import (
 from .QtGui import initialize as StartColorChooser
 from .lab_colormap import LabColormap
 from .helper_functions import loadFigureFromFile as load
+from .artist_adapters import (
+    ArtistAdapter,
+    ArtistAdapterRegistry,
+    ArtistCapabilities,
+    ChangeRecord,
+    RigidRotationPlan,
+    UnsupportedArtistError,
+    get_artist_adapter,
+    register_artist_adapter,
+)
+from .interaction import HitCandidate, HitStack, SelectionKernel, SelectionMode
+from .legend_replay import UnsupportedLegendEntry, register_legend_entry_serializer
+from .editor_model import EditorGroup, EditorScene
+from .operations import OperationSupport, TransformIntent, TransformOperation
+from .transform_engine import TransformPlan, TransformPreflightError
+from .commands import (
+    GENERATED_STATE_VERSION,
+    ObjectLocator,
+    migrate_generated_command,
+    migrate_generated_source,
+)
 
 __version__ = "1.3.0"
 
@@ -61,4 +82,29 @@ __all__ = [
     "StartColorChooser",
     "LabColormap",
     "load",
+    "ArtistAdapter",
+    "ArtistAdapterRegistry",
+    "ArtistCapabilities",
+    "ChangeRecord",
+    "RigidRotationPlan",
+    "UnsupportedArtistError",
+    "get_artist_adapter",
+    "register_artist_adapter",
+    "UnsupportedLegendEntry",
+    "register_legend_entry_serializer",
+    "HitCandidate",
+    "HitStack",
+    "SelectionKernel",
+    "SelectionMode",
+    "EditorGroup",
+    "EditorScene",
+    "OperationSupport",
+    "TransformIntent",
+    "TransformOperation",
+    "TransformPlan",
+    "TransformPreflightError",
+    "GENERATED_STATE_VERSION",
+    "ObjectLocator",
+    "migrate_generated_command",
+    "migrate_generated_source",
 ]

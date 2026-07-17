@@ -212,7 +212,7 @@ class Linkable:
         try:
             self.set(self.getLinkedProperty())
             self.setEnabled(self.condition(element))
-        except AttributeError:
+        except (AttributeError, TypeError, ValueError):
             self.hide()
         else:
             self.show()
@@ -228,6 +228,37 @@ class Linkable:
 
     def updateLink(self):
         """update the linked property"""
+        if isinstance(self.element, mpl.figure.Figure):
+            fig = self.element
+        else:
+            fig = main_figure(self.element)
+        tracker = fig.change_tracker
+
+        # Tick-label text is owned by an Axis formatter.  Treating it as an
+        # ordinary Text property appears to work until canvas.draw(), which
+        # immediately writes the formatter output back over the edit.  Route
+        # any selection containing a tick label through the semantic property
+        # transaction before entering the legacy per-Artist setter path.
+        if self.property_name == "text" and isinstance(self.element, Text):
+            from .property_adapters import edit_text_content_if_axis_managed
+
+            selection = getattr(fig, "selection", None)
+            selected_targets = [
+                wrapper.target
+                for wrapper in getattr(selection, "targets", ())
+                if hasattr(wrapper, "target")
+            ]
+            if edit_text_content_if_axis_managed(
+                self.element,
+                self.get(),
+                selected_targets,
+            ):
+                if hasattr(self, "last_text"):
+                    self.last_text = self.input1.text()
+                return
+
+        capture = getattr(tracker, "capture_recording_state", None)
+        recording_before = capture() if capture is not None else None
         old_value = self.getLinkedPropertyAll()
 
         try:
@@ -259,23 +290,24 @@ class Linkable:
             def save_change(element):
                 element.figure.change_tracker.addNewAxesChange(element)
 
-        def undo():
-            for elem, property_name, value in old_value:
+        def apply(values, recording_state):
+            for elem, property_name, value in values:
                 getattr(elem, "set_" + property_name, lambda x: None)(value)
-                save_change(elem)
+                if recording_state is None:
+                    save_change(elem)
+            restore_recording = getattr(tracker, "restore_recording_state", None)
+            if recording_state is not None and restore_recording is not None:
+                restore_recording(recording_state)
+
+        def undo():
+            apply(old_value, recording_before)
 
         def redo():
-            for elem, property_name, value in new_value:
-                getattr(elem, "set_" + property_name, lambda x: None)(value)
-                save_change(elem)
+            apply(new_value, recording_after)
 
-        element = elements[0]
-        if isinstance(element, Figure):
-            fig = element
-        else:
-            fig = main_figure(element)
-
-        save_change(element)
+        for element in elements:
+            save_change(element)
+        recording_after = capture() if capture is not None else None
         fig.change_tracker.addEdit([undo, redo, "Change property"])
         fig.canvas.draw()
         main_figure(self.element).signals.figure_selection_property_changed.emit()
@@ -604,6 +636,11 @@ class NumberWidget(QtWidgets.QWidget, Linkable):
 
     def setValue(self, text: float, signal=False):
         """set the value of the spin box"""
+        if isinstance(text, (list, tuple, np.ndarray)):
+            values = np.asarray(text, dtype=float).ravel()
+            if values.size != 1:
+                raise TypeError("NumberWidget can only display scalar values")
+            text = float(values[0])
         self.noSignal = True
         self.input1.setValue(text)
         self.noSignal = False
