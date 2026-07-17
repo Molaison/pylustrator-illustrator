@@ -68,7 +68,9 @@ python script (before your ``plt.show()``) that defines these changes:
     #% start: automatic generated code from pylustrator
     plt.figure(1).ax_dict = {ax.get_label(): ax for ax in plt.figure(1).axes}
     import matplotlib as mpl
+    import numpy as np
     getattr(plt.figure(1), '_pylustrator_init', lambda: ...)()
+    plt.figure(1)._pylustrator_generated_version = 2
     plt.figure(1).set_size_inches(9.980000/2.54, 11.660000/2.54, forward=True)
     plt.figure(1).axes[0].set(position=[0.1531, 0.1557, 0.7968, 0.3141], xlabel='time', ylabel='amplitude')
     plt.figure(1).axes[0].set_position([0.151600, 0.127337, 0.788696, 0.324652])
@@ -130,4 +132,5 @@ account.
 
    styling
    composing
+   source_doctor
    api

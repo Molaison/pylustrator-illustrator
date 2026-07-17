@@ -106,3 +106,11 @@ accepted during replay and rewritten through the public migration helpers.
    :members:
 
 .. autofunction:: pylustrator.migrate_generated_source
+
+.. autofunction:: pylustrator.diagnose_generated_source
+
+.. autoclass:: pylustrator.SourceDiagnostic
+   :members:
+
+.. autoclass:: pylustrator.SourceDoctorReport
+   :members:

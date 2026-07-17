@@ -60,6 +60,11 @@ from .commands import (
     migrate_generated_command,
     migrate_generated_source,
 )
+from .source_doctor import (
+    SourceDiagnostic,
+    SourceDoctorReport,
+    diagnose_generated_source,
+)
 
 __version__ = "1.3.0"
 
@@ -107,4 +112,7 @@ __all__ = [
     "ObjectLocator",
     "migrate_generated_command",
     "migrate_generated_source",
+    "SourceDiagnostic",
+    "SourceDoctorReport",
+    "diagnose_generated_source",
 ]

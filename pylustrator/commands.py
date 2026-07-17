@@ -12,9 +12,12 @@ from matplotlib.artist import Artist
 
 from .editor_model import EditorGroup, EditorScene
 from .legend_replay import axes_handles_reproduce_legend
+from .source_migration import (
+    GENERATED_STATE_VERSION,
+    migrate_generated_command,
+    migrate_generated_source,
+)
 
-
-GENERATED_STATE_VERSION = 2
 
 
 def semantic_equal(
@@ -155,25 +158,6 @@ class ObjectLocator:
             if len(matches) == 1:
                 return matches[0]
         return None
-
-
-def migrate_generated_command(command: str, from_version: int = 0) -> str:
-    """Upgrade one legacy generated command to the current locator surface."""
-
-    migrated = str(command)
-    if from_version < 2:
-        migrated = migrated.replace(
-            ".get_legend_handles_labels()[0]", ".get_legend().legend_handles"
-        )
-    return migrated
-
-
-def migrate_generated_source(source: str, from_version: int = 0) -> str:
-    """Upgrade a generated Pylustrator block without executing it."""
-
-    return "\n".join(
-        migrate_generated_command(line, from_version) for line in source.splitlines()
-    ) + ("\n" if source.endswith("\n") else "")
 
 
 def install_legacy_legend_replay_compatibility(figure) -> None:
