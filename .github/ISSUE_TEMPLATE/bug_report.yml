@@ -1,0 +1,89 @@
+name: Fork bug report
+description: Report incorrect interaction, geometry, undo, replay, or UI behavior in this fork.
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting a problem. Please use a minimal figure when possible and remove private data before attaching generated source.
+
+  - type: checkboxes
+    id: fork_check
+    attributes:
+      label: Fork confirmation
+      options:
+        - label: I reproduced this with `Molaison/pylustrator-illustrator`, not only upstream Pylustrator.
+          required: true
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Describe the selected object, operation, preview, committed result, and any exception.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: operation
+    attributes:
+      label: Operation
+      multiple: true
+      options:
+        - Selection or click-through
+        - Move or drag preview
+        - Resize or aspect lock
+        - Rotate or pivot
+        - Align, distribute, or key object
+        - Text or axis-label editing
+        - Legend editing
+        - Undo or redo
+        - Save, generated source, or replay
+        - Performance
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: artists
+    attributes:
+      label: Matplotlib artist types
+      description: For example Text, Legend, Line2D, PathCollection, Axes, or mixed selection.
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Include the smallest Python script and exact interaction sequence that reproduces the issue.
+      render: python
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include fork commit, Python, Matplotlib, NumPy, Qt binding, OS, and display environment.
+      placeholder: |
+        Fork commit:
+        Python:
+        Matplotlib:
+        NumPy:
+        Qt/PyQt:
+        OS/display:
+    validations:
+      required: true
+
+  - type: textarea
+    id: generated_source
+    attributes:
+      label: Relevant generated source or traceback
+      description: Paste only the relevant generated block or traceback. Remove tokens, private paths, and private data.
+      render: text
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: Describe the Illustrator-style behavior you expected and whether geometry, selection, undo, and replay should change.
+    validations:
+      required: true

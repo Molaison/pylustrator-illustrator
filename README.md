@@ -110,6 +110,40 @@ Please refer to the upstream
 application and usage guide. Fork-specific architecture and behavior are
 documented in this repository.
 
+## Installation
+
+This fork deliberately does not publish a package under the upstream
+`pylustrator` distribution name. Running `pip install pylustrator` installs the
+upstream project, not the interaction architecture described above.
+
+Install this fork directly from GitHub:
+
+```bash
+python -m pip install "pylustrator @ git+https://github.com/Molaison/pylustrator-illustrator.git@main"
+```
+
+With `uv`:
+
+```bash
+uv pip install "pylustrator @ git+https://github.com/Molaison/pylustrator-illustrator.git@main"
+```
+
+For reproducible environments, replace `main` with a release tag or a full
+commit SHA. The import name remains unchanged:
+
+```python
+import pylustrator
+```
+
+For development, clone the fork and install all test and documentation
+dependencies:
+
+```bash
+git clone https://github.com/Molaison/pylustrator-illustrator.git
+cd pylustrator-illustrator
+uv sync --locked --all-extras --dev
+```
+
 ## Issues, Questions, and Suggestions
 
 Please submit your questions, suggestions, and bug reports to the

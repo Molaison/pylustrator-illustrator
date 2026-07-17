@@ -1,0 +1,55 @@
+name: Fork feature request
+description: Propose an interaction or workflow improvement for this fork.
+title: "[Feature]: "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: User problem
+      description: Explain the scientific-figure workflow that is difficult today, before proposing a control or implementation.
+    validations:
+      required: true
+
+  - type: textarea
+    id: interaction
+    attributes:
+      label: Expected interaction
+      description: Describe selection, preview, commit, cancellation, undo/redo, and replay behavior.
+    validations:
+      required: true
+
+  - type: input
+    id: artists
+    attributes:
+      label: Affected artist types
+      description: List the Matplotlib artist types or semantic roles involved.
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Scope
+      options:
+        - Interaction correctness
+        - Semantic transform or property editing
+        - Smart guides or direct editing
+        - Clipboard or productivity workflow
+        - Performance
+        - Persistence or migration
+        - Adapter API or third-party extension
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproducibility
+    attributes:
+      label: Reproducibility requirements
+      description: Explain what generated Python, undo/redo, and reopening the figure must preserve.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Note any current workaround or related Adobe Illustrator behavior.
