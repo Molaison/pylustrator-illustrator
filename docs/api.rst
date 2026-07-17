@@ -96,6 +96,10 @@ Legend reflow likewise uses a frozen ``LegendLayoutPlan`` and layout-only
 state.  Its v1 ``LegendLayoutSpec`` changes columns and spacing while retaining
 every persistent Legend leaf; unsupported/custom packer trees reject before
 mutation.
+The shared rigid-rotation pivot is selection-level editor state, stored in
+physical Figure coordinates rather than in an Artist snapshot or generated
+source. Moving that overlay therefore never dirties the document; handle and
+toolbar rotation still consume the same absolute transform plan.
 
 Generated blocks carry a schema version.  Legacy proxy-legend references are
 accepted during replay and rewritten through the public migration helpers.

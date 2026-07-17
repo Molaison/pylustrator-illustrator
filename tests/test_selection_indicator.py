@@ -38,7 +38,7 @@ from pylustrator.components.plot_layout import (
     selection_scene_transform,
 )
 from pylustrator.components.align import Align
-from pylustrator.components.qpos_and_size import QPosAndSize
+from pylustrator.components.qpos_and_size import QPosAndSize, ReferencePointWidget
 from pylustrator.components.tree_view import MyTreeView
 from pylustrator.drag_helper import (
     DIR_X0,
@@ -2610,6 +2610,451 @@ def test_toolbar_multi_rotation_uses_shared_reference_pivot_and_one_undo() -> No
         for artist, rotated in zip((first, second), after)
     )
     manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_custom_rotation_pivot_is_physical_non_document_state(monkeypatch) -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    artists = [
+        ax.add_patch(
+            Polygon([[0.2, 0.25], [0.35, 0.27], [0.28, 0.42]], closed=True)
+        ),
+        ax.add_patch(
+            Polygon([[0.58, 0.55], [0.74, 0.57], [0.66, 0.72]], closed=True)
+        ),
+    ]
+    for artist in artists:
+        artist.set_clip_on(False)
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_elements(artists, primary=artists[-1])
+    selection = manager.selection
+    before = [TargetWrapper(artist).get_positions().copy() for artist in artists]
+    draw_calls = []
+    original_draw = fig.canvas.draw
+    monkeypatch.setattr(fig.canvas, "draw", lambda *args, **kwargs: draw_calls.append(1))
+
+    assert selection.set_rotation_pivot((85.0, 70.0)) == (85.0, 70.0)
+
+    assert np.allclose(selection.custom_rotation_pivot_state(), (0.85, 0.7))
+    assert np.allclose(selection.rotation_pivot(), (85.0, 70.0))
+    assert not draw_calls
+    assert not fig.change_tracker.edits
+    assert not fig.change_tracker.changes
+    assert all(
+        np.allclose(TargetWrapper(artist).get_positions(), state)
+        for artist, state in zip(artists, before)
+    )
+
+    monkeypatch.setattr(fig.canvas, "draw", original_draw)
+    fig.set_dpi(200)
+    assert np.allclose(selection.custom_rotation_pivot_position(), (170.0, 140.0))
+    fig.set_size_inches(7, 5, forward=False)
+    assert np.allclose(selection.custom_rotation_pivot_position(), (170.0, 140.0))
+    selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_toolbar_rotation_uses_custom_pivot_and_undo_restores_pivot_state() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    first = ax.add_patch(
+        Polygon([[0.22, 0.24], [0.36, 0.27], [0.29, 0.42]], closed=True)
+    )
+    second = ax.add_patch(
+        Polygon([[0.57, 0.53], [0.72, 0.57], [0.64, 0.71]], closed=True)
+    )
+    for artist in (first, second):
+        artist.set_clip_on(False)
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_elements([first, second], primary=second)
+    selection = manager.selection
+    selection.set_alignment_reference("key_object", key=first)
+    selection.set_reference_point((0.0, 0.0))
+    custom = np.array([175.0, 128.0])
+    selection.set_rotation_pivot(custom)
+    custom_state = selection.custom_rotation_pivot_state()
+    before = [TargetWrapper(artist).get_positions().copy() for artist in (first, second)]
+    matrix = TargetWrapper(first).adapter.display_rotation_matrix(17.0, custom)
+
+    assert selection.rotate_selection(17.0)
+    fig.canvas.draw()
+    after = [TargetWrapper(artist).get_positions().copy() for artist in (first, second)]
+
+    for original, current in zip(before, after):
+        expected = TargetWrapper(first).adapter._transform_points(matrix, original)
+        assert np.allclose(current, expected, atol=1e-8)
+    assert len(fig.change_tracker.edits) == 1
+    assert selection.custom_rotation_pivot_state() == custom_state
+    assert manager.selected_element is second
+    assert selection.alignment_key is first
+
+    undo, redo = fig.change_tracker.edit[:2]
+    selection.set_reference_point((1.0, 1.0))
+    assert selection.custom_rotation_pivot_state() is None
+    undo()
+    fig.canvas.draw()
+    assert selection.reference_point == (0.0, 0.0)
+    assert selection.custom_rotation_pivot_state() == custom_state
+    assert np.allclose(selection.rotation_pivot(), custom)
+    assert manager.selected_element is second
+    assert selection.alignment_key is first
+    redo()
+    fig.canvas.draw()
+    assert selection.reference_point == (0.0, 0.0)
+    assert selection.custom_rotation_pivot_state() == custom_state
+    assert all(
+        np.allclose(TargetWrapper(artist).get_positions(), state, atol=1e-8)
+        for artist, state in zip((first, second), after)
+    )
+    selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_rotation_handle_uses_custom_pivot_and_keeps_a_nonzero_lever_arm() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    artists = [
+        ax.add_patch(
+            Polygon([[0.22, 0.27], [0.36, 0.29], [0.29, 0.44]], closed=True)
+        ),
+        ax.add_patch(
+            Polygon([[0.57, 0.52], [0.73, 0.56], [0.64, 0.7]], closed=True)
+        ),
+    ]
+    for artist in artists:
+        artist.set_clip_on(False)
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_elements(artists, primary=artists[-1])
+    selection = manager.selection
+    original_handle = np.asarray(selection.rotation_grabber.get_xy(), dtype=float)
+    selection.set_rotation_pivot(original_handle)
+    pivot = selection.rotation_pivot().copy()
+    handle = np.asarray(selection.rotation_grabber.get_xy(), dtype=float)
+
+    assert np.linalg.norm(handle - pivot) > 12.0
+    before = [TargetWrapper(artist).get_positions().copy() for artist in artists]
+    vector = handle - pivot
+    requested = np.deg2rad(37.0)
+    pointer = pivot + np.array(
+        [
+            vector[0] * np.cos(requested) - vector[1] * np.sin(requested),
+            vector[0] * np.sin(requested) + vector[1] * np.cos(requested),
+        ]
+    )
+    selection.start_rotation(SimpleNamespace(x=handle[0], y=handle[1], key=None))
+    assert selection.preview_rotation(
+        SimpleNamespace(x=pointer[0], y=pointer[1], key="shift")
+    ) == pytest.approx(30.0)
+    matrix = TargetWrapper(artists[0]).adapter.display_rotation_matrix(30.0, pivot)
+    for artist, original in zip(artists, before):
+        expected = TargetWrapper(artist).adapter._transform_points(matrix, original)
+        assert np.allclose(TargetWrapper(artist).get_positions(), expected, atol=1e-8)
+    assert selection.end_rotation()
+    selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_escape_cancels_pivot_drag_without_mutating_document_or_selection() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    artists = [
+        ax.add_patch(Polygon([[0.2, 0.25], [0.35, 0.28], [0.28, 0.43]])),
+        ax.add_patch(Polygon([[0.58, 0.53], [0.73, 0.57], [0.65, 0.71]])),
+    ]
+    for artist in artists:
+        artist.set_clip_on(False)
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_elements(artists, primary=artists[-1])
+    selection = manager.selection
+    original_pivot = np.array([132.0, 104.0])
+    selection.set_rotation_pivot(original_pivot)
+    original_state = selection.custom_rotation_pivot_state()
+    artist_states = [TargetWrapper(artist).get_positions().copy() for artist in artists]
+    grabber = selection.rotation_grabber
+
+    grabber.pivot_button_press_event(
+        SimpleNamespace(x=original_pivot[0], y=original_pivot[1])
+    )
+    grabber.on_pivot_motion(SimpleNamespace(x=78.0, y=62.0))
+    assert np.allclose(selection.rotation_pivot(), (78.0, 62.0))
+    manager.key_press_event(SimpleNamespace(key="escape"))
+
+    assert selection.custom_rotation_pivot_state() == original_state
+    assert np.allclose(selection.rotation_pivot(), original_pivot)
+    assert not grabber.pivot_got_artist
+    assert [target.target for target in selection.targets] == artists
+    assert manager.selected_element is artists[-1]
+    assert not fig.change_tracker.edits
+    assert not fig.change_tracker.changes
+    assert all(
+        np.allclose(TargetWrapper(artist).get_positions(), state)
+        for artist, state in zip(artists, artist_states)
+    )
+    selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_same_reference_locator_click_resets_custom_rotation_pivot() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    artists = [
+        ax.add_patch(Polygon([[0.2, 0.2], [0.36, 0.24], [0.29, 0.4]])),
+        ax.add_patch(Polygon([[0.58, 0.52], [0.74, 0.56], [0.65, 0.7]])),
+    ]
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_elements(artists, primary=artists[-1])
+    selection = manager.selection
+    selection.set_rotation_pivot((120.0, 90.0))
+    widget = ReferencePointWidget()
+    widget.referenceChanged.connect(selection.set_reference_point)
+
+    widget.setValue(widget.value(), emit=True)
+
+    assert selection.reference_point == (0.5, 0.5)
+    assert selection.custom_rotation_pivot_state() is None
+    assert np.allclose(selection.rotation_pivot(), selection.reference_position())
+    widget.deleteLater()
+    selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_custom_pivot_survives_primary_change_and_interaction_state_restore() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    artists = [
+        ax.add_patch(Polygon([[0.15, 0.2], [0.28, 0.23], [0.22, 0.37]])),
+        ax.add_patch(Polygon([[0.43, 0.45], [0.57, 0.48], [0.5, 0.63]])),
+        ax.add_patch(Polygon([[0.7, 0.22], [0.84, 0.25], [0.77, 0.4]])),
+    ]
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_elements(artists[:2], primary=artists[1])
+    selection = manager.selection
+    selection.set_reference_point((0.0, 1.0))
+    selection.set_rotation_pivot((145.0, 112.0))
+    pivot_state = selection.custom_rotation_pivot_state()
+
+    manager.select_elements(artists[:2], primary=artists[0])
+    assert selection.custom_rotation_pivot_state() == pivot_state
+    assert manager.selected_element is artists[0]
+    interaction = manager.capture_interaction_state()
+
+    manager.select_element(artists[2])
+    assert selection.custom_rotation_pivot_state() is None
+    manager.restore_interaction_state(interaction)
+
+    assert [target.target for target in selection.targets] == [artists[1], artists[0]]
+    assert manager.selected_element is artists[0]
+    assert selection.reference_point == (0.0, 1.0)
+    assert selection.custom_rotation_pivot_state() == pivot_state
+    assert np.allclose(selection.rotation_pivot(), (145.0, 112.0))
+    selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_group_undo_restores_the_pre_group_custom_pivot() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    first = ax.add_patch(Polygon([[0.2, 0.22], [0.35, 0.25], [0.28, 0.4]]))
+    second = ax.add_patch(Polygon([[0.58, 0.52], [0.74, 0.56], [0.65, 0.71]]))
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_elements([first, second], primary=second)
+    selection = manager.selection
+    selection.set_reference_point((1.0, 0.0))
+    selection.set_rotation_pivot((142.0, 108.0))
+    pivot_state = selection.custom_rotation_pivot_state()
+
+    group = manager.group_selection("Pivot group")
+
+    assert [target.target for target in selection.targets] == [group]
+    assert selection.custom_rotation_pivot_state() is None
+    undo, redo = fig.change_tracker.edit[:2]
+    undo()
+    assert [target.target for target in selection.targets] == [first, second]
+    assert manager.selected_element is second
+    assert selection.reference_point == (1.0, 0.0)
+    assert selection.custom_rotation_pivot_state() == pivot_state
+    assert np.allclose(selection.rotation_pivot(), (142.0, 108.0))
+    redo()
+    assert len(selection.targets) == 1
+    assert selection.targets[0].target.group_id == group.group_id
+    assert selection.custom_rotation_pivot_state() is None
+    selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_custom_pivot_survives_failed_rotation_preflight_without_mutation() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    artists = [
+        ax.add_patch(Polygon([[0.08, 0.08], [0.2, 0.1], [0.13, 0.23]])),
+        ax.add_patch(Polygon([[0.72, 0.72], [0.86, 0.75], [0.79, 0.89]])),
+    ]
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_elements(artists, primary=artists[-1])
+    selection = manager.selection
+    selection.set_rotation_pivot((55.0, 45.0))
+    pivot_state = selection.custom_rotation_pivot_state()
+    before = [TargetWrapper(artist).get_positions().copy() for artist in artists]
+
+    with pytest.raises(UnsupportedArtistError, match="clip"):
+        selection.rotate_selection(90.0)
+
+    assert selection.custom_rotation_pivot_state() == pivot_state
+    assert np.allclose(selection.rotation_pivot(), (55.0, 45.0))
+    assert all(
+        np.allclose(TargetWrapper(artist).get_positions(), state)
+        for artist, state in zip(artists, before)
+    )
+    assert not fig.change_tracker.edits
+    assert not fig.change_tracker.changes
+    selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_pivot_drag_release_commits_only_editor_state() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    artists = [
+        ax.add_patch(Polygon([[0.2, 0.23], [0.35, 0.26], [0.28, 0.41]])),
+        ax.add_patch(Polygon([[0.58, 0.53], [0.73, 0.56], [0.65, 0.7]])),
+    ]
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_elements(artists, primary=artists[-1])
+    selection = manager.selection
+    before = [TargetWrapper(artist).get_positions().copy() for artist in artists]
+    start = selection.rotation_pivot().copy()
+    destination = np.array([96.0, 76.0])
+    grabber = selection.rotation_grabber
+    update_emissions = []
+    fig.signals.figure_selection_update.connect(
+        lambda: update_emissions.append(True)
+    )
+
+    grabber.pivot_button_press_event(SimpleNamespace(x=start[0], y=start[1]))
+    grabber.on_pivot_motion(
+        SimpleNamespace(x=destination[0], y=destination[1])
+    )
+    assert not update_emissions
+    grabber.pivot_button_release_event(
+        SimpleNamespace(x=destination[0], y=destination[1])
+    )
+
+    assert np.allclose(selection.rotation_pivot(), destination)
+    assert len(update_emissions) == 1
+    assert not grabber.pivot_got_artist
+    assert not fig.change_tracker.edits
+    assert not fig.change_tracker.changes
+    assert all(
+        np.allclose(TargetWrapper(artist).get_positions(), state)
+        for artist, state in zip(artists, before)
+    )
+    selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_rotation_history_insertion_failure_rolls_back_the_entire_gesture() -> None:
+    from pylustrator.change_tracker import ChangeTracker as RealChangeTracker
+
+    class RaisingSignal:
+        def emit(self, *_args):
+            raise RuntimeError("simulated history insertion failure")
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    artists = [
+        ax.add_patch(Polygon([[0.2, 0.23], [0.35, 0.26], [0.28, 0.41]])),
+        ax.add_patch(Polygon([[0.58, 0.53], [0.73, 0.56], [0.65, 0.7]])),
+    ]
+    for artist in artists:
+        artist.set_clip_on(False)
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_elements(artists, primary=artists[-1])
+    selection = manager.selection
+    selection.set_reference_point((0.0, 1.0))
+    selection.set_rotation_pivot((132.0, 102.0))
+    pivot_state = selection.custom_rotation_pivot_state()
+    before = [TargetWrapper(artist).get_positions().copy() for artist in artists]
+
+    tracker = RealChangeTracker.__new__(RealChangeTracker)
+    tracker.figure = fig
+    tracker.changes = {}
+    tracker.saved = True
+    tracker.edits = []
+    tracker.last_edit = -1
+    tracker.update_changes_signal = None
+    tracker.no_save = False
+    fig.change_tracker = tracker
+    recording_before = tracker.capture_recording_state()
+    original_add_edit = tracker.addEdit
+
+    def fail_after_history_insert(edit):
+        tracker.update_changes_signal = RaisingSignal()
+        try:
+            original_add_edit(edit)
+        finally:
+            tracker.update_changes_signal = None
+
+    tracker.addEdit = fail_after_history_insert
+
+    with pytest.raises(RuntimeError, match="history insertion failure"):
+        selection.rotate_selection(17.0)
+
+    assert all(
+        np.allclose(TargetWrapper(artist).get_positions(), state)
+        for artist, state in zip(artists, before)
+    )
+    assert tracker.capture_recording_state() == recording_before
+    assert tracker.edits == []
+    assert tracker.last_edit == -1
+    assert selection.reference_point == (0.0, 1.0)
+    assert selection.custom_rotation_pivot_state() == pivot_state
+    assert np.allclose(selection.rotation_pivot(), (132.0, 102.0))
+    assert [target.target for target in selection.targets] == artists
+    assert manager.selected_element is artists[-1]
+    selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_native_only_rotation_never_accepts_a_custom_pivot() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    text = ax.text(0.3, 0.5, "native angle only")
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_element(text)
+    selection = manager.selection
+
+    assert selection.rotation_operation() is TransformOperation.ROTATE
+    assert not selection.custom_rotation_pivot_supported()
+    with pytest.raises(UnsupportedArtistError, match="shared rigid-rotation"):
+        selection.set_rotation_pivot((120.0, 90.0))
+    assert selection.custom_rotation_pivot_state() is None
+    assert not selection.rotation_grabber.pivot_marker.isVisible()
+    assert not fig.change_tracker.edits
+    assert not fig.change_tracker.changes
+    selection.clear_targets()
     plt.close(fig)
     assert app is not None
 

@@ -68,8 +68,10 @@ the user-facing interaction rules shared.
   key object without allowing stale key-object mode to intercept ordinary
   single-object drags.
 - Resize and rotation use preflighted transform plans and stable pivots;
-  multi-object rotation uses one shared display-space pivot rather than
-  unrelated local angle changes.
+  multi-object rotation uses one shared pivot rather than unrelated local
+  angle changes. When every selected object supports exact rigid rotation, the
+  on-canvas pivot can be dragged anywhere on or beyond the artboard; native-only
+  rotation keeps the object's real fixed pivot.
 - The Align panel separates geometry scale from explicit appearance scale.
   `A+`/`A−` change supported font, stroke, and marker dimensions without moving
   coordinates or reflowing layout; mixed selections are preflighted and undo
@@ -106,7 +108,7 @@ and the extension API is introduced in the [API documentation](docs/api.rst).
 
 At the current fork milestone on 2026-07-17:
 
-- the full test suite passed with **851 passed and 147 skipped**;
+- the full test suite passed with **862 passed and 147 skipped**;
 - Ruff and Ty completed successfully, with an explicit incremental type-check
   baseline for the dynamic Matplotlib/Qt interaction modules; and
 - the real multi-panel Fig2 workflow was used to validate selection, movement,

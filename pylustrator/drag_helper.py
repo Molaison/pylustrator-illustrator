@@ -325,6 +325,7 @@ class GrabbableRectangleSelection(GrabFunctions):
         self.target_bounds = []
         self.lock_aspect_ratio = False
         self.reference_point = (0.5, 0.5)
+        self._custom_rotation_pivot_inches = None
         self.alignment_reference_mode = "selection"
         self.alignment_key = None
         self.defer_artist_updates = True
@@ -338,6 +339,8 @@ class GrabbableRectangleSelection(GrabFunctions):
         target = TargetWrapper(target)
         if not target.supported:
             return
+        if not getattr(self, "_batch_add_targets", False):
+            self._clear_custom_rotation_pivot()
 
         new_points = np.array(target.get_selection_points())
         if len(new_points) == 0:
@@ -1013,6 +1016,9 @@ class GrabbableRectangleSelection(GrabFunctions):
             )
         if self.rotation_operation() is TransformOperation.ROTATE:
             return np.asarray(self.targets[0].get_rotation_pivot(), dtype=float)
+        custom = self.custom_rotation_pivot_position()
+        if custom is not None:
+            return custom
         return np.asarray(self.reference_position(), dtype=float)
 
     def start_rotation(self, event: MouseEvent) -> None:
@@ -1211,7 +1217,7 @@ class GrabbableRectangleSelection(GrabFunctions):
 
         plans = ()
         if operation is TransformOperation.RIGID_ROTATE:
-            pivot = self.reference_position()
+            pivot = self.rotation_pivot()
             with selection_geometry_snapshot():
                 plans = tuple(
                     target.plan_rigid_rotation(angle_degrees, pivot)
@@ -1327,6 +1333,7 @@ class GrabbableRectangleSelection(GrabFunctions):
         targets_non_wrapped = [t.target for t in self.targets]
         if target not in targets_non_wrapped:
             return
+        self.rotation_grabber.cancel_pivot_event(restore=True)
         index = targets_non_wrapped.index(target)
         self._clear_preview(self.targets[index])
         self.targets.pop(index)
@@ -1335,6 +1342,7 @@ class GrabbableRectangleSelection(GrabFunctions):
         rect2 = self.targets_rects.pop(index * 2)
         rect1.scene().removeItem(rect1)
         rect2.scene().removeItem(rect2)
+        self._clear_custom_rotation_pivot()
         # self.figure.patches.remove(rect1)
         # self.figure.patches.remove(rect2)
         if len(self.targets) == 0:
@@ -1350,6 +1358,11 @@ class GrabbableRectangleSelection(GrabFunctions):
         """update the position of the grabber elements"""
         self._grabber_scale_supported = self.do_target_scale()
         self._grabber_rotation_supported = self.rotation_handle_supported()
+        if (
+            self._custom_rotation_pivot_inches is not None
+            and not self.custom_rotation_pivot_supported()
+        ):
+            self._clear_custom_rotation_pivot()
         self._position_grabbers(
             self._grabber_scale_supported,
             self._grabber_rotation_supported,
@@ -1375,8 +1388,9 @@ class GrabbableRectangleSelection(GrabFunctions):
             grabber.set_xy((-100, -100))
         self.rotation_grabber.hide()
 
-    def clear_targets(self):
+    def clear_targets(self, *, preserve_rotation_pivot: bool = False):
         """remove all elements from the selection"""
+        self.rotation_grabber.cancel_pivot_event(restore=True)
         self.clear_move_previews()
         for rect in self.targets_rects:
             self.graphics_scene.scene().removeItem(rect)
@@ -1385,6 +1399,8 @@ class GrabbableRectangleSelection(GrabFunctions):
         self.targets = []
         self.target_bounds = []
         self.alignment_key = None
+        if not preserve_rotation_pivot:
+            self._clear_custom_rotation_pivot()
 
         self.hide_grabber()
 
@@ -1517,7 +1533,96 @@ class GrabbableRectangleSelection(GrabFunctions):
         if any(value not in (0.0, 0.5, 1.0) for value in point):
             raise ValueError("Reference point values must use the 3x3 transform grid")
         self.reference_point = point
+        self._clear_custom_rotation_pivot()
+        if self.rotation_handle_supported():
+            self.rotation_grabber.updatePos()
+        self._notify_alignment_state_changed()
         return point
+
+    def custom_rotation_pivot_supported(self) -> bool:
+        """Return whether the selection can honor an arbitrary shared pivot."""
+
+        return bool(
+            self.rotation_operation() is TransformOperation.RIGID_ROTATE
+            and self.rotation_interaction_support(
+                TransformOperation.RIGID_ROTATE
+            ).supported
+        )
+
+    def custom_rotation_pivot_state(self) -> tuple[float, float] | None:
+        """Return the non-document pivot in root-Figure physical inches."""
+
+        if self._custom_rotation_pivot_inches is None:
+            return None
+        return tuple(self._custom_rotation_pivot_inches)
+
+    def custom_rotation_pivot_position(self) -> np.ndarray | None:
+        """Resolve the custom pivot to current display pixels, if one is active."""
+
+        state = self.custom_rotation_pivot_state()
+        if state is None:
+            return None
+        position = np.asarray(self.figure.dpi_scale_trans.transform(state), dtype=float)
+        if position.shape != (2,) or not np.all(np.isfinite(position)):
+            return None
+        return position
+
+    def _set_custom_rotation_pivot_state(
+        self, state: Sequence[float] | None, *, notify: bool = True
+    ) -> None:
+        if state is None:
+            self._custom_rotation_pivot_inches = None
+        else:
+            state = tuple(float(value) for value in state)
+            if len(state) != 2 or not np.all(np.isfinite(state)):
+                raise ValueError("Custom rotation pivot state must be finite")
+            if not self.custom_rotation_pivot_supported():
+                raise UnsupportedArtistError(
+                    "A custom rotation pivot requires a complete shared "
+                    "rigid-rotation plan"
+                )
+            self._custom_rotation_pivot_inches = state
+        if self.rotation_handle_supported():
+            self.rotation_grabber.updatePos()
+        if notify:
+            self._notify_alignment_state_changed()
+
+    def _clear_custom_rotation_pivot(self) -> None:
+        self._custom_rotation_pivot_inches = None
+
+    def set_rotation_pivot(
+        self,
+        display_position: Sequence[float],
+        *,
+        notify: bool = True,
+    ) -> tuple[float, float]:
+        """Set a shared rotation pivot without creating a document edit."""
+
+        if getattr(self, "rotation_drag_mode", None) is not None:
+            raise RuntimeError("Cannot move the pivot during a rotation gesture")
+        if not self.custom_rotation_pivot_supported():
+            raise UnsupportedArtistError(
+                "A custom rotation pivot requires a complete shared "
+                "rigid-rotation plan"
+            )
+        display_position = np.asarray(display_position, dtype=float)
+        if display_position.shape != (2,) or not np.all(np.isfinite(display_position)):
+            raise ValueError("Rotation pivot must contain two finite display values")
+        physical_position = np.asarray(
+            self.figure.dpi_scale_trans.inverted().transform(display_position),
+            dtype=float,
+        )
+        self._set_custom_rotation_pivot_state(
+            physical_position, notify=notify
+        )
+        return tuple(float(value) for value in display_position)
+
+    def reset_rotation_pivot(self) -> bool:
+        """Return rigid rotation to the active 3x3 reference point."""
+
+        changed = self._custom_rotation_pivot_inches is not None
+        self._set_custom_rotation_pivot_state(None)
+        return changed
 
     def reference_position(self) -> np.ndarray:
         """Resolve the normalized reference point in display coordinates."""
@@ -1691,6 +1796,8 @@ class GrabbableRectangleSelection(GrabFunctions):
         selected_targets = [target.target for target in self.targets]
         alignment_reference_mode = self.alignment_reference_mode
         alignment_key = self.alignment_key
+        reference_point = tuple(self.reference_point)
+        custom_rotation_pivot = self.custom_rotation_pivot_state()
         dragger = getattr(self.figure, "figure_dragger", None)
         selected_primary = getattr(dragger, "selected_element", None)
         wrapped_targets = self._unique_wrappers(targets or self.targets)
@@ -1738,6 +1845,11 @@ class GrabbableRectangleSelection(GrabFunctions):
             self._restore_alignment_reference_state(
                 alignment_reference_mode, alignment_key
             )
+            self.set_reference_point(reference_point)
+            if custom_rotation_pivot is not None:
+                self._set_custom_rotation_pivot_state(
+                    custom_rotation_pivot
+                )
 
         return undo
 
@@ -1776,8 +1888,30 @@ class GrabbableRectangleSelection(GrabFunctions):
         tracker = getattr(self.figure, "change_tracker", None)
         capture = getattr(tracker, "capture_recording_state", None)
         self.move_start_tracker_state = capture() if capture is not None else None
+        self.move_start_edit_history_state = None
+        if hasattr(tracker, "edits") and hasattr(tracker, "last_edit"):
+            self.move_start_edit_history_state = (
+                self._copy_edit_history(tracker.edits),
+                int(tracker.last_edit),
+            )
+        self.move_start_reference_point = tuple(self.reference_point)
+        self.move_start_custom_rotation_pivot = self.custom_rotation_pivot_state()
+        self.move_start_ui_state_captured = True
 
         self.store_start = self.get_save_point(self.save_targets)
+
+    @staticmethod
+    def _copy_edit_history(edits) -> list:
+        copied = []
+        for edit in edits:
+            if not isinstance(edit, list):
+                copied.append(edit)
+                continue
+            item = list(edit)
+            if len(item) > 3 and isinstance(item[3], dict):
+                item[3] = dict(item[3])
+            copied.append(item)
+        return copied
 
     @staticmethod
     def _clear_preview(target: TargetWrapper):
@@ -1896,12 +2030,27 @@ class GrabbableRectangleSelection(GrabFunctions):
                     failures.append((target.target, error))
         tracker_state = getattr(self, "move_start_tracker_state", None)
         tracker = getattr(self.figure, "change_tracker", None)
+        edit_history_state = getattr(
+            self, "move_start_edit_history_state", None
+        )
+        if edit_history_state is not None:
+            try:
+                edits, last_edit = edit_history_state
+                tracker.edits = self._copy_edit_history(edits)
+                tracker.last_edit = int(last_edit)
+            except Exception as error:
+                failures.append((tracker, error))
         restore = getattr(tracker, "restore_recording_state", None)
         if tracker_state is not None and restore is not None:
             try:
                 restore(tracker_state)
             except Exception as error:
                 failures.append((tracker, error))
+        if bool(getattr(self, "move_start_ui_state_captured", False)):
+            self.reference_point = tuple(self.move_start_reference_point)
+            self._custom_rotation_pivot_inches = (
+                self.move_start_custom_rotation_pivot
+            )
         try:
             self.clear_move_previews()
         except Exception as error:
@@ -1931,42 +2080,7 @@ class GrabbableRectangleSelection(GrabFunctions):
             raise InteractionRollbackError(failures)
         return tuple(failures)
 
-    @legend_owner_snapshot()
-    def end_move(self, edit_name: str = "Move", coalesce_key: str = None):
-        """a grabber move stopped"""
-        if self.has_moved is True:
-            try:
-                self._commit_deferred_positions()
-            except Exception:
-                self._restore_move_start(strict=False)
-                self.has_moved = False
-                raise
-            if not self._move_changed_semantically():
-                self._restore_move_start()
-                self.has_moved = False
-        else:
-            self.clear_move_previews()
-        self.update_grabber()
-
-        self.store_end = self.get_save_point(self.save_targets)
-        if self.has_moved is True:
-            self.figure.signals.figure_selection_moved.emit()
-            edit = [self.store_start, self.store_end, edit_name]
-            if coalesce_key is not None:
-                edit.append(
-                    {
-                        "coalesce_key": coalesce_key,
-                        "targets": tuple(id(target.target) for target in self.save_targets),
-                        "timestamp": time.monotonic(),
-                    }
-                )
-            self.figure.change_tracker.addEdit(edit)
-            if getattr(self, "defer_current_move", False):
-                canvas = getattr(self.figure, "canvas", None)
-                if hasattr(canvas, "schedule_draw"):
-                    canvas.schedule_draw()
-                elif hasattr(canvas, "draw_idle"):
-                    canvas.draw_idle()
+    def _clear_move_transaction(self) -> None:
         self.move_start_positions = {}
         self.move_start_raw_selection_points = {}
         self.move_start_selection_points = {}
@@ -1974,7 +2088,52 @@ class GrabbableRectangleSelection(GrabFunctions):
         self.move_current_selection_points = {}
         self.move_start_states = {}
         self.move_start_tracker_state = None
+        self.move_start_edit_history_state = None
+        self.move_start_reference_point = None
+        self.move_start_custom_rotation_pivot = None
+        self.move_start_ui_state_captured = False
         self.defer_current_move = False
+
+    @legend_owner_snapshot()
+    def end_move(self, edit_name: str = "Move", coalesce_key: str = None):
+        """a grabber move stopped"""
+        try:
+            if self.has_moved is True:
+                self._commit_deferred_positions()
+                if not self._move_changed_semantically():
+                    self._restore_move_start()
+                    self.has_moved = False
+            else:
+                self.clear_move_previews()
+            self.update_grabber()
+
+            self.store_end = self.get_save_point(self.save_targets)
+            if self.has_moved is True:
+                self.figure.signals.figure_selection_moved.emit()
+                edit = [self.store_start, self.store_end, edit_name]
+                if coalesce_key is not None:
+                    edit.append(
+                        {
+                            "coalesce_key": coalesce_key,
+                            "targets": tuple(
+                                id(target.target) for target in self.save_targets
+                            ),
+                            "timestamp": time.monotonic(),
+                        }
+                    )
+                self.figure.change_tracker.addEdit(edit)
+                if getattr(self, "defer_current_move", False):
+                    canvas = getattr(self.figure, "canvas", None)
+                    if hasattr(canvas, "schedule_draw"):
+                        canvas.schedule_draw()
+                    elif hasattr(canvas, "draw_idle"):
+                        canvas.draw_idle()
+        except Exception:
+            self._restore_move_start(strict=False)
+            self.has_moved = False
+            self._clear_move_transaction()
+            raise
+        self._clear_move_transaction()
 
     @legend_owner_snapshot()
     def addOffset(self, pos: Sequence, dir: int, keep_aspect_ratio: bool = True):
@@ -2419,12 +2578,16 @@ class DragManager:
             else None
         )
         return InteractionState(
-            self.selection_mode.value,
-            selected,
-            primary,
-            scopes,
-            self.selection.alignment_reference_mode,
-            alignment_key,
+            mode=self.selection_mode.value,
+            selected=selected,
+            primary=primary,
+            scopes=scopes,
+            alignment_reference_mode=self.selection.alignment_reference_mode,
+            alignment_key=alignment_key,
+            reference_point=tuple(self.selection.reference_point),
+            custom_rotation_pivot_inches=(
+                self.selection.custom_rotation_pivot_state()
+            ),
         )
 
     def restore_interaction_state(self, state: InteractionState) -> None:
@@ -2451,6 +2614,11 @@ class DragManager:
         self.selection._restore_alignment_reference_state(
             state.alignment_reference_mode, alignment_key
         )
+        self.selection.set_reference_point(state.reference_point)
+        if state.custom_rotation_pivot_inches is not None:
+            self.selection._set_custom_rotation_pivot_state(
+                state.custom_rotation_pivot_inches
+            )
         self._update_interaction_controls()
 
     def _notify_editor_scene_changed(self, owner: Artist = None) -> None:
@@ -3685,20 +3853,25 @@ class DragManager:
             return elements
 
         previous_alignment_key = self.selection.alignment_key
-        self.selection.clear_targets()
+        same_membership = len(current) == len(elements) and {
+            id(element) for element in current
+        } == {id(element) for element in elements}
+        self.selection.clear_targets(
+            preserve_rotation_pivot=same_membership
+        )
 
-        for element in elements:
-            if element != primary:
-                self.selection.add_target(element, update=False)
+        self.selection._batch_add_targets = True
+        try:
+            for element in elements:
+                if element != primary:
+                    self.selection.add_target(element, update=False)
 
-        if primary is not None:
-            self.selection._batch_add_targets = True
-            try:
+            if primary is not None:
                 self.on_select(primary, event)
-            finally:
-                self.selection._batch_add_targets = False
-        else:
-            self.on_select(None, event)
+            else:
+                self.on_select(None, event)
+        finally:
+            self.selection._batch_add_targets = False
         self.selected_element = primary
         if self.selection.targets:
             self.selection.update_extent()
@@ -3767,6 +3940,22 @@ class DragManager:
         if event.key == "ctrl+y":
             self.redo()
         if event.key == "escape":
+            pivot_active = bool(
+                getattr(
+                    self.selection.rotation_grabber,
+                    "pivot_got_artist",
+                    False,
+                )
+            )
+            if pivot_active:
+                self.selection.rotation_grabber.cancel_pivot_event(
+                    restore=True
+                )
+                self.grab_element = None
+                scene = getattr(self.figure, "_pyl_scene", None)
+                if scene is not None:
+                    scene.grabber_pressed = None
+                return
             rotation_active = (
                 getattr(self.selection, "rotation_drag_mode", None) is not None
             )
@@ -3894,7 +4083,7 @@ class GrabberGenericRectangle(GrabberGeneric):
 
 
 class GrabberRotation(GrabFunctions):
-    """One native-angle handle anchored to the selected artist's true pivot."""
+    """Rotation handle plus an optional movable shared-pivot marker."""
 
     def __init__(self, parent: GrabbableRectangleSelection, scene):
         GrabFunctions.__init__(self, parent, 0, no_height=True)
@@ -3907,7 +4096,9 @@ class GrabberRotation(GrabFunctions):
         self.line = QtWidgets.QGraphicsLineItem(scene)
         self.line.setPen(line_pen)
         self.line.setZValue(902)
-        self.pivot_marker = QtWidgets.QGraphicsEllipseItem(-3, -3, 6, 6, scene)
+        self.pivot_marker = RotationPivotMarker(-3, -3, 6, 6, scene)
+        self.pivot_marker.view = scene.view
+        self.pivot_marker.grabber = self
         self.pivot_marker.setPen(pivot_pen)
         self.pivot_marker.setBrush(QtGui.QBrush(QtCore.Qt.NoBrush))
         self.pivot_marker.setZValue(903)
@@ -3933,18 +4124,97 @@ class GrabberRotation(GrabFunctions):
         bounds = self.parent.selection_bounds()
         pivot = self.parent.rotation_pivot()
         handle = np.array([(bounds[0] + bounds[2]) / 2, bounds[3] + 24.0])
+        if np.linalg.norm(handle - pivot) <= 12.0:
+            candidates = np.array(
+                [
+                    [bounds[2] + 24.0, (bounds[1] + bounds[3]) / 2],
+                    [(bounds[0] + bounds[2]) / 2, bounds[1] - 24.0],
+                    [bounds[0] - 24.0, (bounds[1] + bounds[3]) / 2],
+                ],
+                dtype=float,
+            )
+            handle = candidates[
+                int(np.argmax(np.linalg.norm(candidates - pivot, axis=1)))
+            ]
         self.set_xy(handle)
-        self.line.setLine(
-            float(pivot[0]), float(pivot[1]), float(handle[0]), float(handle[1])
+        self._position_pivot(pivot)
+        movable = self.parent.custom_rotation_pivot_supported()
+        self.pivot_marker.setAcceptedMouseButtons(
+            QtCore.Qt.LeftButton if movable else QtCore.Qt.NoButton
         )
-        self.pivot_marker.setRect(
-            float(pivot[0]) - 3, float(pivot[1]) - 3, 6, 6
+        self.pivot_marker.setCursor(
+            QtCore.Qt.SizeAllCursor if movable else QtCore.Qt.ArrowCursor
+        )
+        self.pivot_marker.setToolTip(
+            "Drag to move the shared rotation pivot; double-click to reset"
+            if movable
+            else "This object rotates around its fixed native pivot"
         )
         self.line.setVisible(True)
         self.pivot_marker.setVisible(True)
         self.handle.setVisible(True)
 
+    def _position_pivot(self, pivot: Sequence[float]) -> None:
+        self.line.setLine(
+            float(pivot[0]), float(pivot[1]), float(self.xy[0]), float(self.xy[1])
+        )
+        self.pivot_marker.setRect(
+            float(pivot[0]) - 3, float(pivot[1]) - 3, 6, 6
+        )
+
+    def on_pivot_motion(self, event: MouseEvent) -> None:
+        if getattr(self, "pivot_got_artist", False):
+            self.parent.set_rotation_pivot(
+                (event.x, event.y), notify=False
+            )
+
+    def pivot_button_press_event(self, event: MouseEvent) -> None:
+        if not self.parent.custom_rotation_pivot_supported():
+            raise UnsupportedArtistError(
+                "A custom rotation pivot requires a complete shared "
+                "rigid-rotation plan"
+            )
+        self.pivot_drag_start_state = self.parent.custom_rotation_pivot_state()
+        self.pivot_got_artist = True
+        self._pivot_c1 = self.figure.canvas.mpl_connect(
+            "motion_notify_event", self.on_pivot_motion
+        )
+        self.parent.set_rotation_pivot(
+            (event.x, event.y), notify=False
+        )
+
+    def pivot_button_release_event(self, event: MouseEvent) -> None:
+        if not getattr(self, "pivot_got_artist", False):
+            return
+        try:
+            self.parent.set_rotation_pivot((event.x, event.y))
+        finally:
+            self.cancel_pivot_event()
+
+    def cancel_pivot_event(self, *, restore: bool = False) -> None:
+        was_active = bool(getattr(self, "pivot_got_artist", False))
+        start_state = getattr(self, "pivot_drag_start_state", None)
+        if was_active:
+            self.pivot_got_artist = False
+            connection = getattr(self, "_pivot_c1", None)
+            if connection is not None:
+                self.figure.canvas.mpl_disconnect(connection)
+        if restore and was_active:
+            self.parent._set_custom_rotation_pivot_state(start_state)
+        self._pivot_c1 = None
+        self.pivot_drag_start_state = None
+
+    def reset_pivot_event(self) -> None:
+        self.cancel_pivot_event()
+        self.parent.reset_rotation_pivot()
+
+    def cancel_event(self) -> None:
+        super().cancel_event()
+        self.cancel_pivot_event(restore=True)
+
     def hide(self) -> None:
+        self.cancel_pivot_event(restore=True)
+        self.pivot_marker.setAcceptedMouseButtons(QtCore.Qt.NoButton)
         self.line.setVisible(False)
         self.pivot_marker.setVisible(False)
         self.handle.setVisible(False)
@@ -3984,6 +4254,44 @@ class MyRect(MyItem, QtWidgets.QGraphicsRectItem):
 
 class MyEllipse(MyItem, QtWidgets.QGraphicsEllipseItem):
     pass
+
+
+class RotationPivotMarker(QtWidgets.QGraphicsEllipseItem):
+    """Qt overlay item that moves editor pivot state, never figure Artists."""
+
+    def _canvas_event(self, event):
+        x, y = scene_point_to_canvas_pixels(self.view, event.scenePos())
+        return MyEvent(x, y)
+
+    def _claim_event(self) -> None:
+        self.view.grabber_found = True
+        self.scene().grabber_pressed = self
+
+    def mousePressEvent(self, event):
+        QtWidgets.QGraphicsEllipseItem.mousePressEvent(self, event)
+        if not self.grabber.parent.custom_rotation_pivot_supported():
+            event.ignore()
+            return
+        self._claim_event()
+        self.grabber.pivot_button_press_event(self._canvas_event(event))
+        event.accept()
+
+    def mouseReleaseEvent(self, event):
+        QtWidgets.QGraphicsEllipseItem.mouseReleaseEvent(self, event)
+        self.scene().grabber_pressed = None
+        self.view.grabber_found = True
+        self.grabber.pivot_button_release_event(self._canvas_event(event))
+        event.accept()
+
+    def mouseDoubleClickEvent(self, event):
+        QtWidgets.QGraphicsEllipseItem.mouseDoubleClickEvent(self, event)
+        if not self.grabber.parent.custom_rotation_pivot_supported():
+            event.ignore()
+            return
+        self._claim_event()
+        self.grabber.reset_pivot_event()
+        self.scene().grabber_pressed = None
+        event.accept()
 
 
 class MyEvent:

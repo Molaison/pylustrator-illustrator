@@ -192,7 +192,7 @@ def install_legacy_legend_replay_compatibility(figure) -> None:
 
 @dataclass(frozen=True)
 class InteractionState:
-    """Selection, tool scope, and non-document alignment UI state."""
+    """Selection, tool scope, and non-document transform UI state."""
 
     mode: str
     selected: tuple[ObjectLocator, ...]
@@ -200,6 +200,8 @@ class InteractionState:
     scopes: tuple[ObjectLocator, ...]
     alignment_reference_mode: str = "selection"
     alignment_key: Optional[ObjectLocator] = None
+    reference_point: tuple[float, float] = (0.5, 0.5)
+    custom_rotation_pivot_inches: Optional[tuple[float, float]] = None
 
 
 __all__ = [
