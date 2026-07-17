@@ -534,12 +534,13 @@ def _analyse_block(
         )
     elif versions and versions[0].value is not None:
         marker = versions[0]
-        effective_version = marker.value
-        if marker.value > GENERATED_STATE_VERSION:
+        version = marker.value
+        effective_version = version
+        if version > GENERATED_STATE_VERSION:
             diagnostics.append(
                 SourceDiagnostic(
                     "PYL103",
-                    f"generated schema {marker.value} is newer than supported schema {GENERATED_STATE_VERSION}",
+                    f"generated schema {version} is newer than supported schema {GENERATED_STATE_VERSION}",
                     block.start_line + marker.value_start[0] - 1,
                     marker.value_start[1] + 1,
                     "error",
@@ -547,11 +548,11 @@ def _analyse_block(
                     block_index,
                 )
             )
-        elif marker.value < GENERATED_STATE_VERSION:
+        elif version < GENERATED_STATE_VERSION:
             diagnostics.append(
                 SourceDiagnostic(
                     "PYL102",
-                    f"generated schema {marker.value} should migrate to {GENERATED_STATE_VERSION}",
+                    f"generated schema {version} should migrate to {GENERATED_STATE_VERSION}",
                     block.start_line + marker.value_start[0] - 1,
                     marker.value_start[1] + 1,
                     "warning",
