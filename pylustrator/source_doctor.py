@@ -535,6 +535,7 @@ def _analyse_block(
     elif versions and versions[0].value is not None:
         marker = versions[0]
         version = marker.value
+        assert version is not None
         effective_version = version
         if version > GENERATED_STATE_VERSION:
             diagnostics.append(
