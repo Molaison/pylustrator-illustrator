@@ -100,6 +100,11 @@ The shared rigid-rotation pivot is selection-level editor state, stored in
 physical Figure coordinates rather than in an Artist snapshot or generated
 source. Moving that overlay therefore never dirties the document; handle and
 toolbar rotation still consume the same absolute transform plan.
+``RigidRotationPlan`` stores large geometry destinations as compact immutable
+arrays backed by read-only bytes. Line2D uses vectorized coordinate conversion
+and a marker-aware destination envelope; a visible marker is accepted only
+when its painted path is rotationally symmetric and the source/destination
+``markevery`` centers preserve the requested rigid transform.
 
 Generated blocks carry a schema version.  Legacy proxy-legend references are
 accepted during replay and rewritten through the public migration helpers.
@@ -114,6 +119,9 @@ accepted during replay and rewritten through the public migration helpers.
    :members:
 
 .. autoclass:: pylustrator.TransformPlan
+   :members:
+
+.. autoclass:: pylustrator.RigidRotationPlan
    :members:
 
 .. autoclass:: pylustrator.AppearanceScalePlan

@@ -3063,7 +3063,12 @@ def test_toolbar_mixed_geometry_rotation_shares_one_pivot_and_transaction() -> N
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     fig, ax = plt.subplots(figsize=(5, 5), dpi=100)
     text = ax.text(0.47, 0.52, "anchor", rotation_mode="anchor")
-    line = ax.plot([0.25, 0.38], [0.7, 0.78])[0]
+    line = ax.plot(
+        [0.25, 0.38],
+        [0.7, 0.78],
+        marker="o",
+        markevery=[0],
+    )[0]
     polygon = ax.add_patch(
         Polygon([[0.25, 0.25], [0.4, 0.27], [0.34, 0.4]], closed=True)
     )
@@ -3269,6 +3274,62 @@ def test_multi_rotation_handle_previews_shared_pivot_and_shift_snap() -> None:
     assert selection.rotation_grabber.handle.isVisible()
     selection.clear_targets()
     plt.close(fig)
+    assert app is not None
+
+
+def test_rotation_handle_reuses_cached_gesture_source_geometry(monkeypatch) -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    target = ax.plot(
+        np.linspace(0.2, 0.8, 100),
+        np.linspace(0.3, 0.7, 100),
+        linestyle="none",
+        marker="o",
+        markevery=5,
+        clip_on=False,
+    )[0]
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    fig.signals.figure_selection_property_changed = Signal()
+    manager.select_element(target)
+    selection = manager.selection
+    pivot = selection.rotation_pivot().copy()
+    start = np.asarray(selection.rotation_grabber.get_xy(), dtype=float)
+    vector = start - pivot
+    requested = np.deg2rad(23.0)
+    pointer = pivot + np.array(
+        [
+            vector[0] * np.cos(requested) - vector[1] * np.sin(requested),
+            vector[0] * np.sin(requested) + vector[1] * np.cos(requested),
+        ]
+    )
+
+    selection.start_rotation(SimpleNamespace(x=start[0], y=start[1], key=None))
+    wrapper = selection.targets[0]
+    original = wrapper.adapter.plan_rigid_rotation
+    calls = []
+
+    def capture_plan(angle, plan_pivot, **kwargs):
+        calls.append(kwargs)
+        return original(angle, plan_pivot, **kwargs)
+
+    monkeypatch.setattr(wrapper.adapter, "plan_rigid_rotation", capture_plan)
+
+    try:
+        selection.preview_rotation(
+            SimpleNamespace(x=pointer[0], y=pointer[1], key=None)
+        )
+        assert len(calls) == 1
+        assert calls[0]["control_points"] is selection.move_start_positions[
+            id(target)
+        ]
+        assert calls[0][
+            "selection_points"
+        ] is selection.move_start_raw_selection_points[id(target)]
+        selection.cancel_rotation()
+    finally:
+        selection.clear_targets()
+        plt.close(fig)
     assert app is not None
 
 

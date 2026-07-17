@@ -382,11 +382,53 @@ expected zero-mutation typed rejection. The formal editable Fig2 remained
 byte-identical at SHA-256
 `aba67bbd663fd16da535aa30d43f607c7205d096455f44544e518607cdce2dbb`.
 
+### P1d: Marker-aware Line2D rigid rotation
+
+Implemented for marker-free lines, lines whose marker paint is absent, and
+visible centered canonical circle paths (including ``o``, ``.``, and an exact
+custom unit-circle Path). The marker transform must remain rotationally
+symmetric after scaling to renderer pixels: anisotropy plus the full sweep of
+any center offset may contribute at most ``0.25 px``. Partial fill paths,
+non-circle glyphs, filters/sketch effects, non-finite rendered dimensions, and
+unsupported ownership/clip states reject before mutation.
+
+The destination envelope no longer combines all Line2D controls with a source
+subset's asymmetric outsets. It applies Matplotlib's real ``markevery``
+semantics independently to the representable destination, computes line and
+marker paint there, and requires the destination marker centers to equal the
+rigidly transformed source centers within ``0.25 px``. This closes the measured
+``246.687 px`` subset error and also catches rare floating-distance ties where
+preview and commit could agree on the wrong marker identity. NaN/masked slots
+remain in the marker index stream, while an isolated point across a NaN gap no
+longer inflates the visible line-stroke box.
+
+The interactive path was optimized as part of the same correctness contract.
+Line2D forward/inverse transforms are vectorized, a handle gesture reuses its
+source controls and visible envelope, and ``RigidRotationPlan`` stores compact
+byte-backed immutable arrays instead of hundreds of thousands of Python
+tuples. A 100k-point plan fell from roughly ``1.3 s`` to ``55--64 ms`` in the
+local probe; 10k points fell to about ``6--8 ms``. Ninety-six Agg raster cases over
+four DPIs, eight ``markevery`` forms, and three circle paint styles matched
+plan/commit analytic bounds within ``1e-8 px``. Nonzero-alpha raster coverage
+can extend up to ``1.77 px`` beyond that analytic paint envelope due to
+antialiasing, which remains part of the renderer-faithful P1 work below rather
+than a marker-specific alignment constant.
+
+The real Fig2 fork contains 553 Line2D instances and 245 with visible marker
+paint. Its 242 non-circular marker lines and three Legend-owned marker lines all
+return typed Q denials with no selection/support exception. The one ordinary
+400-point affine Line2D representative was converted only in memory to a circle
+marker and exercised with integer, tuple, list, float, and float-tuple
+``markevery`` forms; all five plan/commit errors were ``0 px`` and restore error
+was at most ``1.14e-13 px``. The formal editable Fig2 remained byte-identical at
+SHA-256
+`aba67bbd663fd16da535aa30d43f607c7205d096455f44544e518607cdce2dbb`.
+
 Remaining feature work:
 
-- Safe rigid-rotation coverage for continuously symmetric Line2D markers. This
-  requires a marker-aware destination envelope; merely enabling the capability
-  produced up to ``242.99 px`` preview/commit error for subset ``markevery``.
+- Preserve original MaskedArray containers, masks, and hidden values through
+  Line2D geometry snapshots, generated replay, Undo, and Redo; current numeric
+  geometry deliberately treats masked values as NaN slots.
 - Generic smart guides for edges, centers, baselines, anchors, and equal gaps.
 - Direct path/endpoint editing and inline text editing.
 - Content-following cached drag previews and spatial hit/snap indexes.

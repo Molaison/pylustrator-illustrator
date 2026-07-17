@@ -18,6 +18,7 @@ from matplotlib.collections import LineCollection, PathCollection, PolyCollectio
 from matplotlib.image import AxesImage
 from matplotlib.legend import Legend
 from matplotlib.lines import Line2D
+from matplotlib.markers import MarkerStyle
 from matplotlib.path import Path
 from matplotlib.patches import (
     Circle,
@@ -1788,6 +1789,602 @@ def test_rigid_rotation_predicates_reject_lossy_artist_variants() -> None:
         assert not filtered_text_adapter.operation_support(
             TransformOperation.ROTATE
         ).supported
+    finally:
+        plt.close(fig)
+
+
+@pytest.mark.parametrize("dpi", [72, 100, 144, 200])
+@pytest.mark.parametrize(
+    "markevery",
+    [
+        None,
+        2,
+        (1, 3),
+        slice(1, None, 2),
+        [0, 3, 5],
+        [True, False, True, False, False, True],
+        0.18,
+        (0.07, 0.18),
+    ],
+)
+def test_symmetric_line_marker_rigid_rotation_recomputes_destination_envelope(
+    dpi, markevery
+) -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=dpi)
+    tracker = RecordingChangeTracker()
+    fig.change_tracker = tracker
+    target = ax.plot(
+        [0.12, 0.25, 0.42, 0.63, 0.78, 0.88],
+        [0.18, 0.82, 0.27, 0.76, 0.58, 0.34],
+        linestyle="none",
+        marker="o",
+        markersize=16,
+        markeredgewidth=3,
+        markevery=markevery,
+        clip_on=False,
+    )[0]
+    fig.canvas.draw()
+    adapter = get_artist_adapter(target)
+    source_state = adapter.snapshot()
+    source_selection = np.asarray(adapter.selection_points(), dtype=float)
+    pivot = np.asarray(fig.dpi_scale_trans.transform((2.5, 1.9)), dtype=float)
+
+    try:
+        assert adapter.operation_support(
+            TransformOperation.RIGID_ROTATE
+        ).supported
+        plan = adapter.plan_rigid_rotation(37.0, pivot)
+        assert semantic_equal(source_state, adapter.snapshot())
+        _assert_px_close(adapter.selection_points(), source_selection, atol=0)
+
+        adapter.apply_rigid_rotation_plan(plan)
+        fig.canvas.draw()
+
+        _assert_px_close(
+            _bounds(adapter.selection_points()),
+            _bounds(plan.selection_array()),
+            atol=1e-9,
+        )
+        assert [call[1] for call in tracker.calls] == [target]
+        assert all("set_data" in str(call[2]) for call in tracker.calls)
+    finally:
+        plt.close(fig)
+
+
+@pytest.mark.parametrize(
+    ("marker", "fillstyle"),
+    [
+        ("o", "full"),
+        ("o", "none"),
+        (".", "full"),
+        (Path.unit_circle(), "full"),
+    ],
+    ids=["circle", "circle-outline", "point", "custom-unit-circle"],
+)
+def test_centered_circle_marker_styles_are_the_only_visible_marker_q_contract(
+    marker, fillstyle
+) -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    target = ax.plot(
+        [0.2, 0.5, 0.8],
+        [0.3, 0.75, 0.4],
+        linestyle="none",
+        marker=MarkerStyle(marker, fillstyle=fillstyle),
+        markeredgecolor="black",
+        markerfacecolor="tab:blue",
+        clip_on=False,
+    )[0]
+    fig.canvas.draw()
+
+    try:
+        adapter = get_artist_adapter(target)
+        assert adapter.capabilities.can_rigid_rotate
+        assert adapter.plan_rigid_rotation(23.0, (250.0, 190.0)).target is target
+    finally:
+        plt.close(fig)
+
+
+def test_line_marker_q_rejects_non_symmetric_offset_and_custom_glyphs() -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    marker_styles = [
+        MarkerStyle("s"),
+        MarkerStyle("o", fillstyle="left"),
+        MarkerStyle("o").transformed(Affine2D().scale(2.0, 1.0)),
+        MarkerStyle("o").transformed(Affine2D().translate(0.25, 0.0)),
+    ]
+    targets = [
+        ax.plot(
+            [0.2, 0.5, 0.8],
+            [0.25 + index * 0.1, 0.7, 0.35 + index * 0.05],
+            linestyle="none",
+            marker=marker,
+            clip_on=False,
+        )[0]
+        for index, marker in enumerate(marker_styles)
+    ]
+    sketch = ax.plot(
+        [0.2, 0.8], [0.88, 0.78], linestyle="none", marker="o", clip_on=False
+    )[0]
+    sketch.set_sketch_params(1.0, 2.0, 3.0)
+    targets.append(sketch)
+    fig.canvas.draw()
+
+    try:
+        for target in targets:
+            adapter = get_artist_adapter(target)
+            before = adapter.snapshot()
+            assert not adapter.capabilities.can_rigid_rotate
+            with pytest.raises(UnsupportedArtistError):
+                adapter.plan_rigid_rotation(23.0, (250.0, 190.0))
+            assert semantic_equal(before, adapter.snapshot())
+    finally:
+        plt.close(fig)
+
+
+@pytest.mark.parametrize(
+    "user_transform",
+    [
+        Affine2D().translate(5e-13, 0.0),
+        Affine2D().scale(1.0 + 5e-13, 1.0),
+    ],
+)
+def test_marker_symmetry_tolerance_is_scaled_by_rendered_size(
+    user_transform,
+) -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    target = ax.plot(
+        [0.2, 0.8],
+        [0.25, 0.75],
+        linestyle="none",
+        marker=MarkerStyle("o").transformed(user_transform),
+        markersize=1e15,
+        clip_on=False,
+    )[0]
+    adapter = get_artist_adapter(target)
+
+    try:
+        assert not adapter.capabilities.can_rigid_rotate
+        with pytest.raises(UnsupportedArtistError):
+            adapter.plan_rigid_rotation(23.0, (250.0, 190.0))
+    finally:
+        plt.close(fig)
+
+
+@pytest.mark.parametrize(
+    "marker_kwargs",
+    [
+        {"markevery": []},
+        {"markersize": 0.0},
+        {
+            "markerfacecolor": "none",
+            "markeredgecolor": "none",
+            "markeredgewidth": 0.0,
+        },
+    ],
+)
+def test_invisible_non_symmetric_marker_does_not_block_line_q(marker_kwargs) -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    target = ax.plot(
+        [0.2, 0.5, 0.8],
+        [0.25, 0.75, 0.4],
+        linestyle="-",
+        marker="s",
+        clip_on=False,
+        **marker_kwargs,
+    )[0]
+    fig.canvas.draw()
+
+    try:
+        adapter = get_artist_adapter(target)
+        assert adapter.capabilities.can_rigid_rotate
+        plan = adapter.plan_rigid_rotation(23.0, (250.0, 190.0))
+        adapter.apply_rigid_rotation_plan(plan, record_changes=False)
+        fig.canvas.draw()
+        _assert_px_close(
+            _bounds(adapter.selection_points()),
+            _bounds(plan.selection_array()),
+            atol=1e-9,
+        )
+    finally:
+        plt.close(fig)
+
+
+def test_line_marker_markevery_preserves_original_nan_indices() -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    target = ax.plot(
+        [0.1, np.nan, 0.5, 0.8],
+        [0.2, np.nan, 0.7, 0.35],
+        linestyle="none",
+        marker="o",
+        markevery=[1, 3],
+        clip_on=False,
+    )[0]
+    fig.canvas.draw()
+    adapter = get_artist_adapter(target)
+    expected = np.asarray(ax.transData.transform([[0.8, 0.35]]), dtype=float)
+
+    try:
+        _assert_px_close(adapter._marker_display_positions(), expected, atol=1e-12)
+        plan = adapter.plan_rigid_rotation(31.0, (250.0, 190.0))
+        adapter.apply_rigid_rotation_plan(plan, record_changes=False)
+        fig.canvas.draw()
+        _assert_px_close(
+            _bounds(adapter.selection_points()),
+            _bounds(plan.selection_array()),
+            atol=1e-9,
+        )
+    finally:
+        plt.close(fig)
+
+
+def test_line_envelope_excludes_isolated_vertices_between_nan_gaps() -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    ax.set_xlim(0.0, 10.0)
+    ax.set_ylim(0.0, 1.0)
+    target = ax.plot(
+        [0.5, 1.5, np.nan, 9.0],
+        [0.5, 0.5, np.nan, 0.9],
+        linewidth=6.0,
+        marker="o",
+        markersize=10.0,
+        markevery=[0],
+        clip_on=False,
+    )[0]
+    fig.canvas.draw()
+    adapter = get_artist_adapter(target)
+    segment = np.asarray(ax.transData.transform([[0.5, 0.5], [1.5, 0.5]]))
+    line_radius = target.get_linewidth() * fig.dpi / 72.0 / 2.0
+    marker_radius = (
+        target.get_markersize() + target.get_markeredgewidth()
+    ) * fig.dpi / 72.0 / 2.0
+    expected = np.array(
+        [
+            min(np.min(segment[:, 0]) - line_radius, segment[0, 0] - marker_radius),
+            min(np.min(segment[:, 1]) - line_radius, segment[0, 1] - marker_radius),
+            max(np.max(segment[:, 0]) + line_radius, segment[0, 0] + marker_radius),
+            max(np.max(segment[:, 1]) + line_radius, segment[0, 1] + marker_radius),
+        ]
+    )
+
+    try:
+        _assert_px_close(_bounds(adapter.selection_points()), expected, atol=1e-9)
+        plan = adapter.plan_rigid_rotation(31.0, (250.0, 190.0))
+        adapter.apply_rigid_rotation_plan(plan, record_changes=False)
+        fig.canvas.draw()
+        _assert_px_close(
+            _bounds(adapter.selection_points()),
+            _bounds(plan.selection_array()),
+            atol=1e-9,
+        )
+    finally:
+        plt.close(fig)
+
+
+def test_line_vectorized_native_controls_are_detached_from_artist_storage() -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    target = ax.plot([0.2, 0.5, 0.8], [0.25, 0.75, 0.4])[0]
+    adapter = get_artist_adapter(target)
+    before = np.asarray(target.get_xydata(), dtype=float).copy()
+    controls = adapter.native_control_points()
+
+    try:
+        controls[0] = (99.0, 101.0)
+        np.testing.assert_array_equal(target.get_xydata(), before)
+    finally:
+        plt.close(fig)
+
+
+def test_line_rigid_plan_uses_compact_immutable_array_storage() -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    target = ax.plot(
+        np.linspace(0.1, 0.9, 1000),
+        np.linspace(0.2, 0.8, 1000),
+        marker="o",
+        markevery=25,
+        clip_on=False,
+    )[0]
+    fig.canvas.draw()
+    adapter = get_artist_adapter(target)
+    plan = adapter.plan_rigid_rotation(23.0, (250.0, 190.0))
+
+    try:
+        for points in (
+            plan.control_points,
+            plan.native_control_points,
+            plan.selection_points,
+        ):
+            assert isinstance(points, np.ndarray)
+            assert points.flags.c_contiguous
+            assert not points.flags.writeable
+            root = points
+            while isinstance(root.base, np.ndarray):
+                root = root.base
+            assert isinstance(root.base, bytes)
+            with pytest.raises(ValueError):
+                points[0, 0] = 99.0
+            with pytest.raises(ValueError):
+                points.setflags(write=True)
+    finally:
+        plt.close(fig)
+
+
+@pytest.mark.parametrize(
+    "custom_marker",
+    [
+        np.array(
+            [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.0, 0.0]], dtype=float
+        ),
+        [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.0, 0.0]],
+    ],
+    ids=["array", "list"],
+)
+def test_custom_array_marker_capability_query_is_typed_not_crashing(
+    custom_marker,
+) -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    target = ax.plot(
+        [0.2, 0.8],
+        [0.25, 0.75],
+        linestyle="none",
+        marker=custom_marker,
+        clip_on=False,
+    )[0]
+    fig.canvas.draw()
+
+    try:
+        adapter = get_artist_adapter(target)
+        assert not adapter.capabilities.can_rigid_rotate
+        assert not adapter.operation_support(
+            TransformOperation.RIGID_ROTATE
+        ).supported
+        assert len(adapter.selection_points())
+        assert adapter.operation_support(
+            TransformOperation.SCALE_APPEARANCE
+        ).supported
+    finally:
+        plt.close(fig)
+
+
+def test_float_markevery_vertex_switch_rejects_rigid_rotation_atomically() -> None:
+    fig, ax = plt.subplots(figsize=(5.3, 3.7), dpi=113)
+    tracker = RecordingChangeTracker()
+    fig.change_tracker = tracker
+    target = Line2D(
+        [249.700932834436, 45.94524183381154],
+        [278.9542364160249, 172.47136011338694],
+        linestyle="none",
+        marker="o",
+        markevery=(0.20350059476636723, 10.0),
+        transform=IdentityTransform(),
+        clip_on=False,
+    )
+    ax.add_line(target)
+    fig.canvas.draw()
+    adapter = get_artist_adapter(target)
+    before = adapter.snapshot()
+    recording_before = tracker.capture_recording_state()
+
+    try:
+        assert adapter.capabilities.can_rigid_rotate
+        with pytest.raises(UnsupportedArtistError, match="different marker vertices"):
+            adapter.plan_rigid_rotation(
+                33.872803088100284,
+                (-606.7265316809651, 367.7625461777693),
+            )
+        assert semantic_equal(before, adapter.snapshot())
+        assert tracker.capture_recording_state() == recording_before
+    finally:
+        plt.close(fig)
+
+
+def test_mixed_circle_marker_and_patch_q_share_one_absolute_plan() -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    tracker = RecordingChangeTracker()
+    fig.change_tracker = tracker
+    targets = [
+        ax.plot(
+            [0.15, 0.32, 0.48],
+            [0.2, 0.72, 0.38],
+            linestyle="none",
+            marker="o",
+            markevery=[0, 2],
+            clip_on=False,
+        )[0],
+        ax.add_patch(
+            Polygon(
+                [[0.58, 0.42], [0.82, 0.48], [0.68, 0.76]],
+                closed=True,
+                clip_on=False,
+            )
+        ),
+    ]
+    fig.canvas.draw()
+    adapters = [get_artist_adapter(target) for target in targets]
+    pivot = np.asarray(fig.dpi_scale_trans.transform((2.5, 1.9)), dtype=float)
+
+    try:
+        plan = TransformPlan.preflight(
+            targets, TransformIntent.rigid_rotate(-29.0, pivot)
+        )
+        plan.commit()
+        fig.canvas.draw()
+
+        for adapter, member_plan in zip(adapters, plan.rigid_rotation_plans):
+            _assert_px_close(
+                _bounds(adapter.selection_points()),
+                _bounds(member_plan.selection_array()),
+                atol=1e-9,
+            )
+        assert [call[1] for call in tracker.calls] == targets
+    finally:
+        plt.close(fig)
+
+
+def test_mixed_q_rejects_non_symmetric_marker_before_any_mutation() -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    tracker = RecordingChangeTracker()
+    fig.change_tracker = tracker
+    targets = [
+        ax.plot(
+            [0.15, 0.32, 0.48],
+            [0.2, 0.72, 0.38],
+            linestyle="none",
+            marker="o",
+            clip_on=False,
+        )[0],
+        ax.plot(
+            [0.58, 0.7, 0.84],
+            [0.42, 0.76, 0.48],
+            linestyle="none",
+            marker="s",
+            clip_on=False,
+        )[0],
+    ]
+    fig.canvas.draw()
+    adapters = [get_artist_adapter(target) for target in targets]
+    before = [adapter.snapshot() for adapter in adapters]
+    recording_before = tracker.capture_recording_state()
+    pivot = np.asarray(fig.dpi_scale_trans.transform((2.5, 1.9)), dtype=float)
+
+    try:
+        with pytest.raises(TransformPreflightError):
+            TransformPlan.preflight(
+                targets, TransformIntent.rigid_rotate(-29.0, pivot)
+            )
+        assert all(
+            semantic_equal(state, adapter.snapshot())
+            for state, adapter in zip(before, adapters)
+        )
+        assert tracker.capture_recording_state() == recording_before
+    finally:
+        plt.close(fig)
+
+
+@pytest.mark.parametrize("source_x", [0.02, 0.98])
+def test_partially_clipped_circle_marker_q_rejects_before_mutation(
+    source_x,
+) -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    tracker = RecordingChangeTracker()
+    fig.change_tracker = tracker
+    target = ax.plot(
+        [source_x],
+        [0.5],
+        linestyle="none",
+        marker="o",
+        markersize=40.0,
+        markeredgewidth=4.0,
+    )[0]
+    ax.set_xlim(0.0, 1.0)
+    ax.set_ylim(0.0, 1.0)
+    fig.canvas.draw()
+    adapter = get_artist_adapter(target)
+    before = adapter.snapshot()
+    recording_before = tracker.capture_recording_state()
+
+    try:
+        assert adapter.capabilities.can_rigid_rotate
+        with pytest.raises(UnsupportedArtistError, match="partially clipped"):
+            adapter.plan_rigid_rotation(23.0, (250.0, 190.0))
+        assert semantic_equal(before, adapter.snapshot())
+        assert tracker.capture_recording_state() == recording_before
+    finally:
+        plt.close(fig)
+
+
+def test_circle_marker_q_rejects_destination_that_crosses_clip() -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    tracker = RecordingChangeTracker()
+    fig.change_tracker = tracker
+    target = ax.plot(
+        [0.5],
+        [0.5],
+        linestyle="none",
+        marker="o",
+        markersize=18.0,
+    )[0]
+    fig.canvas.draw()
+    adapter = get_artist_adapter(target)
+    center = adapter._marker_display_positions()[0]
+    before = adapter.snapshot()
+    recording_before = tracker.capture_recording_state()
+
+    try:
+        with pytest.raises(UnsupportedArtistError, match="partially clipped"):
+            adapter.plan_rigid_rotation(90.0, center + np.array([200.0, 0.0]))
+        assert semantic_equal(before, adapter.snapshot())
+        assert tracker.capture_recording_state() == recording_before
+    finally:
+        plt.close(fig)
+
+
+@pytest.mark.parametrize(
+    "bad_marker_state",
+    [
+        {"markevery": (0.5, 2)},
+        {"markersize": np.nan},
+        {"markersize": np.inf},
+        {"markeredgewidth": -1.0},
+        {"markeredgewidth": np.finfo(float).max},
+        {"markeredgewidth": 10**1000},
+        {"markevery": (10**1000, 0.2)},
+        {"markevery": slice(None, None, 0.5)},
+        {"markevery": slice(0.5, None, 1)},
+        {"markevery": slice(None, 2.5, 1)},
+        {"markevery": slice(None, None, np.nan)},
+    ],
+)
+def test_invalid_symmetric_marker_state_is_not_advertised_for_q(
+    bad_marker_state,
+) -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    target = ax.plot(
+        [0.2, 0.5, 0.8],
+        [0.25, 0.75, 0.4],
+        linestyle="none",
+        marker="o",
+        clip_on=False,
+        **bad_marker_state,
+    )[0]
+    adapter = get_artist_adapter(target)
+    before = adapter.snapshot()
+
+    try:
+        assert not adapter.capabilities.can_rigid_rotate
+        assert isinstance(adapter.selection_points(), np.ndarray)
+        assert not adapter.operation_support(
+            TransformOperation.SCALE_APPEARANCE
+        ).supported
+        with pytest.raises(UnsupportedArtistError):
+            adapter.plan_rigid_rotation(23.0, (250.0, 190.0))
+        assert semantic_equal(before, adapter.snapshot())
+    finally:
+        plt.close(fig)
+
+
+@pytest.mark.parametrize(
+    "linewidth", [np.nan, np.inf, -1.0, np.finfo(float).max]
+)
+def test_invalid_visible_linewidth_is_not_advertised_for_marker_q(
+    linewidth,
+) -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    target = ax.plot(
+        [0.2, 0.5, 0.8],
+        [0.25, 0.75, 0.4],
+        linestyle="-",
+        linewidth=linewidth,
+        marker="o",
+        clip_on=False,
+    )[0]
+    adapter = get_artist_adapter(target)
+    before = adapter.snapshot()
+
+    try:
+        assert not adapter.capabilities.can_rigid_rotate
+        with pytest.raises(UnsupportedArtistError):
+            adapter.plan_rigid_rotation(23.0, (250.0, 190.0))
+        assert semantic_equal(before, adapter.snapshot())
     finally:
         plt.close(fig)
 

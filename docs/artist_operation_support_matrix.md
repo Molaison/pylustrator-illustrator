@@ -62,7 +62,7 @@ Anchor-mode Text and ordinary similarity Patches use Q preferentially.
 | `Text` | `TextAdapter` | S M R Q A N C conditionally | Axes/data/figure/display transforms; visible text bounds; M; native R; anchor-mode Q; point-font A preview/commit/Undo/Redo/replay; complete N; real replay; Axis-owned property edits | **PASS** | A is limited to visible ordinary point Text with an invertible affine transform; Annotation, Legend/layout-owned, wrapped, bbox, TeX, filtered, sketched, or path-effect Text rejects. Q retains its stricter anchor-mode contract. Geometry resize remains denied. |
 | `Annotation` | `AnnotationAdapter` | S M R N C | Mixed data/axes endpoint coordinates; text and arrow-stroke bounds; two control points; M; R; complete N; real replay | **PASS** | Geometry resize is explicitly denied. |
 | `Legend` | `LegendAdapter` | S M L N C conditionally | Visible handles/text/title union; `frameon=False/True`; M; logical-owner persistence; current/extra/Figure L through frozen plans; six-field layout Undo/Redo; Matplotlib-only replay; N; real replay | **PASS** | L preserves Legend/frame/handle/Text/title/DrawingArea/TextArea identity and replaces only verified standard HPacker/VPacker nodes. `mode="expand"`, custom packers/state, detached owners, and Legend/descendant co-selection reject. Explicit composite handlers can use L even when full Legend reconstruction/replay remains unavailable. Geometry resize remains denied. |
-| `Line2D` | `Line2DAdapter` | S M Q A N C conditionally | Data/log transforms; visible line, marker-path, and marker-edge bounds; M; affine shared-pivot Q; linewidth/markersize/markeredgewidth A; appearance-only Undo/Redo and replay; N; real `.set_data` replay | **PASS** | A requires actual visible line segments or painted marker paths and rejects Legend/layout ownership, pixel markers, filters, path/sketch effects, invalid dimensions, and paint-free/degenerate paths. Q retains its affine marker-free contract. Geometry resize remains denied. |
+| `Line2D` | `Line2DAdapter` | S M Q A N C conditionally | Data/log transforms; visible line, marker-path, and marker-edge bounds; M; affine shared-pivot Q with marker-aware `markevery`; linewidth/markersize/markeredgewidth A; appearance-only Undo/Redo and replay; N; real `.set_data` replay | **PASS** | A requires actual visible line segments or painted marker paths and rejects Legend/layout ownership, pixel markers, filters, path/sketch effects, invalid dimensions, and paint-free/degenerate paths. Q accepts marker-free/invisible-marker lines and centered canonical circle paths whose rendered anisotropy/offset error is at most 0.25 px; other visible glyphs, changed float-`markevery` identities, invalid rendered dimensions, and partial clips reject atomically. Original MaskedArray container/mask data is not yet retained by geometry replay; its numeric NaN/index geometry is. Geometry resize remains denied. |
 | `AxesImage` | `AxesImageAdapter` | S M Z N C | M/Z preview/commit; extent replay; N; x/y viewport and Axes position invariance | **PASS** | R is explicitly unsupported. Moving or resizing the image does not autoscale the camera. |
 | `Rectangle` | `RectangleAdapter` | S M Z R Q N C conditionally | Visible-stroke bounds; fixed-stroke M/Z; native R; common-pivot Q under similarity/reflection transforms; rotated M; rotated-resize denial; N; replay | **PASS** | Q additionally requires `rotation_point` `xy`/`center`, no hatch/effect, and no Legend/container owner. Tuple pivots need a richer plan. Z is only advertised at angles equivalent to 0 degrees modulo 360. |
 | `Ellipse` | `EllipseAdapter` | S M Z R Q N C conditionally | Visible-stroke bounds; fixed-stroke M/Z; native R; common-pivot Q under similarity/reflection transforms; rotated M; rotated-resize denial; N; replay | **PASS** | Q denies non-similarity transforms, hatch/effects, and Legend/container owners. Z is disabled for rotated ellipses. |
@@ -204,6 +204,12 @@ v1 whitelist and typed preflight rejection:
   have writable, invertible affine controls and no unsupported appearance or
   rendered-offset semantics; arbitrary Agg filters reject because their pixel
   offsets are not guaranteed to rotate with geometry;
+- a visible Line2D marker must be a canonical circle path with no partial-fill
+  alternate path and a centered similarity transform within the 0.25 px
+  rendered tolerance. Marker centers are reselected with Matplotlib's exact
+  ``markevery`` algorithm at the representable destination and compared with
+  the rigidly transformed source centers; a float-distance tie that changes
+  vertex identity therefore rejects rather than jumping to a different point;
 - Text must use stable anchor rotation without wrap, bbox, path effect,
   transform-relative angle, Annotation semantics, or a Matplotlib layout owner;
 - Rectangle/Ellipse require a display-similarity transform; Rectangle also
@@ -218,6 +224,17 @@ round-trip error must be at most 0.25 px; the plan stores that representable
 native destination and applies it directly. This rejects numerically singular
 coordinate systems by measured error rather than a fragile global condition-
 number cutoff.
+
+Line2D plans preserve NaN slots (including masked values after Matplotlib's
+numeric conversion) for marker selection while stroke bounds include only
+vertices belonging to a real finite segment, not isolated MOVETO points across
+a gap. The original MaskedArray container and hidden underlying values remain a
+separate snapshot/replay gap. Coordinate conversion is vectorized, rotation
+gestures reuse their immutable source geometry, and large plan arrays are
+backed by immutable bytes instead of per-point Python tuples. In the 100k-point
+probe this reduced one plan from roughly 1.3 s to 55--64 ms; the 10k-point case
+fell to about 6--8 ms. Capability checks remain about 2--4 ms at 100k points and do
+not run the potentially expensive float-distance marker resolver.
 
 Semantic ownership is checked independently from geometric representability.
 Every recursive Legend descendant—including nested errorbar, stem, and tuple

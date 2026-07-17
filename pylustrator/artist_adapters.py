@@ -17,7 +17,8 @@ from __future__ import annotations
 from copy import copy
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
+from numbers import Integral, Real
 from threading import RLock
 from typing import Iterable, Optional, Sequence
 
@@ -32,7 +33,7 @@ except ImportError:
 from matplotlib.collections import LineCollection, PathCollection, PolyCollection
 from matplotlib.image import AxesImage
 from matplotlib.legend import Legend
-from matplotlib.lines import Line2D
+from matplotlib.lines import Line2D, _mark_every_path  # ty: ignore[unresolved-import]
 from matplotlib.path import Path, get_path_collection_extents
 from matplotlib.patches import (
     ConnectionPatch,
@@ -663,20 +664,45 @@ class RigidRotationPlan:
     target: Artist
     angle_degrees: float
     pivot: tuple[float, float]
-    control_points: tuple[tuple[float, float], ...]
-    native_control_points: tuple[tuple[float, float], ...]
-    selection_points: tuple[tuple[float, float], ...]
+    control_points: np.ndarray = field(repr=False, compare=False)
+    native_control_points: np.ndarray = field(repr=False, compare=False)
+    selection_points: np.ndarray = field(repr=False, compare=False)
     rotation_value: Optional[float] = None
     member_plans: tuple["RigidRotationPlan", ...] = ()
 
+    @staticmethod
+    def _immutable_points(points) -> np.ndarray:
+        values = np.asarray(points, dtype=float)
+        if values.size == 0:
+            values = np.empty((0, 2), dtype=float)
+        if values.ndim != 2 or values.shape[1] != 2:
+            raise ValueError("Rigid-rotation plan points must have shape (N, 2)")
+        values = np.ascontiguousarray(values, dtype=float)
+        return np.frombuffer(values.tobytes(), dtype=float).reshape(values.shape)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "control_points", self._immutable_points(self.control_points)
+        )
+        object.__setattr__(
+            self,
+            "native_control_points",
+            self._immutable_points(self.native_control_points),
+        )
+        object.__setattr__(
+            self,
+            "selection_points",
+            self._immutable_points(self.selection_points),
+        )
+
     def control_array(self) -> np.ndarray:
-        return np.asarray(self.control_points, dtype=float)
+        return self.control_points
 
     def native_array(self) -> np.ndarray:
-        return np.asarray(self.native_control_points, dtype=float)
+        return self.native_control_points
 
     def selection_array(self) -> np.ndarray:
-        return np.asarray(self.selection_points, dtype=float)
+        return self.selection_points
 
 
 @dataclass(frozen=True)
@@ -1894,18 +1920,9 @@ class ArtistAdapter:
             target=self.target,
             angle_degrees=float(angle_degrees),
             pivot=tuple(float(value) for value in np.asarray(pivot, dtype=float)),
-            control_points=tuple(
-                tuple(float(value) for value in point)
-                for point in np.asarray(planned_control, dtype=float)
-            ),
-            native_control_points=tuple(
-                tuple(float(value) for value in point)
-                for point in np.asarray(planned_native, dtype=float)
-            ),
-            selection_points=tuple(
-                tuple(float(value) for value in point)
-                for point in np.asarray(visible, dtype=float)
-            ),
+            control_points=planned_control,
+            native_control_points=planned_native,
+            selection_points=visible,
             rotation_value=(
                 None if rotation_value is None else float(rotation_value)
             ),
@@ -4013,16 +4030,12 @@ class EditorGroupAdapter(ArtistAdapter):
             adapter.plan_rigid_rotation(angle_degrees, pivot)
             for adapter in adapters
         )
-        control = [
-            point
-            for plan in member_plans
-            for point in plan.control_points
-        ]
-        native = [
-            point
-            for plan in member_plans
-            for point in plan.native_control_points
-        ]
+        control = np.concatenate(
+            [plan.control_array() for plan in member_plans], axis=0
+        )
+        native = np.concatenate(
+            [plan.native_array() for plan in member_plans], axis=0
+        )
         visible = [
             plan.selection_array()
             for adapter, plan in zip(adapters, member_plans)
@@ -4037,11 +4050,9 @@ class EditorGroupAdapter(ArtistAdapter):
             target=self.target,
             angle_degrees=float(angle_degrees),
             pivot=tuple(float(value) for value in np.asarray(pivot, dtype=float)),
-            control_points=tuple(control),
-            native_control_points=tuple(native),
-            selection_points=tuple(
-                tuple(float(value) for value in point) for point in selection
-            ),
+            control_points=control,
+            native_control_points=native,
+            selection_points=selection,
             member_plans=member_plans,
         )
 
@@ -4144,7 +4155,8 @@ class Line2DAdapter(ArtistAdapter):
         ),
         TransformOperation.RIGID_ROTATE: (
             "Line common-pivot rotation requires an affine transform, default "
-            "drawstyle, and no marker or path effect"
+            "drawstyle, and either no visible marker or a continuously "
+            "rotation-symmetric marker"
         ),
         TransformOperation.SCALE_APPEARANCE: (
             "Line appearance scaling requires finite stroke and marker dimensions"
@@ -4161,43 +4173,114 @@ class Line2DAdapter(ArtistAdapter):
     def capabilities_for(cls, target: Line2D) -> ArtistCapabilities:
         if not len(cls.finite_points(target.get_xydata())):
             return ArtistCapabilities()
-        marker = target.get_marker()
+        adapter = cls(target)
+        try:
+            marker_rotation_supported = adapter._marker_rigid_rotation_supported(
+                strict=True, resolve_positions=False
+            )
+            line_rotation_supported = adapter._line_rigid_rotation_supported(
+                strict=True
+            )
+        except UnsupportedArtistError:
+            marker_rotation_supported = False
+            line_rotation_supported = False
         can_rigid_rotate = bool(
             legend_owner_for_artist(target) is None
             and active_layout_owner_for_artist(target) is None
             and cls.transform_is_invertible_affine(target.get_transform())
             and target.get_drawstyle() == "default"
-            and marker in (None, "", " ", "none", "None")
+            and marker_rotation_supported
+            and line_rotation_supported
             and target.get_agg_filter() is None
             and not target.get_path_effects()
+            and target.get_sketch_params() is None
         )
         return replace(
             cls.default_capabilities, can_rigid_rotate=can_rigid_rotate
         )
 
-    def _line_paint_is_visible(self) -> bool:
+    def _line_stroke_is_configured(self) -> bool:
         linestyle = self.target.get_linestyle()
         if linestyle in (None, "", " ", "none", "None"):
             return False
-        if float(self.target.get_linewidth()) <= 0.0:
-            return False
+        colors = []
         try:
-            color = mpl.colors.to_rgba(
-                self.target.get_color(), self.target.get_alpha()
+            colors.append(
+                mpl.colors.to_rgba(
+                    self.target.get_color(), self.target.get_alpha()
+                )
             )
         except (TypeError, ValueError):
-            return False
-        if not self.colors_are_visible(color):
+            pass
+        gap_color = getattr(self.target, "get_gapcolor", lambda: None)()
+        if self.target.is_dashed() and gap_color is not None:
+            try:
+                colors.append(
+                    mpl.colors.to_rgba(gap_color, self.target.get_alpha())
+                )
+            except (TypeError, ValueError):
+                pass
+        if not self.colors_are_visible(colors):
             return False
         return self.path_has_drawable_segment(self.target.get_path())
+
+    def _line_paint_is_visible(self) -> bool:
+        if not self._line_stroke_is_configured():
+            return False
+        try:
+            linewidth = float(self.target.get_linewidth())
+        except (TypeError, ValueError):
+            return False
+        return bool(np.isfinite(linewidth) and linewidth > 0.0)
+
+    def _line_rigid_rotation_supported(self, *, strict: bool = False) -> bool:
+        if not self._line_stroke_is_configured():
+            return True
+        try:
+            linewidth = float(self.target.get_linewidth())
+            rendered_linewidth = self.points_to_pixels(linewidth)
+        except (OverflowError, TypeError, ValueError):
+            linewidth = float("nan")
+            rendered_linewidth = float("nan")
+        if (
+            not np.isfinite(linewidth)
+            or linewidth < 0.0
+            or not np.isfinite(rendered_linewidth)
+            or rendered_linewidth < 0.0
+        ):
+            if strict:
+                raise UnsupportedArtistError(
+                    "Line2D linewidth must be finite and non-negative"
+                )
+            return False
+        return True
+
+    def _finite_marker_dimensions(self) -> tuple[float, float] | None:
+        try:
+            values = np.asarray(
+                (
+                    float(self.target.get_markersize()),
+                    float(self.target.get_markeredgewidth()),
+                ),
+                dtype=float,
+            )
+        except (OverflowError, TypeError, ValueError):
+            return None
+        if not np.all(np.isfinite(values)) or np.any(values < 0.0):
+            return None
+        return float(values[0]), float(values[1])
 
     def _marker_painted_paths(self) -> list[tuple[Path, Transform]]:
         marker = self.target._marker
         if not marker:
             return []
+        dimensions = self._finite_marker_dimensions()
+        if dimensions is None:
+            return []
+        _markersize, markeredgewidth = dimensions
         alpha = self.target.get_alpha()
         edge_visible = False
-        if float(self.target.get_markeredgewidth()) > 0.0:
+        if markeredgewidth > 0.0:
             try:
                 edge_visible = self.colors_are_visible(
                     mpl.colors.to_rgba(self.target.get_markeredgecolor(), alpha)
@@ -4241,15 +4324,229 @@ class Line2DAdapter(ArtistAdapter):
                 components.append((path, transform))
         return components
 
-    def _marker_paint_is_visible(self) -> bool:
+    def _markevery_schema_is_valid(self) -> bool:
+        markevery = self.target.get_markevery()
+        if markevery is None:
+            return True
+        if isinstance(markevery, Integral):
+            return int(markevery) != 0
+        if isinstance(markevery, Real):
+            try:
+                value = float(markevery)
+            except (OverflowError, TypeError, ValueError):
+                return False
+            return bool(np.isfinite(value) and value != 0.0)
+        if isinstance(markevery, tuple):
+            if len(markevery) != 2:
+                return False
+            start, step = markevery
+            if isinstance(step, Integral):
+                return isinstance(start, Integral) and int(step) != 0
+            if isinstance(step, Real):
+                try:
+                    return bool(
+                        isinstance(start, Real)
+                        and np.isfinite(float(start))
+                        and np.isfinite(float(step))
+                        and float(step) != 0.0
+                    )
+                except (OverflowError, TypeError, ValueError):
+                    return False
+            return False
+        if isinstance(markevery, slice):
+            return bool(
+                all(
+                    value is None or isinstance(value, Integral)
+                    for value in (
+                        markevery.start,
+                        markevery.stop,
+                        markevery.step,
+                    )
+                )
+                and (markevery.step is None or int(markevery.step) != 0)
+            )
+        try:
+            indices = np.asarray(markevery)
+        except (TypeError, ValueError):
+            return False
+        if indices.ndim != 1:
+            return False
+        if indices.size == 0:
+            return True
+        if np.issubdtype(indices.dtype, np.bool_):
+            return len(indices) == len(self.target.get_xydata())
+        if not np.issubdtype(indices.dtype, np.integer):
+            return False
+        length = len(self.target.get_xydata())
+        return bool(np.all(indices >= -length) and np.all(indices < length))
+
+    def _markevery_is_definitely_empty(self) -> bool:
+        markevery = self.target.get_markevery()
+        length = len(self.target.get_xydata())
+        try:
+            if isinstance(markevery, Integral):
+                return len(range(length)[slice(0, None, int(markevery))]) == 0
+            if (
+                isinstance(markevery, tuple)
+                and len(markevery) == 2
+                and isinstance(markevery[0], Integral)
+                and isinstance(markevery[1], Integral)
+                and int(markevery[1]) != 0
+            ):
+                return (
+                    len(
+                        range(length)[
+                            slice(int(markevery[0]), None, int(markevery[1]))
+                        ]
+                    )
+                    == 0
+                )
+            if isinstance(markevery, slice) and self._markevery_schema_is_valid():
+                return len(range(length)[markevery]) == 0
+        except (OverflowError, TypeError, ValueError):
+            return False
+        if isinstance(markevery, (list, np.ndarray)):
+            try:
+                indices = np.asarray(markevery)
+            except (TypeError, ValueError):
+                return False
+            return bool(
+                indices.size == 0
+                or (
+                    indices.ndim == 1
+                    and np.issubdtype(indices.dtype, np.bool_)
+                    and not np.any(indices)
+                )
+            )
+        return False
+
+    def _marker_paint_is_visible(
+        self, *, strict: bool = False, resolve_positions: bool = True
+    ) -> bool:
         marker = self.target._marker
+        dimensions = self._finite_marker_dimensions()
         if (
             not marker
-            or float(self.target.get_markersize()) <= 0.0
-            or not len(self._marker_display_positions())
+            or dimensions is None
+            or dimensions[0] <= 0.0
+        ):
+            return False
+        if not self._markevery_schema_is_valid():
+            if strict:
+                raise UnsupportedArtistError(
+                    "Line2D markevery is not valid for rigid rotation"
+                )
+            return False
+        if self._markevery_is_definitely_empty():
+            return False
+        if resolve_positions and not len(
+            self._marker_display_positions(strict=strict)
         ):
             return False
         return bool(self._marker_painted_paths())
+
+    def _marker_rigid_rotation_supported(
+        self, *, strict: bool = False, resolve_positions: bool = True
+    ) -> bool:
+        """Whether marker paint remains identical under arbitrary rotation."""
+
+        marker = self.target._marker
+        if marker:
+            dimensions = self._finite_marker_dimensions()
+            if dimensions is None:
+                if strict:
+                    raise UnsupportedArtistError(
+                        "Line2D marker dimensions must be finite and non-negative"
+                    )
+                return False
+            try:
+                rendered_marker_edgewidth = self.points_to_pixels(dimensions[1])
+            except (OverflowError, TypeError, ValueError):
+                rendered_marker_edgewidth = float("nan")
+            if (
+                not np.isfinite(rendered_marker_edgewidth)
+                or rendered_marker_edgewidth < 0.0
+            ):
+                if strict:
+                    raise UnsupportedArtistError(
+                        "Line2D marker dimensions must be finite and non-negative"
+                    )
+                return False
+        if not self._markevery_schema_is_valid():
+            if strict:
+                raise UnsupportedArtistError(
+                    "Line2D markevery is not valid for rigid rotation"
+                )
+            return False
+        if not self._marker_paint_is_visible(
+            strict=strict, resolve_positions=resolve_positions
+        ):
+            return True
+        path = marker.get_path()
+        circle = Path.unit_circle()
+        transform = marker.get_transform()
+        try:
+            matrix = np.asarray(transform.get_affine().get_matrix(), dtype=float)
+            marker_scale_pixels = self.points_to_pixels(
+                float(self.target.get_markersize())
+            )
+            singular_values = np.linalg.svd(
+                matrix[:2, :2], compute_uv=False
+            )
+            rendered_anisotropy = marker_scale_pixels * abs(
+                float(singular_values[0] - singular_values[1])
+            )
+            rendered_offset_sweep = (
+                2.0
+                * marker_scale_pixels
+                * float(np.linalg.norm(matrix[:2, 2]))
+            )
+        except (
+            AttributeError,
+            IndexError,
+            OverflowError,
+            TypeError,
+            ValueError,
+            RuntimeError,
+            np.linalg.LinAlgError,
+        ):
+            return False
+        centered_circle = bool(
+            path.vertices.shape == circle.vertices.shape
+            and np.array_equal(path.vertices, circle.vertices)
+            and (
+                (path.codes is None and circle.codes is None)
+                or (
+                    path.codes is not None
+                    and circle.codes is not None
+                    and np.array_equal(path.codes, circle.codes)
+                )
+            )
+            and matrix.shape == (3, 3)
+            and np.all(np.isfinite(matrix))
+            and np.all(np.isfinite(singular_values))
+            and np.isfinite(marker_scale_pixels)
+            and marker_scale_pixels > 0.0
+            and singular_values[-1] > np.finfo(float).eps
+            and np.isfinite(rendered_anisotropy)
+            and np.isfinite(rendered_offset_sweep)
+            and rendered_anisotropy + rendered_offset_sweep <= 0.25
+        )
+        supported = bool(
+            marker.get_fillstyle() in {"full", "none"}
+            and marker.get_alt_path() is None
+            and centered_circle
+        )
+        if supported and resolve_positions:
+            marker_bounds = self._marker_selection_points(strict=strict)
+            supported = bool(
+                len(marker_bounds) and np.all(np.isfinite(marker_bounds))
+            )
+        return supported
+
+    def _marker_is_pixel(self) -> bool:
+        marker_value = self.target._marker.get_marker()
+        return bool(isinstance(marker_value, str) and marker_value == ",")
 
     def operation_support(
         self, operation: TransformOperation | str
@@ -4282,7 +4579,12 @@ class Line2DAdapter(ArtistAdapter):
                 operation,
                 "Line2D sketch effects have independent display-space dimensions",
             )
-        if self.target.get_marker() == "," and float(self.target.get_markersize()) > 0:
+        marker_dimensions = self._finite_marker_dimensions()
+        if (
+            self._marker_is_pixel()
+            and marker_dimensions is not None
+            and marker_dimensions[0] > 0.0
+        ):
             return OperationSupport.denied(
                 operation,
                 "The pixel marker has a renderer-fixed one-pixel appearance",
@@ -4296,9 +4598,18 @@ class Line2DAdapter(ArtistAdapter):
                 ),
                 dtype=float,
             )
-        except (TypeError, ValueError):
+            rendered_values = np.asarray(
+                [self.points_to_pixels(value) for value in values], dtype=float
+            )
+        except (OverflowError, TypeError, ValueError):
             values = np.asarray((np.nan,), dtype=float)
-        if not np.all(np.isfinite(values)) or np.any(values < 0.0):
+            rendered_values = np.asarray((np.nan,), dtype=float)
+        if (
+            not np.all(np.isfinite(values))
+            or np.any(values < 0.0)
+            or not np.all(np.isfinite(rendered_values))
+            or np.any(rendered_values < 0.0)
+        ):
             return OperationSupport.denied(
                 operation,
                 "Line2D stroke and marker dimensions must be finite and non-negative",
@@ -4363,54 +4674,81 @@ class Line2DAdapter(ArtistAdapter):
         points = self.point_array(self.target.get_xydata())
         if not len(points):
             return points
-        return self.finite_points(self.target.get_transform().transform(points))
+        return self.point_array(self.target.get_transform().transform(points))
 
-    def _marker_display_positions(self, points=None) -> np.ndarray:
+    def _marker_display_positions(
+        self, points=None, *, strict: bool = False
+    ) -> np.ndarray:
         if points is None:
             points = self._display_xydata()
         else:
-            points = np.asarray(points, dtype=float)
+            points = self.point_array(points)
+        if not len(points):
+            return np.empty((0, 2), dtype=float)
         markevery = self.target.get_markevery()
         if markevery is None:
             return self.finite_points(points)
         try:
-            if isinstance(markevery, (int, np.integer)):
-                points = points[:: int(markevery)]
-            elif (
-                isinstance(markevery, tuple)
-                and len(markevery) == 2
-                and all(isinstance(value, (int, np.integer)) for value in markevery)
-            ):
-                points = points[int(markevery[0]) :: int(markevery[1])]
-            elif isinstance(markevery, (slice, list, np.ndarray)):
-                points = points[markevery]
-        except (IndexError, TypeError, ValueError, ZeroDivisionError):
-            # Float-distance markevery requires Axes-diagonal interpolation.
-            # Falling back to all vertices is conservative and matches
-            # Matplotlib's own get_window_extent behavior.
-            pass
+            points = _mark_every_path(
+                markevery,
+                Path(points),
+                IdentityTransform(),
+                self.target.axes,
+            ).vertices
+        except (
+            IndexError,
+            OverflowError,
+            TypeError,
+            ValueError,
+            ZeroDivisionError,
+        ) as error:
+            if strict:
+                raise UnsupportedArtistError(
+                    "Line2D markevery cannot be resolved exactly for rigid rotation"
+                ) from error
+            # Selection stays conservative for invalid or renderer-dependent
+            # inputs, but rigid-rotation capability uses the strict path above.
         return self.finite_points(points)
 
-    def _marker_selection_points(self, positions=None) -> np.ndarray:
+    def _marker_selection_points(
+        self,
+        positions=None,
+        *,
+        strict: bool = False,
+        positions_are_resolved: bool = False,
+    ) -> np.ndarray:
         marker = self.target._marker
-        if not marker or float(self.target.get_markersize()) <= 0:
+        dimensions = self._finite_marker_dimensions()
+        if not marker or dimensions is None or dimensions[0] <= 0.0:
             return np.empty((0, 2), dtype=float)
+        markersize, markeredgewidth = dimensions
         alpha = self.target.get_alpha()
         painted_paths = self._marker_painted_paths()
         if not painted_paths:
             return np.empty((0, 2), dtype=float)
 
-        positions = self._marker_display_positions(positions)
+        if positions_are_resolved:
+            positions = self.finite_points(positions)
+        else:
+            positions = self._marker_display_positions(positions, strict=strict)
         if not len(positions):
             return np.empty((0, 2), dtype=float)
-        is_pixel = marker.get_marker() == ","
+        is_pixel = self._marker_is_pixel()
+        try:
+            rendered_markersize = self.points_to_pixels(markersize)
+            rendered_markeredgewidth = self.points_to_pixels(markeredgewidth)
+        except (OverflowError, TypeError, ValueError):
+            return np.empty((0, 2), dtype=float)
+        if not is_pixel and (
+            not np.isfinite(rendered_markersize)
+            or not np.isfinite(rendered_markeredgewidth)
+        ):
+            return np.empty((0, 2), dtype=float)
         relative = []
         for path, transform in painted_paths:
             transform = transform.frozen()
             if not is_pixel:
-                transform.scale(
-                    self.points_to_pixels(float(self.target.get_markersize()))
-                )
+                transform.scale(rendered_markersize)
             relative.append(
                 np.asarray(
                     path.get_extents(transform).get_points(), dtype=float
@@ -4425,9 +4763,7 @@ class Line2DAdapter(ArtistAdapter):
         except (TypeError, ValueError):
             edge = (0.0, 0.0, 0.0, 0.0)
         if not is_pixel and self.colors_are_visible(edge):
-            edge_padding = self.points_to_pixels(
-                max(float(self.target.get_markeredgewidth()), 0.0)
-            ) / 2
+            edge_padding = rendered_markeredgewidth / 2
         relative = self.bounds_points(relative, padding=edge_padding)
         return np.array(
             [
@@ -4443,6 +4779,35 @@ class Line2DAdapter(ArtistAdapter):
             dtype=float,
         )
 
+    def _line_selection_points(self, display_points) -> np.ndarray:
+        display_points = self.point_array(display_points)
+        try:
+            linewidth = float(self.target.get_linewidth())
+        except (TypeError, ValueError):
+            linewidth = float("nan")
+        if (
+            self._line_stroke_is_configured()
+            and np.isfinite(linewidth)
+            and linewidth > 0.0
+        ):
+            finite = np.all(np.isfinite(display_points), axis=1)
+            used = np.zeros(len(display_points), dtype=bool)
+            if len(display_points) >= 2:
+                drawable = (
+                    finite[:-1]
+                    & finite[1:]
+                    & np.any(display_points[1:] != display_points[:-1], axis=1)
+                )
+                used[:-1] |= drawable
+                used[1:] |= drawable
+            line = self.bounds_points(
+                display_points[used],
+                padding=self.points_to_pixels(linewidth) / 2,
+            )
+            if len(line):
+                return line
+        return np.empty((0, 2), dtype=float)
+
     def selection_points(self) -> np.ndarray:
         preview = self._preview_points("_pylustrator_preview_selection_points")
         if preview is not None:
@@ -4451,36 +4816,9 @@ class Line2DAdapter(ArtistAdapter):
         display_points = self._display_xydata()
         if not len(display_points):
             return np.empty((0, 2), dtype=float)
-        linestyle = self.target.get_linestyle()
-        line_is_drawn = linestyle not in (None, "", " ", "none", "None")
-        line_colors = []
-        try:
-            line_colors.append(
-                mpl.colors.to_rgba(
-                    self.target.get_color(), self.target.get_alpha()
-                )
-            )
-        except (TypeError, ValueError):
-            pass
-        gap_color = getattr(self.target, "get_gapcolor", lambda: None)()
-        if gap_color is not None:
-            try:
-                line_colors.append(
-                    mpl.colors.to_rgba(gap_color, self.target.get_alpha())
-                )
-            except (TypeError, ValueError):
-                pass
-        if (
-            line_is_drawn
-            and self.colors_are_visible(line_colors)
-            and float(self.target.get_linewidth()) > 0
-        ):
-            line = self.bounds_points(
-                display_points,
-                padding=self.points_to_pixels(float(self.target.get_linewidth())) / 2,
-            )
-            if len(line):
-                visible_groups.append(line)
+        line = self._line_selection_points(display_points)
+        if len(line):
+            visible_groups.append(line)
         markers = self._marker_selection_points(display_points)
         if len(markers):
             visible_groups.append(markers)
@@ -4488,16 +4826,82 @@ class Line2DAdapter(ArtistAdapter):
             return self.bounds_points(np.concatenate(visible_groups))
         return super().selection_points()
 
-    def native_control_points(self):
-        return [np.asarray(point, dtype=float) for point in self.target.get_xydata()]
+    def preview_rigid_rotation_selection_points(
+        self,
+        matrix,
+        *,
+        control_points,
+        selection_points,
+        planned_control_points,
+        planned_native_control_points,
+        rotation_value: float | None,
+    ) -> np.ndarray:
+        """Recompute Line2D paint from the exact destination marker subset."""
 
-    def native_to_display(self, points):
+        destination_markers = np.empty((0, 2), dtype=float)
+        if self._marker_paint_is_visible(
+            strict=True, resolve_positions=False
+        ):
+            source_markers = self._marker_display_positions(
+                control_points, strict=True
+            )
+            destination_markers = self._marker_display_positions(
+                planned_control_points, strict=True
+            )
+            expected_markers = self._transform_points(matrix, source_markers)
+            if (
+                destination_markers.shape != expected_markers.shape
+                or not np.allclose(
+                    destination_markers,
+                    expected_markers,
+                    atol=0.25,
+                    rtol=0.0,
+                )
+            ):
+                raise UnsupportedArtistError(
+                    "Line2D markevery would select different marker vertices "
+                    "after rigid rotation"
+                )
+        visible_groups = []
+        line = self._line_selection_points(planned_control_points)
+        if len(line):
+            visible_groups.append(line)
+        markers = self._marker_selection_points(
+            destination_markers,
+            strict=True,
+            positions_are_resolved=True,
+        )
+        if len(markers):
+            visible_groups.append(markers)
+        if visible_groups:
+            return self.bounds_points(np.concatenate(visible_groups))
+        return np.empty((0, 2), dtype=float)
+
+    def native_control_points(self) -> np.ndarray:
+        return self.point_array(self.target.get_xydata()).copy()
+
+    def control_points(self) -> np.ndarray:
+        preview = self._preview_points("_pylustrator_preview_positions")
+        if preview is not None:
+            return self.point_array(preview).copy()
+        return self.point_array(self.native_to_display(self.native_control_points()))
+
+    def native_to_display(self, points) -> np.ndarray:
+        points = self.point_array(points)
+        if not len(points):
+            return points
         transform = self.target.get_transform()
-        return [np.asarray(transform.transform(point), dtype=float) for point in points]
+        return self.point_array(transform.transform(points))
 
-    def display_to_native(self, points):
+    def display_to_native(self, points) -> np.ndarray:
+        points = self.point_array(points)
+        if not len(points):
+            return points
         transform = self.target.get_transform().inverted()
-        return [np.asarray(transform.transform(point), dtype=float) for point in points]
+        return self.point_array(transform.transform(points))
+
+    def local_control_points(self) -> np.ndarray:
+        return self.point_array(self.display_to_native(self.control_points()))
 
     def _apply_native_control_points(self, points) -> None:
         xy = np.asarray(points, dtype=float)

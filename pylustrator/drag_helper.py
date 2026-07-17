@@ -1086,7 +1086,16 @@ class GrabbableRectangleSelection(GrabFunctions):
                 self._restore_move_start()
                 with selection_geometry_snapshot():
                     plans = tuple(
-                        target.plan_rigid_rotation(delta, self.rotation_drag_pivot)
+                        target.plan_rigid_rotation(
+                            delta,
+                            self.rotation_drag_pivot,
+                            control_points=self.move_start_positions.get(
+                                id(target.target)
+                            ),
+                            selection_points=self.move_start_raw_selection_points.get(
+                                id(target.target)
+                            ),
+                        )
                         for target in self.targets
                     )
                 for target, plan in zip(self.targets, plans):
