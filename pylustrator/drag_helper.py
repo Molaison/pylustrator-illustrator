@@ -34,6 +34,7 @@ from typing import Iterable, Sequence
 from qtpy import QtCore, QtGui, QtWidgets
 
 from .artist_adapters import (
+    ArtistAdapter,
     UnsupportedArtistError,
     invalidate_legend_owner_inventory,
     iter_figure_legends,
@@ -53,7 +54,8 @@ from .change_tracker import ChangeTracker, add_text_default
 from .components.plot_layout import scene_point_to_canvas_pixels
 from .editor_model import EditorGroup, EditorScene
 from .interaction import HitCandidate, HitStack, SelectionKernel, SelectionMode
-from .operations import OperationSupport, TransformOperation
+from .operations import OperationSupport, TransformIntent, TransformOperation
+from .transform_engine import TransformPlan
 from .property_adapters import axis_tick_label_reference
 from .commands import InteractionState, ObjectLocator, semantic_equal
 from pylustrator.change_tracker import UndoRedo
@@ -910,6 +912,48 @@ class GrabbableRectangleSelection(GrabFunctions):
         self.update_selection_rectangles()
         return True
 
+    def scale_appearance_selection(self, factor: float) -> bool:
+        """Scale font/stroke/marker appearance without changing geometry."""
+
+        factor = float(factor)
+        if not np.isfinite(factor) or factor <= 0.0:
+            raise ValueError("Appearance scale factor must be finite and positive")
+        if not self.targets or factor == 1.0:
+            return False
+        plan = TransformPlan.preflight(
+            [target.target for target in self.targets],
+            TransformIntent.scale_appearance(factor),
+        )
+        save_targets = self._unique_wrappers(self.targets)
+        store_start = self.get_save_point(
+            save_targets, appearance_only=True
+        )
+        try:
+            plan.commit()
+            self.figure.canvas.draw()
+            self.update_extent()
+        except Exception as error:
+            rollback_failures = []
+            try:
+                store_start()
+            except Exception as rollback_error:
+                rollback_failures.append((self, rollback_error))
+            ArtistAdapter.annotate_rollback_failures(error, rollback_failures)
+            raise
+        store_end = self.get_save_point(
+            save_targets, appearance_only=True
+        )
+        self.figure.signals.figure_selection_moved.emit()
+        self.figure.change_tracker.addEdit(
+            [store_start, store_end, "Scale appearance"]
+        )
+        self.update_selection_rectangles()
+        dragger = getattr(self.figure, "figure_dragger", None)
+        notify = getattr(dragger, "_notify_selected_element_changed", None)
+        if callable(notify):
+            notify()
+        return True
+
     @staticmethod
     def _rotatable_value(target: Artist) -> float | None:
         wrapped = TargetWrapper(target)
@@ -1637,7 +1681,12 @@ class GrabbableRectangleSelection(GrabFunctions):
         return self.transform(pos)
 
     @selection_geometry_snapshot()
-    def get_save_point(self, targets: Iterable[TargetWrapper] = None) -> callable:
+    def get_save_point(
+        self,
+        targets: Iterable[TargetWrapper] = None,
+        *,
+        appearance_only: bool = False,
+    ) -> callable:
         """gather the current positions in a restore point for the undo function"""
         selected_targets = [target.target for target in self.targets]
         alignment_reference_mode = self.alignment_reference_mode
@@ -1646,7 +1695,14 @@ class GrabbableRectangleSelection(GrabFunctions):
         selected_primary = getattr(dragger, "selected_element", None)
         wrapped_targets = self._unique_wrappers(targets or self.targets)
         restore_targets = [target.target for target in wrapped_targets]
-        states = [target.get_restore_state() for target in wrapped_targets]
+        states = [
+            (
+                target.get_appearance_state()
+                if appearance_only
+                else target.get_restore_state()
+            )
+            for target in wrapped_targets
+        ]
         tracker = getattr(self.figure, "change_tracker", None)
         capture = getattr(tracker, "capture_recording_state", None)
         recording_state = capture() if capture is not None else None
@@ -1656,9 +1712,14 @@ class GrabbableRectangleSelection(GrabFunctions):
             self.clear_targets()
             for target, state in zip(restore_targets, states):
                 target = TargetWrapper(target)
-                target.restore_state(
-                    state, record_changes=recording_state is None
-                )
+                if appearance_only:
+                    target.restore_appearance_state(
+                        state, record_changes=recording_state is None
+                    )
+                else:
+                    target.restore_state(
+                        state, record_changes=recording_state is None
+                    )
             restore_recording = getattr(tracker, "restore_recording_state", None)
             if recording_state is not None and restore_recording is not None:
                 restore_recording(recording_state)
@@ -2288,6 +2349,20 @@ class DragManager:
         window = getattr(self.figure, "window", None)
         if window is not None and hasattr(window, "updateSelectionControls"):
             window.updateSelectionControls()
+
+    def _notify_selected_element_changed(self) -> None:
+        """Refresh property panels without changing the current selection."""
+
+        current = [target.target for target in self.selection.targets]
+        element = self.selected_element if self.selected_element in current else None
+        if element is None and current:
+            element = current[-1]
+            self.selected_element = element
+        signals = getattr(self.figure, "signals", None)
+        selected = getattr(signals, "figure_element_selected", None)
+        emit = getattr(selected, "emit", None)
+        if callable(emit):
+            emit(element)
 
     def set_selection_mode(self, mode: SelectionMode | str) -> SelectionMode:
         result = self._ensure_selection_kernel().set_mode(mode)
@@ -3664,6 +3739,7 @@ class DragManager:
         current = [target.target for target in self.selection.targets]
         self.selected_element = current[-1] if current else None
         self._update_interaction_controls()
+        self._notify_selected_element_changed()
         self.figure.canvas.draw()
 
     def redo(self):
@@ -3672,6 +3748,7 @@ class DragManager:
         current = [target.target for target in self.selection.targets]
         self.selected_element = current[-1] if current else None
         self._update_interaction_controls()
+        self._notify_selected_element_changed()
         self.figure.canvas.draw()
 
     def key_press_event(self, event: KeyEvent):

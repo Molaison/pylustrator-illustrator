@@ -200,6 +200,56 @@ marquee selects 364 targets in 70.5 ms median. This is slightly slower than the
 well below the earlier 125.6 ms adapter result; whole-selection move and undo
 remain subsecond with unchanged numerical error.
 
+### P1a: Explicit appearance scaling
+
+Implemented on 2026-07-17 as a separate semantic operation rather than a
+fallback from geometry resize. The Align panel keeps its existing geometry
+scale controls and adds explicit `A+`/`A−` controls. The first batch supports:
+
+- ordinary visible point Text through font size;
+- Line2D through linewidth, marker size, and marker-edge width;
+- LineCollection and visibly stroked PolyCollection through linewidths; and
+- PathCollection through linewidths and marker areas (`size × factor²`).
+
+Every mixed selection is capability-checked before mutation and consumes one
+frozen absolute plan for preview and commit. Factor `1` is an exact no-op;
+finite near-one factors remain valid edits. Generated records contain only the
+owned appearance setters, and Undo/Redo restores appearance, selection, the
+primary object, alignment state, and generated bookkeeping atomically.
+
+Appearance has its own transaction state rather than piggybacking on geometry
+snapshots. This both preserves the semantic boundary and removes appearance
+checks from ordinary move/rotate snapshot hot paths. Marker/collection support
+requires actual rendered paint: visible colors and positive dimensions are not
+enough when paths have no fill area or strokable segment. Unique marker paths
+are analyzed once, keeping large scatter capability checks linear in item
+metadata rather than repeatedly parsing the same path.
+
+The first batch deliberately rejects Annotation, Legend/layout-managed Text,
+wrapped/bbox/TeX/effected Text, pixel markers, hatch, filters, sketch/path
+effects, Legend/layout-owned children, invalid or underflowing dimensions, and
+paint-free or degenerate paths. No unsupported geometry resize silently turns
+into appearance scale.
+
+The read-only Fig2 fork scanned 1,457 live Artists. It advertised appearance
+scaling for 427 instances (28 Text, 352 Line2D, 7 LineCollection, and 40
+PathCollection); every supported instance produced a finite, side-effect-free
+preflight. Per-type commit/draw/restore workflows had zero preview error and
+emitted only their appearance-owned setters. The formal editable Fig2 remained
+byte-identical before and after at SHA-256
+`aba67bbd663fd16da535aa30d43f607c7205d096455f44544e518607cdce2dbb`.
+
+### P1b: Identity-preserving Legend reflow (next)
+
+Legend layout remains a separate operation. The discarded donor/transplant
+prototype preserved the outer Legend but replaced handles, Text, title, and
+packer identities, violating direct-selection and Undo/Redo contracts. The
+next implementation must reuse every existing Artist and DrawingArea/TextArea,
+replace only standard HPacker/VPacker structure, and preserve manual child
+offsets. Its v1 layout spec is limited to `ncols`, `borderpad`, `labelspacing`,
+`handlelength`, `handletextpad`, and `columnspacing`; `mode="expand"`, unknown
+packers, and simultaneous Legend/descendant selection reject before mutation.
+
 The transform bar now has a 3x3 reference locator. Numeric X/Y addresses that
 point on the exact visible selection bounds, while W/H resizes about the same
 point through one preflighted atomic transaction. Physical units compose in the

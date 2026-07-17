@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import FrozenInstanceError, dataclass, fields
+from types import MethodType
 from typing import Callable
 
 import matplotlib
@@ -283,6 +284,7 @@ def _line_collection(_fig, ax):
             [[0.52, 0.3], [0.78, 0.74]],
         ],
         linewidths=[1.0, 2.0],
+        edgecolors=["tab:blue", "tab:orange"],
     )
     ax.add_collection(target)
     return target
@@ -295,6 +297,7 @@ def _poly_collection(_fig, ax):
             [[0.56, 0.3], [0.82, 0.35], [0.72, 0.68]],
         ],
         linewidths=[1.0, 2.0],
+        edgecolors=["tab:blue", "tab:orange"],
     )
     ax.add_collection(target)
     return target
@@ -544,16 +547,27 @@ OPERATION_CAPABILITY = {
     TransformOperation.SERIALIZE: "can_serialize",
 }
 
+SEMANTIC_OPERATION_SUPPORT = {
+    TransformOperation.SCALE_APPEARANCE: {
+        "Text",
+        "Line2D",
+        "PathCollection",
+        "LineCollection",
+        "PolyCollection",
+    },
+}
+
 
 @pytest.mark.parametrize("operation", tuple(TransformOperation))
 def test_operation_support_agrees_with_capabilities(artist_case, operation) -> None:
     support = artist_case.adapter.operation_support(operation)
     capability_name = OPERATION_CAPABILITY.get(operation)
-    expected = (
-        bool(getattr(artist_case.adapter.capabilities, capability_name))
-        if capability_name is not None
-        else False
-    )
+    if capability_name is not None:
+        expected = bool(getattr(artist_case.adapter.capabilities, capability_name))
+    else:
+        expected = artist_case.spec.name in SEMANTIC_OPERATION_SUPPORT.get(
+            operation, set()
+        )
 
     assert support.operation is operation
     assert support.supported is expected
@@ -561,6 +575,531 @@ def test_operation_support_agrees_with_capabilities(artist_case, operation) -> N
         assert support.reason == ""
     else:
         assert support.reason.strip()
+
+
+APPEARANCE_CASE_NAMES = (
+    "Text",
+    "Line2D",
+    "PathCollection",
+    "LineCollection",
+    "PolyCollection",
+)
+
+
+@pytest.fixture(params=APPEARANCE_CASE_NAMES)
+def appearance_case(request):
+    spec = next(case for case in ARTIST_CASES if case.name == request.param)
+    built = _build_case(spec)
+    try:
+        yield built
+    finally:
+        plt.close(built.figure)
+
+
+def test_appearance_plan_is_immutable_and_preview_matches_commit(
+    appearance_case,
+) -> None:
+    adapter = appearance_case.adapter
+    before = adapter.snapshot()
+    appearance_before = adapter.appearance_state()
+    tracker_before = appearance_case.tracker.capture_recording_state()
+
+    plan = TransformPlan.preflight(
+        [appearance_case.target], TransformIntent.scale_appearance(1.6)
+    )
+    appearance_plan = plan.appearance_scale_plans[0]
+    planned_state = appearance_plan.state
+    planned_bounds = _bounds(plan.preview_selection_points()[0])
+
+    assert semantic_equal(before, adapter.snapshot())
+    assert adapter.appearance_state() == appearance_before
+    assert appearance_case.tracker.capture_recording_state() == tracker_before
+    with pytest.raises(FrozenInstanceError):
+        setattr(plan, "intent", TransformIntent.scale_appearance(2.0))
+    state_field = fields(planned_state)[0].name
+    with pytest.raises(FrozenInstanceError):
+        setattr(planned_state, state_field, None)
+
+    plan.commit()
+    appearance_case.figure.canvas.draw()
+
+    assert adapter.appearance_state() == planned_state
+    actual = adapter.clip_selection_points(adapter.selection_points())
+    _assert_px_close(_bounds(actual), planned_bounds)
+    commands = [
+        command
+        for _kind, _target, command in appearance_case.tracker.calls
+        if command is not None
+    ]
+    assert not any(
+        forbidden in command
+        for command in commands
+        for forbidden in (".set_data", ".set_offsets")
+    )
+
+
+def test_factor_one_is_a_strict_appearance_noop(appearance_case) -> None:
+    adapter = appearance_case.adapter
+    before = adapter.appearance_state()
+    tracker_before = appearance_case.tracker.capture_recording_state()
+
+    plan = TransformPlan.preflight(
+        [appearance_case.target], TransformIntent.scale_appearance(1.0)
+    )
+    plan.commit()
+
+    assert adapter.appearance_state() == before
+    assert appearance_case.tracker.capture_recording_state() == tracker_before
+    assert not appearance_case.tracker.calls
+
+
+def test_near_one_appearance_factor_is_not_silently_dropped(
+    appearance_case,
+) -> None:
+    before = appearance_case.adapter.appearance_state()
+
+    plan = TransformPlan.preflight(
+        [appearance_case.target], TransformIntent.scale_appearance(1.000001)
+    )
+    plan.commit()
+
+    assert appearance_case.adapter.appearance_state() != before
+    assert appearance_case.tracker.calls
+
+
+def test_mixed_appearance_preflight_is_side_effect_free() -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    target = ax.text(0.25, 0.7, "ordinary")
+    line = ax.plot([0.2, 0.8], [0.25, 0.7], label="managed")[0]
+    legend = ax.legend(handles=[line])
+    tracker = RecordingChangeTracker()
+    fig.change_tracker = tracker
+    fig.canvas.draw()
+    before = get_artist_adapter(target).appearance_state()
+
+    try:
+        with pytest.raises(TransformPreflightError, match="Legend-managed Text"):
+            TransformPlan.preflight(
+                [target, legend.get_texts()[0]],
+                TransformIntent.scale_appearance(2.0),
+            )
+        assert get_artist_adapter(target).appearance_state() == before
+        assert not tracker.calls
+    finally:
+        plt.close(fig)
+
+
+def test_mixed_appearance_commit_failure_rolls_back_artists_and_tracker() -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    text = ax.text(0.25, 0.7, "ordinary")
+    line = ax.plot(
+        [0.2, 0.8], [0.25, 0.7], marker="o", linewidth=2.0
+    )[0]
+    tracker = RecordingChangeTracker()
+    fig.change_tracker = tracker
+    fig.canvas.draw()
+    plan = TransformPlan.preflight(
+        [text, line], TransformIntent.scale_appearance(1.5)
+    )
+    before = [adapter.appearance_state() for adapter in plan.adapters]
+    tracker_before = tracker.capture_recording_state()
+    original_apply = plan.adapters[1]._apply_preflighted_appearance_scale_plan
+
+    def fail_after_apply(_self, appearance_plan):
+        original_apply(appearance_plan)
+        raise RuntimeError("appearance commit failure")
+
+    plan.adapters[1]._apply_preflighted_appearance_scale_plan = MethodType(
+        fail_after_apply, plan.adapters[1]
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="appearance commit failure"):
+            plan.commit()
+        assert all(
+            state == adapter.appearance_state()
+            for state, adapter in zip(before, plan.adapters)
+        )
+        assert tracker.capture_recording_state() == tracker_before
+    finally:
+        plt.close(fig)
+
+
+def test_appearance_rollback_failure_is_reported_on_original_error() -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    text = ax.text(0.25, 0.7, "ordinary")
+    line = ax.plot([0.2, 0.8], [0.25, 0.7], marker="o")[0]
+    fig.change_tracker = RecordingChangeTracker()
+    fig.canvas.draw()
+    plan = TransformPlan.preflight(
+        [text, line], TransformIntent.scale_appearance(1.5)
+    )
+
+    def fail_commit(_self, _state):
+        raise RuntimeError("appearance commit failure")
+
+    def fail_restore(_self, _state, *, record_changes=True):
+        del record_changes
+        raise RuntimeError("appearance rollback failure")
+
+    plan.adapters[1]._apply_appearance_state = MethodType(
+        fail_commit, plan.adapters[1]
+    )
+    plan.adapters[0].restore_appearance_state = MethodType(
+        fail_restore, plan.adapters[0]
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="appearance commit failure") as caught:
+            plan.commit()
+        failures = getattr(caught.value, "pylustrator_rollback_failures", ())
+        assert failures
+        assert any("rollback failure" in str(error) for _target, error in failures)
+        assert any("Pylustrator rollback failures" in note for note in caught.value.__notes__)
+    finally:
+        plt.close(fig)
+
+
+def test_path_collection_rejects_appearance_overflow_and_underflow() -> None:
+    built = _build_case(
+        next(case for case in ARTIST_CASES if case.name == "PathCollection")
+    )
+    before = built.adapter.appearance_state()
+    try:
+        with pytest.raises(TransformPreflightError, match="overflow"):
+            TransformPlan.preflight(
+                [built.target], TransformIntent.scale_appearance(1e308)
+            )
+        with pytest.raises(TransformPreflightError, match="underflow"):
+            TransformPlan.preflight(
+                [built.target], TransformIntent.scale_appearance(1e-200)
+            )
+        assert built.adapter.appearance_state() == before
+        assert not built.tracker.calls
+    finally:
+        plt.close(built.figure)
+
+
+def test_line_appearance_requires_actual_rendered_paint() -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    no_segments = ax.plot([0.5], [0.5], linestyle="-", marker="none")[0]
+    no_markers = ax.plot(
+        [0.2, 0.8],
+        [0.3, 0.7],
+        linestyle="none",
+        marker="o",
+        markevery=[],
+    )[0]
+    no_paint = ax.plot(
+        [0.2, 0.8],
+        [0.7, 0.3],
+        linestyle="none",
+        marker="o",
+        markerfacecolor="none",
+        markeredgecolor="none",
+        markeredgewidth=0,
+    )[0]
+    no_paint.set_markerfacecoloralt("red")
+    with pytest.warns(RuntimeWarning):
+        single_point_marker = ax.plot(
+            [0.25, 0.75],
+            [0.55, 0.55],
+            linestyle="none",
+            marker=Path([(0.0, 0.0)], [Path.MOVETO]),
+            markerfacecolor="red",
+            markeredgecolor="none",
+            markeredgewidth=0,
+        )[0]
+    open_marker = ax.plot(
+        [0.25, 0.75],
+        [0.45, 0.45],
+        linestyle="none",
+        marker=Path(
+            [(-0.5, 0.0), (0.5, 0.0)], [Path.MOVETO, Path.LINETO]
+        ),
+        markerfacecolor="red",
+        markeredgecolor="none",
+        markeredgewidth=0,
+    )[0]
+    close_only_marker = ax.plot(
+        [0.25, 0.75],
+        [0.35, 0.35],
+        linestyle="none",
+        marker=Path(
+            [(0.5, 0.5), (0.0, 0.0)], [Path.MOVETO, Path.CLOSEPOLY]
+        ),
+        markerfacecolor="none",
+        markeredgecolor="red",
+        markeredgewidth=2,
+    )[0]
+    pixel_marker = ax.plot(
+        [0.3, 0.7], [0.25, 0.75], linestyle="none", marker=","
+    )[0]
+    sketched = ax.plot([0.2, 0.8], [0.2, 0.8], linewidth=2.0)[0]
+    sketched.set_sketch_params(scale=1.0, length=100.0, randomness=2.0)
+    fig.canvas.draw()
+    pixels_before = np.asarray(fig.canvas.buffer_rgba()).copy()
+
+    try:
+        for target in (
+            no_segments,
+            no_markers,
+            no_paint,
+            single_point_marker,
+            open_marker,
+            close_only_marker,
+            pixel_marker,
+            sketched,
+        ):
+            support = get_artist_adapter(target).operation_support(
+                TransformOperation.SCALE_APPEARANCE
+            )
+            assert not support.supported
+            assert support.reason.strip()
+
+        no_paint.set_markersize(no_paint.get_markersize() * 2)
+        no_paint.set_markeredgewidth(no_paint.get_markeredgewidth() * 2)
+        single_point_marker.set_markersize(
+            single_point_marker.get_markersize() * 2
+        )
+        open_marker.set_markersize(open_marker.get_markersize() * 2)
+        close_only_marker.set_markersize(close_only_marker.get_markersize() * 2)
+        fig.canvas.draw()
+        np.testing.assert_array_equal(
+            np.asarray(fig.canvas.buffer_rgba()), pixels_before
+        )
+    finally:
+        plt.close(fig)
+
+
+def test_fully_clipped_line_denies_appearance_before_plan() -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    target = ax.plot([2.0, 3.0], [2.0, 3.0], linewidth=2.0)[0]
+    fig.change_tracker = RecordingChangeTracker()
+    fig.canvas.draw()
+    adapter = get_artist_adapter(target)
+
+    try:
+        support = adapter.operation_support(TransformOperation.SCALE_APPEARANCE)
+        assert not support.supported
+        assert "active clip" in support.reason
+        with pytest.raises(TransformPreflightError, match="active clip"):
+            TransformPlan.preflight(
+                [target], TransformIntent.scale_appearance(1.1)
+            )
+    finally:
+        plt.close(fig)
+
+
+def test_path_collection_requires_visible_face_or_stroked_edge() -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    target = ax.scatter(
+        [0.25, 0.75],
+        [0.3, 0.7],
+        s=[36, 64],
+        facecolors="none",
+        edgecolors="red",
+        linewidths=0,
+    )
+    target.set_sketch_params(None)
+    fig.canvas.draw()
+
+    try:
+        support = get_artist_adapter(target).operation_support(
+            TransformOperation.SCALE_APPEARANCE
+        )
+        assert not support.supported
+        assert "no visible" in support.reason
+    finally:
+        plt.close(fig)
+
+
+def test_large_path_collection_checks_each_unique_marker_path_once() -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    target = ax.scatter(
+        np.linspace(0.1, 0.9, 10_000),
+        np.linspace(0.2, 0.8, 10_000),
+        s=36,
+        linewidths=1,
+    )
+    fig.canvas.draw()
+    adapter = get_artist_adapter(target)
+    calls = {"fill": 0, "stroke": 0}
+    original_fill = adapter.path_has_fill_area
+    original_stroke = adapter.path_has_drawable_segment
+
+    def count_fill(path, transform=None):
+        calls["fill"] += 1
+        return original_fill(path, transform)
+
+    def count_stroke(path, transform=None):
+        calls["stroke"] += 1
+        return original_stroke(path, transform)
+
+    adapter.path_has_fill_area = count_fill
+    adapter.path_has_drawable_segment = count_stroke
+
+    try:
+        support = adapter.operation_support(TransformOperation.SCALE_APPEARANCE)
+        assert support.supported
+        assert calls == {"fill": 1, "stroke": 1}
+    finally:
+        plt.close(fig)
+
+
+def test_geometry_snapshot_does_not_query_appearance_support() -> None:
+    built = _build_case(next(case for case in ARTIST_CASES if case.name == "Line2D"))
+    adapter = built.adapter
+
+    def fail_if_queried(_self, _operation):
+        raise AssertionError("geometry snapshot queried an appearance capability")
+
+    adapter.operation_support = MethodType(fail_if_queried, adapter)
+    try:
+        state = adapter.snapshot()
+        assert state["type"] == "positions"
+        assert "appearance" not in state
+    finally:
+        plt.close(built.figure)
+
+
+def test_degenerate_collection_paths_do_not_advertise_appearance_scaling() -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    single = Path([(0.0, 0.0)], [Path.MOVETO])
+    open_path = Path(
+        [(-0.5, 0.0), (0.5, 0.0)], [Path.MOVETO, Path.LINETO]
+    )
+    close_only = Path(
+        [(0.5, 0.5), (0.0, 0.0)], [Path.MOVETO, Path.CLOSEPOLY]
+    )
+    path_collections = [
+        PathCollection(
+            [path],
+            sizes=[100],
+            offsets=[[x, 0.7]],
+            offset_transform=ax.transData,
+            facecolors="red",
+            edgecolors="none",
+            linewidths=0,
+        )
+        for path, x in (
+            (single, 0.2),
+            (open_path, 0.5),
+            (close_only, 0.8),
+        )
+    ]
+    line_collection = LineCollection(
+        [[(0.5, 0.5)]], colors="red", linewidths=5
+    )
+    poly_collection = PolyCollection(
+        [[(0.5, 0.3)]],
+        facecolors="none",
+        edgecolors="red",
+        linewidths=5,
+    )
+    for target in (*path_collections, line_collection, poly_collection):
+        ax.add_collection(target)
+    fig.canvas.draw()
+    pixels_before = np.asarray(fig.canvas.buffer_rgba()).copy()
+
+    try:
+        for target in (*path_collections, line_collection, poly_collection):
+            support = get_artist_adapter(target).operation_support(
+                TransformOperation.SCALE_APPEARANCE
+            )
+            assert not support.supported
+            assert support.reason.strip()
+        for target in path_collections:
+            target.set_sizes(target.get_sizes() * 2, dpi=fig.dpi)
+        line_collection.set_linewidths(line_collection.get_linewidths() * 2)
+        poly_collection.set_linewidths(poly_collection.get_linewidths() * 2)
+        fig.canvas.draw()
+        np.testing.assert_array_equal(
+            np.asarray(fig.canvas.buffer_rgba()), pixels_before
+        )
+    finally:
+        plt.close(fig)
+
+
+@pytest.mark.parametrize("kind", ["path", "line", "poly"])
+def test_collection_appearance_is_independent_of_geometry_snapshot(kind) -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    fig.change_tracker = RecordingChangeTracker()
+    singular = Affine2D().scale(0.0, 200.0).translate(250.0, 100.0)
+    if kind == "path":
+        target = PathCollection(
+            [Path.unit_circle()],
+            sizes=[64],
+            offsets=[[0.4, 0.5]],
+            offset_transform=singular,
+            facecolors="red",
+        )
+    elif kind == "line":
+        target = LineCollection(
+            [[(0.2, 0.3), (0.8, 0.7)]],
+            colors="red",
+            linewidths=2,
+            transform=singular,
+        )
+    else:
+        target = PolyCollection(
+            [[(0.2, 0.3), (0.8, 0.3), (0.5, 0.7)]],
+            facecolors="none",
+            edgecolors="red",
+            linewidths=2,
+            transform=singular,
+        )
+    ax.add_collection(target)
+    fig.canvas.draw()
+
+    try:
+        adapter = get_artist_adapter(target)
+        assert not adapter.capabilities.can_snapshot
+        support = adapter.operation_support(TransformOperation.SCALE_APPEARANCE)
+        assert support.supported
+        before = adapter.appearance_state()
+        plan = TransformPlan.preflight(
+            [target], TransformIntent.scale_appearance(1.5)
+        )
+        expected = _bounds(plan.preview_selection_points()[0])
+        plan.commit()
+        fig.canvas.draw()
+        assert adapter.appearance_state() != before
+        _assert_px_close(_bounds(adapter.selection_points()), expected)
+    finally:
+        plt.close(fig)
+
+
+def test_line_appearance_is_independent_of_geometry_snapshot_transform() -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    fig.change_tracker = RecordingChangeTracker()
+    target = ax.plot([0.2, 0.8], [0.3, 0.7], linewidth=2.0)[0]
+    target.set_transform(
+        Affine2D().scale(0.0, 200.0).translate(250.0, 100.0)
+    )
+    fig.canvas.draw()
+
+    try:
+        adapter = get_artist_adapter(target)
+        support = adapter.operation_support(
+            TransformOperation.SCALE_APPEARANCE
+        )
+        assert support.supported
+        before = adapter.appearance_state()
+        plan = TransformPlan.preflight(
+            [target], TransformIntent.scale_appearance(1.5)
+        )
+        expected = _bounds(plan.preview_selection_points()[0])
+        plan.commit()
+        fig.canvas.draw()
+        assert adapter.appearance_state() != before
+        _assert_px_close(_bounds(adapter.selection_points()), expected)
+    finally:
+        plt.close(fig)
 
 
 def test_selectable_artist_has_finite_visible_selection_bounds(artist_case) -> None:
@@ -1560,6 +2099,99 @@ def _install_real_change_tracker(fig):
     tracker.no_save = False
     fig.change_tracker = tracker
     return tracker
+
+
+def test_appearance_generated_commands_replay_and_keep_stable_keys(
+    appearance_case,
+) -> None:
+    tracker = _install_real_change_tracker(appearance_case.figure)
+    adapter = get_artist_adapter(appearance_case.target)
+    before = adapter.appearance_state()
+    plan = TransformPlan.preflight(
+        [appearance_case.target], TransformIntent.scale_appearance(1.4)
+    )
+
+    plan.commit()
+    appearance_case.figure.canvas.draw()
+    expected_state = adapter.appearance_state()
+    expected_bounds = _bounds(adapter.clip_selection_points(adapter.selection_points()))
+    generated = list(tracker.changes.values())
+    first_keys = set(tracker.changes)
+    commands = [command for _target, command in generated]
+
+    assert generated
+    assert not any(
+        forbidden in command
+        for command in commands
+        for forbidden in (".set_data", ".set_offsets")
+    )
+
+    adapter.restore_appearance_state(before, record_changes=False)
+    appearance_case.figure.canvas.draw()
+    namespace = {"mpl": matplotlib, "np": np, "plt": plt}
+    from pylustrator.change_tracker import getReference
+
+    for command_target, command in generated:
+        exec(f"{getReference(command_target)}{command}", namespace)
+    appearance_case.figure.canvas.draw()
+
+    assert adapter.appearance_state() == expected_state
+    actual_bounds = _bounds(adapter.clip_selection_points(adapter.selection_points()))
+    _assert_px_close(actual_bounds, expected_bounds)
+
+    tracker.changes = {}
+    adapter._record_change_records(adapter.serialize_appearance_changes())
+    assert set(tracker.changes) == first_keys
+    assert sorted(command for _target, command in tracker.changes.values()) == sorted(
+        commands
+    )
+
+
+def test_text_geometry_and_appearance_commands_compose_in_either_order() -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    target = ax.text(0.25, 0.7, "compose", fontsize=10)
+    tracker = _install_real_change_tracker(fig)
+    fig.canvas.draw()
+    adapter = get_artist_adapter(target)
+    geometry_before = adapter.snapshot()
+    appearance_before = adapter.appearance_state()
+
+    try:
+        adapter.translate((12.0, -7.0))
+        TransformPlan.preflight(
+            [target], TransformIntent.scale_appearance(1.4)
+        ).commit()
+        fig.canvas.draw()
+        geometry_after = adapter.snapshot()
+        appearance_after = adapter.appearance_state()
+        generated = list(tracker.changes.values())
+        command_keys = {key[1] for key in tracker.changes}
+        assert ".set" in command_keys
+        assert ".set_fontsize" in command_keys
+
+        TargetWrapper(target).restore_state(geometry_before, record_changes=False)
+        adapter.restore_appearance_state(appearance_before, record_changes=False)
+        namespace = {"mpl": matplotlib, "np": np, "plt": plt}
+        from pylustrator.change_tracker import getReference
+
+        for command_target, command in generated:
+            exec(f"{getReference(command_target)}{command}", namespace)
+        fig.canvas.draw()
+        assert semantic_equal(adapter.snapshot(), geometry_after)
+        assert adapter.appearance_state() == appearance_after
+
+        TargetWrapper(target).restore_state(geometry_before, record_changes=False)
+        adapter.restore_appearance_state(appearance_before, record_changes=False)
+        tracker.changes = {}
+        TransformPlan.preflight(
+            [target], TransformIntent.scale_appearance(1.4)
+        ).commit()
+        adapter.translate((12.0, -7.0))
+        command_keys = {key[1] for key in tracker.changes}
+        assert command_keys == {".set"}
+        assert "fontsize=14" in next(iter(tracker.changes.values()))[1]
+    finally:
+        plt.close(fig)
 
 
 def test_generated_commands_replay_the_translated_rendered_bounds(

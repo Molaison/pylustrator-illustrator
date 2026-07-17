@@ -70,6 +70,10 @@ the user-facing interaction rules shared.
 - Resize and rotation use preflighted transform plans and stable pivots;
   multi-object rotation uses one shared display-space pivot rather than
   unrelated local angle changes.
+- The Align panel separates geometry scale from explicit appearance scale.
+  `A+`/`A−` change supported font, stroke, and marker dimensions without moving
+  coordinates or reflowing layout; mixed selections are preflighted and undo
+  as one command.
 - Legends have stable logical ownership across selection, frame changes,
   movement, undo/redo, and source replay. Their selection bounds follow visible
   handles, labels, title, and frame rather than invisible layout boxes.
@@ -96,9 +100,9 @@ and the extension API is introduced in the [API documentation](docs/api.rst).
 
 ### Validation Status
 
-At the fork migration milestone on 2026-07-17:
+At the current fork milestone on 2026-07-17:
 
-- the full test suite passed with **721 passed and 147 skipped**;
+- the full test suite passed with **800 passed and 147 skipped**;
 - Ruff and Ty completed successfully, with an explicit incremental type-check
   baseline for the dynamic Matplotlib/Qt interaction modules; and
 - the real multi-panel Fig2 workflow was used to validate selection, movement,

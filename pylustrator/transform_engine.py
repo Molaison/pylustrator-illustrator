@@ -9,6 +9,7 @@ import numpy as np
 from matplotlib.artist import Artist
 
 from .artist_adapters import (
+    AppearanceScalePlan,
     ArtistAdapter,
     RigidRotationPlan,
     get_artist_adapter,
@@ -27,11 +28,12 @@ class TransformPreflightError(ValueError):
         super().__init__(details or "Transform is not supported")
 
 
-@dataclass
+@dataclass(frozen=True)
 class TransformPlan:
     intent: TransformIntent
     adapters: tuple[ArtistAdapter, ...]
     rigid_rotation_plans: tuple[RigidRotationPlan, ...] = ()
+    appearance_scale_plans: tuple[AppearanceScalePlan, ...] = ()
 
     @classmethod
     def preflight(
@@ -40,6 +42,7 @@ class TransformPlan:
         adapters = tuple(get_artist_adapter(target) for target in targets)
         failures = []
         rigid_rotation_plans = []
+        appearance_scale_plans = []
         for adapter in adapters:
             support = adapter.operation_support(intent.operation)
             if not support.supported:
@@ -58,6 +61,12 @@ class TransformPlan:
                             float(intent.angle_degrees), intent.pivot
                         )
                     )
+                elif intent.operation is TransformOperation.SCALE_APPEARANCE:
+                    appearance_scale_plans.append(
+                        adapter._plan_preflighted_appearance_scale(
+                            float(intent.factor)
+                        )
+                    )
             except (TypeError, ValueError) as error:
                 failures.append(
                     (
@@ -67,7 +76,12 @@ class TransformPlan:
                 )
         if failures:
             raise TransformPreflightError(failures)
-        return cls(intent, adapters, tuple(rigid_rotation_plans))
+        return cls(
+            intent,
+            adapters,
+            tuple(rigid_rotation_plans),
+            tuple(appearance_scale_plans),
+        )
 
     def preview_control_points(self) -> tuple[np.ndarray, ...]:
         operation = self.intent.operation
@@ -92,8 +106,40 @@ class TransformPlan:
             for adapter in self.adapters
         )
 
+    def preview_selection_points(self) -> tuple[np.ndarray, ...]:
+        """Return the visible destination carried by the immutable plan."""
+
+        operation = self.intent.operation
+        if operation is TransformOperation.TRANSLATE:
+            delta = np.asarray(self.intent.delta, dtype=float)
+            return tuple(
+                adapter.preview_translation_selection_points(delta)
+                for adapter in self.adapters
+            )
+        if operation is TransformOperation.RESIZE_GEOMETRY:
+            matrix = np.asarray(self.intent.matrix, dtype=float)
+            return tuple(adapter.preflight_resize(matrix) for adapter in self.adapters)
+        if operation is TransformOperation.RIGID_ROTATE:
+            return tuple(
+                plan.selection_array() for plan in self.rigid_rotation_plans
+            )
+        if operation is TransformOperation.SCALE_APPEARANCE:
+            return tuple(
+                plan.selection_array() for plan in self.appearance_scale_plans
+            )
+        return tuple(
+            np.asarray(adapter.selection_points(), dtype=float)
+            for adapter in self.adapters
+        )
+
     def commit(self) -> None:
-        snapshots = [adapter.snapshot() for adapter in self.adapters]
+        appearance_only = (
+            self.intent.operation is TransformOperation.SCALE_APPEARANCE
+        )
+        snapshots = [
+            adapter.appearance_state() if appearance_only else adapter.snapshot()
+            for adapter in self.adapters
+        ]
         tracker_states = []
         seen_trackers = set()
         for adapter in self.adapters:
@@ -123,6 +169,10 @@ class TransformPlan:
                     adapter.apply_rigid_rotation_plan(
                         self.rigid_rotation_plans[index]
                     )
+                elif self.intent.operation is TransformOperation.SCALE_APPEARANCE:
+                    adapter._apply_preflighted_appearance_scale_plan(
+                        self.appearance_scale_plans[index]
+                    )
                 else:
                     raise TransformPreflightError(
                         [
@@ -135,19 +185,39 @@ class TransformPlan:
                             )
                         ]
                     )
-        except Exception:
+            if (
+                self.intent.operation is TransformOperation.SCALE_APPEARANCE
+                and float(self.intent.factor) != 1.0
+            ):
+                for adapter in self.adapters:
+                    adapter._record_change_records(
+                        adapter.serialize_appearance_changes()
+                    )
+        except Exception as error:
+            rollback_failures = []
             with suspend_change_recording():
                 for adapter, state in zip(
                     reversed(self.adapters), reversed(snapshots)
                 ):
                     try:
-                        adapter.restore(state)
-                    except Exception:
+                        if appearance_only:
+                            adapter.restore_appearance_state(
+                                state, record_changes=False
+                            )
+                        else:
+                            adapter.restore(state)
+                    except Exception as rollback_error:
                         # Continue restoring earlier targets even when the adapter
                         # that failed the commit also cannot restore itself.
-                        continue
+                        rollback_failures.append(
+                            (adapter.target, rollback_error)
+                        )
             for tracker, state in tracker_states:
-                tracker.restore_recording_state(state)
+                try:
+                    tracker.restore_recording_state(state)
+                except Exception as rollback_error:
+                    rollback_failures.append((tracker, rollback_error))
+            ArtistAdapter.annotate_rollback_failures(error, rollback_failures)
             raise
 
 

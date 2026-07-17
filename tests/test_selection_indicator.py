@@ -1644,6 +1644,96 @@ def test_yaxis_label_drag_keeps_selection_box_and_text_together() -> None:
     assert app is not None
 
 
+def test_align_appearance_buttons_are_explicit_atomic_and_refresh_properties() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    signals = WidgetSignals()
+    container = QtWidgets.QWidget()
+    layout = QtWidgets.QVBoxLayout(container)
+    widget = Align(layout, signals)
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    text = ax.text(0.28, 0.72, "appearance", fontsize=10)
+    rectangle = ax.add_patch(Rectangle((0.6, 0.25), 0.18, 0.2))
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    fig.signals = signals
+    signals.figure_changed.emit(fig)
+
+    manager.select_element(rectangle)
+    signals.figure_element_selected.emit(rectangle)
+    assert not widget.buttons_by_action["appearance_up"].isEnabled()
+    assert "geometry" in widget.buttons_by_action["scale_up"].toolTip()
+
+    manager.select_elements([text, rectangle], primary=text)
+    signals.figure_element_selected.emit(text)
+    assert not widget.buttons_by_action["appearance_up"].isEnabled()
+    assert "Rectangle" in widget.buttons_by_action["appearance_up"].toolTip()
+
+    manager.select_element(text)
+    signals.figure_element_selected.emit(text)
+    assert widget.buttons_by_action["appearance_up"].isEnabled()
+    assert widget.buttons_by_action["appearance_down"].isEnabled()
+
+    refreshed = []
+    signals.figure_element_selected.connect(refreshed.append)
+    draw_count = 0
+    original_draw = fig.canvas.draw
+
+    def counted_draw(*args, **kwargs):
+        nonlocal draw_count
+        draw_count += 1
+        return original_draw(*args, **kwargs)
+
+    fig.canvas.draw = counted_draw
+    position_before = text.get_position()
+    widget.execute_action("appearance_up")
+
+    assert text.get_fontsize() == pytest.approx(11.0)
+    assert text.get_position() == position_before
+    assert draw_count == 1
+    assert len(fig.change_tracker.edits) == 1
+    assert fig.change_tracker.edit[2] == "Scale appearance"
+    assert refreshed[-1] is text
+
+    fig.change_tracker.backEdit = lambda: fig.change_tracker.edit[0]()
+    fig.change_tracker.forwardEdit = lambda: fig.change_tracker.edit[1]()
+    manager.undo()
+    assert text.get_fontsize() == pytest.approx(10.0)
+    assert refreshed[-1] is text
+    manager.redo()
+    assert text.get_fontsize() == pytest.approx(11.0)
+    assert refreshed[-1] is text
+
+    manager.selection.clear_targets()
+    plt.close(fig)
+    container.deleteLater()
+    assert app is not None
+
+
+def test_selection_appearance_factor_one_is_noop_but_near_one_is_an_edit() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    text = ax.text(0.28, 0.72, "appearance", fontsize=10)
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_element(text)
+
+    assert manager.selection.scale_appearance_selection(1.0) is False
+    assert text.get_fontsize() == pytest.approx(10.0)
+    assert not fig.change_tracker.edits
+    assert fig.change_tracker.text_change_count == 0
+
+    assert manager.selection.scale_appearance_selection(1.000001) is True
+    assert text.get_fontsize() == pytest.approx(10.00001)
+    assert len(fig.change_tracker.edits) == 1
+    assert fig.change_tracker.text_change_count == 0
+    assert fig.change_tracker.change_count == 1
+    assert fig.change_tracker.change[1].startswith(".set_fontsize(")
+
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
 @pytest.mark.parametrize(
     "selection_mode", [SelectionMode.OBJECT, SelectionMode.DIRECT]
 )

@@ -67,6 +67,7 @@ class TransformIntent:
     delta: Optional[tuple[float, float]] = None
     angle_degrees: Optional[float] = None
     pivot: Optional[tuple[float, float]] = None
+    factor: Optional[float] = None
     label: str = "Transform"
 
     @classmethod
@@ -106,5 +107,16 @@ class TransformIntent:
             label=label,
         )
 
+    @classmethod
+    def scale_appearance(
+        cls, factor: float, *, label: str = "Scale appearance"
+    ) -> "TransformIntent":
+        """Scale paint/font attributes without pretending they are geometry."""
+
+        return cls(
+            TransformOperation.SCALE_APPEARANCE,
+            factor=float(factor),
+            label=label,
+        )
 
 __all__ = ["OperationSupport", "TransformIntent", "TransformOperation"]

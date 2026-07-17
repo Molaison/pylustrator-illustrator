@@ -2,6 +2,8 @@ import os
 from qtpy import QtGui, QtWidgets
 import qtawesome as qta
 
+from ..operations import TransformOperation
+
 
 class Align(QtWidgets.QWidget):
     def __init__(self, layout: QtWidgets.QLayout, signals):
@@ -34,6 +36,8 @@ class Align(QtWidgets.QWidget):
             "same_size",
             "scale_up",
             "scale_down",
+            "appearance_up",
+            "appearance_down",
             "rotate_left",
             "rotate_right",
         ]
@@ -52,6 +56,8 @@ class Align(QtWidgets.QWidget):
             "fa5s.expand-arrows-alt",
             "fa5s.search-plus",
             "fa5s.search-minus",
+            None,
+            None,
             "mdi.rotate-left",
             "mdi.rotate-right",
         ]
@@ -59,8 +65,16 @@ class Align(QtWidgets.QWidget):
             "same_width": "match width to the key object, or first selected object",
             "same_height": "match height to the key object, or first selected object",
             "same_size": "match size to the key object, or first selected object",
-            "scale_up": "enlarge selected objects",
-            "scale_down": "shrink selected objects",
+            "scale_up": (
+                "enlarge selected geometry; font, stroke, and markers stay unchanged"
+            ),
+            "scale_down": (
+                "shrink selected geometry; font, stroke, and markers stay unchanged"
+            ),
+            "appearance_up": "increase font, stroke, and marker appearance by 10%",
+            "appearance_down": (
+                "decrease font, stroke, and marker appearance by about 9.1%"
+            ),
             "rotate_left": "rotate selected objects 15 degrees counterclockwise",
             "rotate_right": "rotate selected objects 15 degrees clockwise",
         }
@@ -70,16 +84,18 @@ class Align(QtWidgets.QWidget):
         align_group = QtWidgets.QButtonGroup(self)
         for index, act in enumerate(actions):
             icon_name = icons[index]
-            if icon_name.endswith(".png"):
+            if icon_name is None:
+                button = QtWidgets.QPushButton(
+                    "A+" if act == "appearance_up" else "A−"
+                )
+            elif icon_name.endswith(".png"):
                 icon = QtGui.QIcon(
                     os.path.join(os.path.dirname(__file__), "..", "icons", icon_name)
                 )
+                button = QtWidgets.QPushButton(icon, "")
             else:
                 icon = qta.icon(icon_name)
-            button = QtWidgets.QPushButton(
-                icon,
-                "",
-            )
+                button = QtWidgets.QPushButton(icon, "")
             button.setSizePolicy(
                 QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed
             )
@@ -90,6 +106,7 @@ class Align(QtWidgets.QWidget):
             self.buttons_by_action[act] = button
             align_group.addButton(button)
 
+        action_rows = (len(actions) + columns - 1) // columns
         self.reference_combo = QtWidgets.QComboBox(self)
         self.reference_combo.addItem("Align to Selection", "selection")
         self.reference_combo.addItem("Align to Key Object", "key_object")
@@ -97,7 +114,9 @@ class Align(QtWidgets.QWidget):
         self.reference_combo.setToolTip(
             "Choose the visible bounds used as the alignment reference"
         )
-        self.layout_main.addWidget(self.reference_combo, 4, 0, 1, columns)
+        self.layout_main.addWidget(
+            self.reference_combo, action_rows, 0, 1, columns
+        )
         self.reference_combo.currentIndexChanged.connect(
             self.change_reference_mode
         )
@@ -106,7 +125,7 @@ class Align(QtWidgets.QWidget):
         self.spacing_enabled.setToolTip(
             "Use an exact gap around the key object when distributing"
         )
-        self.layout_main.addWidget(self.spacing_enabled, 5, 0)
+        self.layout_main.addWidget(self.spacing_enabled, action_rows + 1, 0)
         self.spacing_input = QtWidgets.QDoubleSpinBox(self)
         self.spacing_input.setRange(-10000.0, 10000.0)
         self.spacing_input.setDecimals(2)
@@ -114,7 +133,9 @@ class Align(QtWidgets.QWidget):
         self.spacing_input.setToolTip(
             "Exact display-space gap; negative values overlap objects"
         )
-        self.layout_main.addWidget(self.spacing_input, 5, 1, 1, columns - 1)
+        self.layout_main.addWidget(
+            self.spacing_input, action_rows + 1, 1, 1, columns - 1
+        )
         self.spacing_enabled.toggled.connect(self.refresh_controls)
 
         self.fig = None
@@ -133,6 +154,8 @@ class Align(QtWidgets.QWidget):
             self.reference_combo.setEnabled(False)
             self.spacing_enabled.setEnabled(False)
             self.spacing_input.setEnabled(False)
+            self.buttons_by_action["appearance_up"].setEnabled(False)
+            self.buttons_by_action["appearance_down"].setEnabled(False)
             self.buttons_by_action["rotate_left"].setEnabled(False)
             self.buttons_by_action["rotate_right"].setEnabled(False)
             return
@@ -142,6 +165,25 @@ class Align(QtWidgets.QWidget):
         )
         self.buttons_by_action["rotate_left"].setEnabled(rotation_enabled)
         self.buttons_by_action["rotate_right"].setEnabled(rotation_enabled)
+        appearance_support = selection.operation_support(
+            TransformOperation.SCALE_APPEARANCE
+        )
+        for action in ("appearance_up", "appearance_down"):
+            button = self.buttons_by_action[action]
+            button.setEnabled(appearance_support.supported)
+            base_tooltip = (
+                "increase font, stroke, and marker appearance by 10%"
+                if action == "appearance_up"
+                else (
+                    "decrease font, stroke, and marker appearance by about 9.1% "
+                    "(inverse of +10%)"
+                )
+            )
+            button.setToolTip(
+                base_tooltip
+                if appearance_support.supported
+                else f"{base_tooltip}\nUnavailable: {appearance_support.reason}"
+            )
         mode = getattr(selection, "alignment_reference_mode", "selection")
         index = self.reference_combo.findData(mode)
         self._updating_reference = True
@@ -185,6 +227,7 @@ class Align(QtWidgets.QWidget):
 
     def execute_action(self, act: str):
         """execute an alignment action"""
+        action_handles_redraw = False
         try:
             if act.startswith("same_"):
                 self.fig.selection.match_size(act.removeprefix("same_"))
@@ -192,6 +235,12 @@ class Align(QtWidgets.QWidget):
                 self.fig.selection.scale_selection(1.1)
             elif act == "scale_down":
                 self.fig.selection.scale_selection(1 / 1.1)
+            elif act == "appearance_up":
+                self.fig.selection.scale_appearance_selection(1.1)
+                action_handles_redraw = True
+            elif act == "appearance_down":
+                self.fig.selection.scale_appearance_selection(1 / 1.1)
+                action_handles_redraw = True
             elif act == "rotate_left":
                 self.fig.selection.rotate_selection(15)
             elif act == "rotate_right":
@@ -208,8 +257,9 @@ class Align(QtWidgets.QWidget):
         except (TypeError, ValueError) as exc:
             QtWidgets.QMessageBox.warning(self, "Pylustrator", str(exc))
             return
-        self.fig.selection.update_selection_rectangles()
-        self.fig.canvas.draw()
+        if not action_handles_redraw:
+            self.fig.selection.update_selection_rectangles()
+            self.fig.canvas.draw()
         self.refresh_controls()
 
     def setFigure(self, fig):
