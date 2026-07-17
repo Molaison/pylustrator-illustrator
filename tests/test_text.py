@@ -1,5 +1,7 @@
+import numpy as np
 from matplotlib.backend_bases import KeyEvent
 from base_test_class import BaseTest, NotInSave
+from pylustrator.snap import TargetWrapper
 
 
 class TestText(BaseTest):
@@ -113,7 +115,7 @@ class TestText(BaseTest):
 
         self.change_property2(
             "position",
-            [(0.55, 0.2), (0.472, 0.6)],
+            [(0.5170, 0.2), (0.4, 0.6)],
             lambda _: fig.window.input_align.buttons[1].clicked.emit(0),
             get_text,
             line_command,
@@ -158,7 +160,7 @@ class TestText(BaseTest):
 
         self.change_property2(
             "position",
-            [(0.2, 0.404), (0.6, 0.404)],
+            [(0.2, 0.4), (0.6, 0.4)],
             lambda _: fig.window.input_align.buttons[5].clicked.emit(0),
             get_text,
             line_command,
@@ -213,7 +215,7 @@ class TestText(BaseTest):
 
         self.change_property2(
             "position",
-            [(0.2, 0.2), (1.0301, 0.6), (0.5, 0.5)],
+            [(0.2, 0.2), (0.6, 0.6), (0.5, 0.5)],
             lambda _: fig.window.input_align.buttons[3].clicked.emit(0),
             get_text,
             line_command,
@@ -230,7 +232,7 @@ class TestText(BaseTest):
 
         self.change_property2(
             "position",
-            [(0.2, 0.2), (0.6, 0.6460), (0.5, 0.5)],
+            [(0.2, 0.2), (0.6, 0.6), (0.5, 0.5)],
             lambda _: fig.window.input_align.buttons[7].clicked.emit(0),
             get_text,
             line_command,
@@ -282,6 +284,40 @@ class TestText(BaseTest):
 
     def check_text_properties(self, get_text, line_command, test_run, x, y):
         fig = self.fig
+
+        def transform_panel_positions(*, x=None, y=None):
+            getters = get_text if isinstance(get_text, list) else [get_text]
+            objects = [getter() for getter in getters]
+            wrappers = [TargetWrapper(obj) for obj in objects]
+            points = np.concatenate(
+                [wrapper.get_selection_points() for wrapper in wrappers]
+            )
+            low = np.min(points, axis=0)
+            high = np.max(points, axis=0)
+            reference_display = (low + high) / 2
+            primary = wrappers[-1]
+            desired_native = np.asarray(
+                primary.transform_inverted_points([reference_display])[0], dtype=float
+            )
+            if x is not None:
+                desired_native[0] = x
+            if y is not None:
+                desired_native[1] = y
+            desired_display = np.asarray(
+                primary.transform_points([desired_native])[0], dtype=float
+            )
+            delta = desired_display - reference_display
+            result = [
+                tuple(
+                    float(value)
+                    for value in wrapper.transform_inverted_points(
+                        [np.asarray(wrapper.get_positions()[0], dtype=float) + delta]
+                    )[0]
+                )
+                for wrapper in wrappers
+            ]
+            return result if isinstance(get_text, list) else result[0]
+
         self.change_property2(
             "position",
             (x, 0.5),
@@ -300,17 +336,19 @@ class TestText(BaseTest):
             test_run,
         )
         self.move_element((0, 1), get_text)
+        expected_x = transform_panel_positions(x=0.2)
         self.change_property2(
             "position",
-            (0.2, 0.5),
+            expected_x,
             lambda _: fig.window.input_size.input_position.valueChangedX.emit(0.2),
             get_text,
             line_command,
             test_run,
         )
+        expected_xy = transform_panel_positions(y=0.2)
         self.change_property2(
             "position",
-            (0.2, 0.2),
+            expected_xy,
             lambda _: fig.window.input_size.input_position.valueChangedY.emit(0.2),
             get_text,
             line_command,

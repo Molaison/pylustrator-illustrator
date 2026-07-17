@@ -20,7 +20,6 @@
 # along with Pylustrator. If not, see <http://www.gnu.org/licenses/>
 import sys
 import traceback
-from typing import TYPE_CHECKING, Any, Optional, cast
 
 from matplotlib import _pylab_helpers
 
@@ -29,25 +28,18 @@ import qtawesome as qta
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 from matplotlib.axes._axes import Axes
+from matplotlib.backends.qt_compat import QtCore, QtGui, QtWidgets, _version_info
 
-if TYPE_CHECKING:
-    from PyQt5 import QtCore, QtGui, QtWidgets
-
-    QAction = QtWidgets.QAction
-    from PyQt5.QtCore import pyqtSignal as Signal
+if _version_info[0] == 6:
+    QAction = QtGui.QAction
 else:
-    from matplotlib.backends.qt_compat import QtCore, QtGui, QtWidgets, _version_info
-
-    if _version_info[0] == 6:
-        QAction = QtGui.QAction
-    else:
-        QAction = QtWidgets.QAction
-    from qtpy.QtCore import Signal
+    QAction = QtWidgets.QAction
 
 from .ax_rasterisation import rasterizeAxes, restoreAxes
 from .change_tracker import setFigureVariableNames
 from .drag_helper import DragManager
 from .exception_swallower import swallow_get_exceptions
+from .interaction import SelectionMode
 
 from .components.qitem_properties import QItemProperties
 from .components.tree_view import MyTreeView
@@ -70,9 +62,6 @@ app = None
 keys_for_lines = {}
 
 no_save_allowed = False
-setting_use_global_variable_names = False
-old_pltshow: Optional[Any] = None
-old_pltfigure: Optional[Any] = None
 
 
 def initialize(
@@ -101,6 +90,9 @@ def initialize(
 
     # remember line-numbers where texts are created
     def wrap_text_function(text):
+        if getattr(text, "_pylustrator_text_wrapper", False):
+            return text
+
         def wrapped_text(*args, **kwargs):
             element = text(
                 *args, fontdict=kwargs["fontdict"] if "fontdict" in kwargs else None
@@ -140,6 +132,8 @@ def initialize(
             element.set(**kwargs)
             return element
 
+        wrapped_text._pylustrator_text_wrapper = True
+        wrapped_text._pylustrator_original_text = text
         return wrapped_text
 
     Axes.text = wrap_text_function(Axes.text)
@@ -167,30 +161,34 @@ def initialize(
 
     if app is None:
         app = QtWidgets.QApplication(sys.argv)
-    old_pltshow = plt.show
-    old_pltfigure = plt.figure
-    cast(Any, plt).show = pyl_show
+    if plt.show is not show:
+        old_pltshow = plt.show
+    if plt.figure is not figure:
+        old_pltfigure = plt.figure
+    plt.show = show
     patchColormapsWithMetaInfo()
 
     # stack_call_position = traceback.extract_stack()[-2]
     # stack_call_position.filename
 
-    cast(Any, plt).keys_for_lines = keys_for_lines
+    plt.keys_for_lines = keys_for_lines
 
     # store the last figure save filename
-    sf = Figure.savefig
+    if not getattr(Figure.savefig, "_pylustrator_savefig_wrapper", False):
+        sf = Figure.savefig
 
-    def savefig(self: Figure, filename: Any, *args: Any, **kwargs: Any) -> None:
-        s_any = cast(Any, self)
-        s_any._last_saved_figure = getattr(self, "_last_saved_figure", []) + [
-            (filename, args, kwargs)
-        ]
-        sf(self, filename, *args, **kwargs)
+        def savefig(self, filename, *args, **kwargs):
+            self._last_saved_figure = getattr(self, "_last_saved_figure", []) + [
+                (filename, args, kwargs)
+            ]
+            return sf(self, filename, *args, **kwargs)
 
-    cast(Any, Figure).savefig = savefig
+        savefig._pylustrator_savefig_wrapper = True
+        savefig._pylustrator_original_savefig = sf
+        Figure.savefig = savefig
 
 
-def pyl_show(hide_window: bool = False) -> None:
+def pyl_show(hide_window: bool = False):
     """the function overloads the matplotlib show function.
     It opens a DragManager window instead of the default matplotlib window.
     """
@@ -202,10 +200,6 @@ def pyl_show(hide_window: bool = False) -> None:
         myappid = "rgerum.pylustrator"  # arbitrary string
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
 
-    if app is None:
-        app = QtWidgets.QApplication(sys.argv)
-    if app is None:
-        app = QtWidgets.QApplication(sys.argv)
     if app is None:
         app = QtWidgets.QApplication(sys.argv)
     # iterate over figures
@@ -220,28 +214,25 @@ def pyl_show(hide_window: bool = False) -> None:
         # window = _pylab_helpers.Gcf.figs[figure].canvas.window_pylustrator
         # warn about ticks not fitting tick labels
         warnAboutTicks(fig)
-        # set up window canvas, which initializes figure._pyl_scene
-        window.setFigure(fig)
-        # add dragger (ChangeTracker.load() sets is_new_text on texts from generated code)
+        # add dragger
         DragManager(fig, no_save_allowed)
-        # initialize figure defaults AFTER load, so is_new_text is properly set
         init_figure(fig)
+        window.setFigure(fig)
         window.addFigure(fig)
         window.update()
         # and show it
         if hide_window is False:
             window.show()
-    if hide_window is False and app is not None:
+    if hide_window is False:
         # execute the application
         app.exec_()
 
 
-def show(*args, **kwargs) -> None:
+def show(hide_window: bool = False):
     """the function overloads the matplotlib show function.
     It opens a DragManager window instead of the default matplotlib window.
     """
-    global figures, app, old_pltshow, old_pltfigure
-    hide_window = kwargs.pop("hide_window", False)
+    global figures
     # set an application id, so that windows properly stacks them in the task bar
     if sys.platform[:3] == "win":
         import ctypes
@@ -259,22 +250,19 @@ def show(*args, **kwargs) -> None:
         window.setFigure(_pylab_helpers.Gcf.figs[figure].canvas.figure)
         # warn about ticks not fitting tick labels
         warnAboutTicks(window.fig)
-        # add dragger (ChangeTracker.load() sets is_new_text on texts from generated code)
+        # add dragger
         DragManager(_pylab_helpers.Gcf.figs[figure].canvas.figure, no_save_allowed)
-        # initialize figure defaults AFTER load, so is_new_text is properly set
         init_figure(_pylab_helpers.Gcf.figs[figure].canvas.figure)
         window.update()
         # and show it
         if hide_window is False:
             window.show()
-    if hide_window is False and app is not None:
+    if hide_window is False:
         # execute the application
         app.exec_()
 
-    if old_pltshow is not None:
-        plt.show = old_pltshow
-    if old_pltfigure is not None:
-        plt.figure = old_pltfigure
+    plt.show = old_pltshow
+    plt.figure = old_pltfigure
 
 
 class CmapColor(list):
@@ -289,16 +277,20 @@ def patchColormapsWithMetaInfo():
     """all colormaps now return color with metadata from which colormap the color came from"""
     from matplotlib.colors import Colormap
 
+    if getattr(Colormap.__call__, "_pylustrator_colormap_wrapper", False):
+        return
     cm_call = Colormap.__call__
 
-    def new_call(self, *args: Any, **kwargs: Any) -> Any:
+    def new_call(self, *args, **kwargs):
         c = cm_call(self, *args, **kwargs)
         if isinstance(c, (tuple, list)):
             c = CmapColor(c)
             c.setMeta(args[0], self.name)
         return c
 
-    cast(Any, Colormap).__call__ = new_call
+    new_call._pylustrator_colormap_wrapper = True
+    new_call._pylustrator_original_call = cm_call
+    Colormap.__call__ = new_call
 
 
 def figure(num=None, figsize=None, force_add=False, *args, **kwargs):
@@ -310,7 +302,7 @@ def figure(num=None, figsize=None, force_add=False, *args, **kwargs):
     # if number is not defined
     if force_add or num not in _pylab_helpers.Gcf.figs.keys():
         # create a new window and store it
-        canvas = PlotWindow(num).canvas
+        canvas = PlotWindow(num, figsize, *args, **kwargs).canvas
         canvas.figure.number = num
         canvas.figure.clf()
         canvas.manager.num = num
@@ -319,7 +311,7 @@ def figure(num=None, figsize=None, force_add=False, *args, **kwargs):
     manager = _pylab_helpers.Gcf.figs[num]
     # set the size if it is defined
     if figsize is not None:
-        cast(Any, _pylab_helpers.Gcf.figs[num]).window.setGeometry(
+        _pylab_helpers.Gcf.figs[num].window.setGeometry(
             100, 100, figsize[0] * 80, figsize[1] * 80
         )
     # set the figure as the active figure
@@ -364,19 +356,19 @@ def warnAboutTicks(fig):
 
 
 class Signals(QtWidgets.QWidget):
-    figure_changed = Signal(Figure)
-    canvas_changed = Signal(object)
-    figure_size_changed = Signal()
-    figure_element_selected = Signal(object)
-    figure_selection_moved = Signal()
-    figure_selection_property_changed = Signal()
-    figure_selection_update = Signal()
-    figure_element_child_created = Signal(object)
+    figure_changed = QtCore.Signal(Figure)
+    canvas_changed = QtCore.Signal(object)
+    figure_size_changed = QtCore.Signal()
+    figure_element_selected = QtCore.Signal(object)
+    figure_selection_moved = QtCore.Signal()
+    figure_selection_property_changed = QtCore.Signal()
+    figure_selection_update = QtCore.Signal()
+    figure_element_child_created = QtCore.Signal(object)
 
 
 class PlotWindow(QtWidgets.QWidget):
     fig = None
-    update_changes_signal = Signal(bool, bool, str, str)
+    update_changes_signal = QtCore.Signal(bool, bool, str, str)
 
     def setFigure(self, figure):
         if self.fig is not None:
@@ -386,6 +378,18 @@ class PlotWindow(QtWidgets.QWidget):
         self.fig = figure
         self.fig.window = self
         self.fig.signals = self.signals
+        if getattr(figure, "_pylustrator_initial_dpi", None) is None:
+            figure._pylustrator_initial_dpi = figure.get_dpi()
+        selection = getattr(figure, "selection", None)
+        if selection is not None:
+            selection.defer_artist_updates = self.fast_drag_preview
+        dragger = getattr(figure, "figure_dragger", None)
+        if dragger is not None:
+            dragger.marquee_select_containers_only = (
+                self.marquee_select_containers_only
+            )
+            dragger.set_selection_mode(self.selection_mode)
+        self.updateSelectionControls()
         self.signals.figure_changed.emit(figure)
 
     def setCanvas(self, canvas):
@@ -406,8 +410,6 @@ class PlotWindow(QtWidgets.QWidget):
         # self.preview.addFigure(figure)
 
     def selectionProperyChanged(self):
-        if self.fig is None:
-            return
         self.fig.selection.update_selection_rectangles()
         self.fig.selection.update_extent()
 
@@ -427,7 +429,7 @@ class PlotWindow(QtWidgets.QWidget):
         file_menu.addAction(open_act)
 
         open_act = QAction("Exit", self)
-        open_act.triggered.connect(lambda checked=False: self.close())
+        open_act.triggered.connect(self.close)
         open_act.setShortcut("Ctrl+Q")
         file_menu.addAction(open_act)
 
@@ -447,19 +449,72 @@ class PlotWindow(QtWidgets.QWidget):
         self.redo_act.setShortcut("Ctrl+Y")
         file_menu.addAction(self.redo_act)
 
+        delete_act = QAction("Delete", self)
+        delete_act.triggered.connect(self.delete_selection)
+        delete_act.setShortcuts(["Delete", "Backspace"])
+        file_menu.addAction(delete_act)
+
+        def interaction_action(label, shortcut, callback):
+            action = QAction(label, self)
+            action.setShortcut(shortcut)
+
+            def execute():
+                if self.fig is None:
+                    return
+                try:
+                    callback(self.fig.figure_dragger)
+                except ValueError as exc:
+                    QtWidgets.QMessageBox.warning(self, "Pylustrator", str(exc))
+
+            action.triggered.connect(execute)
+            file_menu.addAction(action)
+            return action
+
+        interaction_action("Group", "Ctrl+G", lambda dragger: dragger.group_selection())
+        interaction_action(
+            "Ungroup", "Ctrl+Shift+G", lambda dragger: dragger.ungroup_selection()
+        )
+        interaction_action(
+            "Lock Selection", "Ctrl+2", lambda dragger: dragger.set_selection_locked(True)
+        )
+        interaction_action("Unlock All", "Ctrl+Alt+2", lambda dragger: dragger.unlock_all())
+        interaction_action(
+            "Hide Selection", "Ctrl+3", lambda dragger: dragger.set_selection_visible(False)
+        )
+        interaction_action("Show All", "Ctrl+Alt+3", lambda dragger: dragger.show_all())
+        interaction_action(
+            "Bring Forward",
+            "Ctrl+]",
+            lambda dragger: dragger.change_selection_zorder("forward"),
+        )
+        interaction_action(
+            "Send Backward",
+            "Ctrl+[",
+            lambda dragger: dragger.change_selection_zorder("backward"),
+        )
+        interaction_action(
+            "Bring to Front",
+            "Ctrl+Shift+]",
+            lambda dragger: dragger.change_selection_zorder("front"),
+        )
+        interaction_action(
+            "Send to Back",
+            "Ctrl+Shift+[",
+            lambda dragger: dragger.change_selection_zorder("back"),
+        )
+
         self.menuBar.addAction(info_act)
 
         layout_parent.addWidget(self.menuBar)
 
     def undo(self):
-        if self.fig is None:
-            return None
         self.fig.figure_dragger.undo()
 
     def redo(self):
-        if self.fig is None:
-            return None
         self.fig.figure_dragger.redo()
+
+    def delete_selection(self):
+        self.fig.selection.delete_targets()
 
     def __init__(self, number: int = 0):
         """The main window of pylustrator
@@ -471,6 +526,10 @@ class PlotWindow(QtWidgets.QWidget):
         super().__init__()
 
         self.figures = []
+        self._initial_layout_applied = False
+        self.fast_drag_preview = True
+        self.marquee_select_containers_only = False
+        self.selection_mode = SelectionMode.OBJECT
 
         self.signals = Signals()
         self.signals.canvas_changed.connect(self.setCanvas)
@@ -525,6 +584,56 @@ class PlotWindow(QtWidgets.QWidget):
 
         self.update_changes_signal.connect(updateChangesSignal)
 
+        selection_group = QtWidgets.QButtonGroup(self)
+        selection_group.setExclusive(True)
+        self.button_object_selection = QtWidgets.QPushButton("V")
+        self.button_object_selection.setCheckable(True)
+        self.button_object_selection.setChecked(True)
+        self.button_object_selection.setFixedWidth(22)
+        self.button_object_selection.setToolTip("Object Selection (V)")
+        self.button_object_selection.setShortcut("V")
+        self.button_object_selection.clicked.connect(
+            lambda checked: checked and self.setSelectionMode(SelectionMode.OBJECT)
+        )
+        selection_group.addButton(self.button_object_selection)
+
+        self.button_direct_selection = QtWidgets.QPushButton("A")
+        self.button_direct_selection.setCheckable(True)
+        self.button_direct_selection.setFixedWidth(22)
+        self.button_direct_selection.setToolTip("Direct Selection (A)")
+        self.button_direct_selection.setShortcut("A")
+        self.button_direct_selection.clicked.connect(
+            lambda checked: checked and self.setSelectionMode(SelectionMode.DIRECT)
+        )
+        selection_group.addButton(self.button_direct_selection)
+
+        self.selection_scope_label = QtWidgets.QLabel("")
+        self.selection_scope_label.setToolTip("Isolation scope")
+        self.selection_scope_label.setMinimumWidth(0)
+        self.selection_scope_label.setSizePolicy(
+            QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred
+        )
+
+        self.button_fast_drag = QtWidgets.QPushButton(qta.icon("fa5s.bolt"), "")
+        self.button_fast_drag.setCheckable(True)
+        self.button_fast_drag.setChecked(self.fast_drag_preview)
+        self.button_fast_drag.setToolTip("Fast drag preview")
+        self.button_fast_drag.clicked.connect(self.setFastDragPreview)
+        layout_top_bar.addWidget(self.button_fast_drag)
+
+        self.button_marquee_containers = QtWidgets.QPushButton(
+            qta.icon("fa5s.layer-group"), ""
+        )
+        self.button_marquee_containers.setCheckable(True)
+        self.button_marquee_containers.setChecked(
+            self.marquee_select_containers_only
+        )
+        self.button_marquee_containers.setToolTip("Box select containers only")
+        self.button_marquee_containers.clicked.connect(
+            self.setMarqueeSelectContainersOnly
+        )
+        layout_top_bar.addWidget(self.button_marquee_containers)
+
         self.input_size = QPosAndSize(layout_top_bar, self.signals)
 
         if 0:
@@ -543,12 +652,25 @@ class PlotWindow(QtWidgets.QWidget):
         #
         widget = QtWidgets.QWidget()
         self.layout_tools = QtWidgets.QVBoxLayout(widget)
+        selection_tools = QtWidgets.QHBoxLayout()
+        selection_tools.setContentsMargins(0, 0, 0, 0)
+        selection_tools.addWidget(self.button_object_selection)
+        selection_tools.addWidget(self.button_direct_selection)
+        selection_tools.addWidget(self.selection_scope_label, 1)
+        self.layout_tools.addLayout(selection_tools)
         widget.setSizePolicy(
-            QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Preferred
+            QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed
         )
-        # widget.setMaximumWidth(350)
-        # widget.setMinimumWidth(350)
-        self.layout_main.addWidget(widget)
+        tools_scroll = QtWidgets.QScrollArea()
+        tools_scroll.setWidgetResizable(True)
+        tools_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        tools_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        tools_scroll.setSizePolicy(
+            QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Expanding
+        )
+        tools_scroll.setWidget(widget)
+        self.layout_main.addWidget(tools_scroll)
+        self.tools_scroll = tools_scroll
 
         if 0:
             layout_rasterize_buttons = QtWidgets.QHBoxLayout()
@@ -581,17 +703,138 @@ class PlotWindow(QtWidgets.QWidget):
         from .QtGui import ColorChooserWidget
 
         self.colorWidget = ColorChooserWidget(self, None, self.signals)
-        self.colorWidget.setMaximumWidth(150)
-        self.layout_main.addWidget(self.colorWidget)
+        self.colorWidget.setSizePolicy(
+            QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Expanding
+        )
+        self.color_scroll = QtWidgets.QScrollArea()
+        self.color_scroll.setWidgetResizable(True)
+        self.color_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self.color_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.color_scroll.setWidget(self.colorWidget)
+        self.layout_main.addWidget(self.color_scroll)
 
         self.layout_main.setStretchFactor(0, 0)
         self.layout_main.setStretchFactor(1, 1)
         self.layout_main.setStretchFactor(2, 0)
 
-    def rasterize(self, rasterize: bool):
-        """convert the figur elements to an image"""
+    def _available_geometry(self) -> QtCore.QRect:
+        screen = self.screen() or QtWidgets.QApplication.primaryScreen()
+        if screen is None:
+            return QtCore.QRect(0, 0, 1440, 900)
+        return screen.availableGeometry()
+
+    def _figure_design_pixels(self) -> tuple[float, float]:
+        if self.fig is None:
+            return 800.0, 600.0
+        width, height = self.fig.get_size_inches()
+        dpi = getattr(self.fig, "_pylustrator_initial_dpi", self.fig.get_dpi())
+        return float(width * dpi), float(height * dpi)
+
+    def _initial_side_widths(self, max_width: int) -> tuple[int, int]:
+        tools_width = 280
+        color_width = 220
+        min_canvas_width = 420
+        if max_width < tools_width + color_width + min_canvas_width + 40:
+            tools_width = 220
+            color_width = 180
+        if max_width < tools_width + color_width + min_canvas_width + 40:
+            tools_width = max(160, int(max_width * 0.25))
+            color_width = max(140, int(max_width * 0.20))
+        return tools_width, color_width
+
+    def _apply_initial_layout(self):
         if self.fig is None:
             return
+        available = self._available_geometry()
+        max_width = max(700, int(available.width() * 0.92))
+        max_height = max(520, int(available.height() * 0.88))
+        tools_width, color_width = self._initial_side_widths(max_width)
+
+        top_chrome = self.height() - self.layout_main.height()
+        if top_chrome <= 0:
+            top_chrome = (
+                self.menuBar.sizeHint().height()
+                + self.input_size.sizeHint().height()
+                + 12
+            )
+        plot_chrome = (
+            self.plot_layout.height() - self.plot_layout.canvas_canvas.height()
+        )
+        if plot_chrome <= 0:
+            plot_chrome = 72
+
+        figure_width, figure_height = self._figure_design_pixels()
+        available_canvas_width = max(max_width - tools_width - color_width - 40, 300)
+        available_canvas_height = max(max_height - top_chrome - plot_chrome, 260)
+
+        canvas_width = int(
+            min(max(figure_width, min(720, available_canvas_width)), available_canvas_width)
+        )
+        canvas_height = int(
+            min(max(figure_height, min(520, available_canvas_height)), available_canvas_height)
+        )
+        window_width = min(max_width, tools_width + canvas_width + color_width + 40)
+        window_height = min(max_height, canvas_height + top_chrome + plot_chrome)
+
+        x = available.x() + max((available.width() - window_width) // 2, 0)
+        y = available.y() + max((available.height() - window_height) // 2, 0)
+        self.setGeometry(x, y, int(window_width), int(window_height))
+        self.layout_main.setSizes(
+            [
+                int(tools_width),
+                max(int(window_width - tools_width - color_width), 300),
+                int(color_width),
+            ]
+        )
+        self.plot_layout.canvas_canvas.fitToView(True)
+
+    def setFastDragPreview(self, enabled: bool):
+        self.fast_drag_preview = bool(enabled)
+        if self.fig is not None and getattr(self.fig, "selection", None) is not None:
+            self.fig.selection.defer_artist_updates = self.fast_drag_preview
+
+    def setSelectionMode(self, mode: SelectionMode | str):
+        self.selection_mode = SelectionMode.coerce(mode)
+        if (
+            self.fig is not None
+            and getattr(self.fig, "figure_dragger", None) is not None
+        ):
+            self.fig.figure_dragger.set_selection_mode(self.selection_mode)
+        self.updateSelectionControls()
+
+    def updateSelectionControls(self):
+        mode = self.selection_mode
+        breadcrumbs = ()
+        if (
+            self.fig is not None
+            and getattr(self.fig, "figure_dragger", None) is not None
+        ):
+            mode = self.fig.figure_dragger.selection_mode
+            breadcrumbs = self.fig.figure_dragger.isolation_breadcrumbs
+        self.selection_mode = mode
+        for button, checked in (
+            (self.button_object_selection, mode is SelectionMode.OBJECT),
+            (self.button_direct_selection, mode is SelectionMode.DIRECT),
+        ):
+            old = button.blockSignals(True)
+            button.setChecked(checked)
+            button.blockSignals(old)
+        self.selection_scope_label.setText(
+            " / ".join(breadcrumbs) if breadcrumbs else ""
+        )
+
+    def setMarqueeSelectContainersOnly(self, enabled: bool):
+        self.marquee_select_containers_only = bool(enabled)
+        if (
+            self.fig is not None
+            and getattr(self.fig, "figure_dragger", None) is not None
+        ):
+            self.fig.figure_dragger.marquee_select_containers_only = (
+                self.marquee_select_containers_only
+            )
+
+    def rasterize(self, rasterize: bool):
+        """convert the figur elements to an image"""
         if len(self.fig.selection.targets):
             self.fig.figure_dragger.select_element(None)
         if rasterize:
@@ -603,19 +846,17 @@ class PlotWindow(QtWidgets.QWidget):
         self.fig.canvas.draw()
 
     def actionSave(self):
-        """save the code for the figure"""
-        if self.fig is None:
-            return
+        """Save the editable source document.
+
+        Image export is an explicit, separate action.  Replaying previous
+        ``savefig`` calls here both blocked the UI on rendering and caused the
+        tracking wrapper to append the replayed requests again, doubling the
+        work after every Ctrl+S.
+        """
         self.fig.change_tracker.save()
-        for _last_saved_figure, args, kwargs in getattr(
-            self.fig, "_last_saved_figure", []
-        ):
-            self.fig.savefig(_last_saved_figure, *args, **kwargs)
 
     def actionSaveImage(self):
         """save figure as an image"""
-        if self.fig is None:
-            return
         path = QtWidgets.QFileDialog.getSaveFileName(
             self,
             "Save Image",
@@ -641,19 +882,22 @@ class PlotWindow(QtWidgets.QWidget):
 
     def showEvent(self, event: QtCore.QEvent):
         """when the window is shown"""
+        super().showEvent(event)
         self.colorWidget.updateColorsText()
+        if not self._initial_layout_applied:
+            self._initial_layout_applied = True
+            self._apply_initial_layout()
+            QtCore.QTimer.singleShot(
+                0, lambda: self.plot_layout.canvas_canvas.fitToView(True)
+            )
 
     def update(self):
         """update the tree view"""
-        if self.fig is None:
-            return
 
         # self.input_size.setValue(np.array(self.fig.get_size_inches()) * 2.54)
 
         def wrap(func):
             def newfunc(element, event=None):
-                if self.fig is None:
-                    return
                 self.fig.no_figure_dragger_selection_update = True
                 self.signals.figure_element_selected.emit(element)
                 ret = func(element, event)
@@ -679,8 +923,6 @@ class PlotWindow(QtWidgets.QWidget):
 
     def updateTitle(self):
         """update the title of the window to display if it is saved or not"""
-        if self.fig is None:
-            return
         if self.fig.change_tracker.saved:
             self.setWindowTitle("Figure %s - Pylustrator" % self.fig.number)
         else:

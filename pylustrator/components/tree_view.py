@@ -1,33 +1,25 @@
-from typing import TYPE_CHECKING, Optional
+from typing import Optional
 
 import qtawesome as qta
+from qtpy import QtCore, QtGui, QtWidgets
 
-if TYPE_CHECKING:
-    from PyQt5 import QtCore, QtGui, QtWidgets
-else:
-    from qtpy import QtCore, QtGui, QtWidgets
-
+import matplotlib as mpl
 from matplotlib.artist import Artist
-from matplotlib.spines import Spine
-from matplotlib.axis import XAxis, YAxis
-from matplotlib.text import Text
+
+from pylustrator.drag_helper import get_artist_children
+from pylustrator.editor_model import EditorGroup
 
 
 class myTreeWidgetItem(QtGui.QStandardItem):
-    entry: Artist | None = None
-    expanded: bool = False
-
-    def __init__(self, text: str):
+    def __init__(self, parent: QtWidgets.QWidget = None):
         """a tree view item to display the contents of the figure"""
-        QtGui.QStandardItem.__init__(self, text)
+        QtGui.QStandardItem.__init__(self, parent)
 
-    def parent(self) -> Optional["myTreeWidgetItem"]:
-        parent = super().parent()
-        if parent is None:
-            return parent
-        if isinstance(parent, myTreeWidgetItem):
-            return parent
-        raise TypeError("myTreeWidgetItem has invalid parent")
+    def __lt__(self, otherItem: QtGui.QStandardItem):
+        """how to sort the items"""
+        if self.sort is None:
+            return 0
+        return self.sort < otherItem.sort
 
 
 class MyTreeView(QtWidgets.QTreeView):
@@ -46,10 +38,9 @@ class MyTreeView(QtWidgets.QTreeView):
 
     last_selection = None
     last_hover = None
-    model: QtGui.QStandardItemModel
 
     def item_selected(self, x):
-        if not self.fig.no_figure_dragger_selection_update:
+        if not getattr(self.fig, "no_figure_dragger_selection_update", False):
             if getattr(self.fig, "figure_dragger", None) is not None:
                 self.fig.figure_dragger.select_element(x)
 
@@ -83,34 +74,48 @@ class MyTreeView(QtWidgets.QTreeView):
         self.setUniformRowHeights(True)
         self.setHeaderHidden(True)
         self.setAnimated(True)
+        self.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
         self.setModel(self.model)
         self.expanded.connect(self.TreeExpand)
         self.clicked.connect(self.treeClicked)
         self.activated.connect(self.treeActivated)
-
-        selectionModel = self.selectionModel()
-        if selectionModel is None:
-            raise ValueError("")
-        selectionModel.selectionChanged.connect(self.selectionChanged)
+        self.selectionModel().selectionChanged.connect(self.selectionChanged)
 
         # add context menu
-        self.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        self.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
 
         # add hover highlight
-        viewport = self.viewport()
-        if viewport is None:
-            raise ValueError("")
-        viewport.setMouseTracking(True)
-        viewport.installEventFilter(self)
+        self.viewport().setMouseTracking(True)
+        self.viewport().installEventFilter(self)
 
         self.item_lookup = {}
 
     def select_element(self, element: Artist):
         """select an element"""
+        selected_entries = []
+        for index in self.selectionModel().selectedIndexes():
+            if index.column() != 0:
+                continue
+            try:
+                selected_entries.append(index.model().itemFromIndex(index).entry)
+            except AttributeError:
+                continue
+        if element in selected_entries:
+            return
         if element is None:
             self.setCurrentIndex(self.fig)
         else:
             self.setCurrentIndex(element)
+
+    def selectionCommand(
+        self, index: QtCore.QModelIndex, event: QtCore.QEvent = None
+    ) -> QtCore.QItemSelectionModel.SelectionFlags:
+        command = super().selectionCommand(index, event)
+        modifiers = event.modifiers() if event is not None else QtCore.Qt.NoModifier
+        additive_modifier = QtCore.Qt.ControlModifier | QtCore.Qt.MetaModifier
+        if modifiers & additive_modifier:
+            return QtCore.QItemSelectionModel.Toggle | QtCore.QItemSelectionModel.Rows
+        return command | QtCore.QItemSelectionModel.Rows
 
     def setFigure(self, fig):
         self.fig = fig
@@ -126,17 +131,36 @@ class MyTreeView(QtWidgets.QTreeView):
         self, selection: QtCore.QItemSelection, y: QtCore.QItemSelection
     ):
         """when the selection in the tree view changes"""
-        model = None
-        if len(selection.indexes()):
-            model = selection.indexes()[0].model()
-        entry = None
-        if model is not None and isinstance(model, QtGui.QStandardItemModel):
-            selected_entry = model.itemFromIndex(selection.indexes()[0])
-            if isinstance(selected_entry, myTreeWidgetItem):
-                entry = selected_entry.entry
-        if self.last_selection != entry:
-            self.last_selection = entry
-            self.item_selected(entry)
+        if getattr(self, "fig", None) is None:
+            return
+        entries = []
+        for index in self.selectionModel().selectedIndexes():
+            if index.column() != 0:
+                continue
+            try:
+                entry = index.model().itemFromIndex(index).entry
+            except AttributeError:
+                continue
+            if entry is not None and entry not in entries:
+                entries.append(entry)
+        entry = entries[-1] if entries else None
+        current_index = self.currentIndex()
+        if current_index.isValid():
+            try:
+                current_entry = current_index.model().itemFromIndex(current_index).entry
+            except AttributeError:
+                current_entry = None
+            if current_entry in entries:
+                entry = current_entry
+        if self.last_selection != entries:
+            self.last_selection = list(entries)
+            if len(entries) > 1 and not getattr(
+                self.fig, "no_figure_dragger_selection_update", False
+            ):
+                if getattr(self.fig, "figure_dragger", None) is not None:
+                    self.fig.figure_dragger.select_elements(entries, primary=entry)
+            else:
+                self.item_selected(entry)
 
     def setCurrentIndex(self, entry: Artist):
         """set the currently selected entry"""
@@ -144,60 +168,40 @@ class MyTreeView(QtWidgets.QTreeView):
             item = self.getItemFromEntry(entry)
             if item is not None:
                 try:
-                    super().setCurrentIndex(item.index())
+                    index = item.index()
+                    self.selectionModel().select(
+                        index,
+                        QtCore.QItemSelectionModel.ClearAndSelect
+                        | QtCore.QItemSelectionModel.Rows,
+                    )
+                    super().setCurrentIndex(index)
                 except RuntimeError:  # maybe find out why we run into this error when the figure is changed
                     pass
                 return
-
-            tree_parent = getattr(entry, "tree_parent", None)
-            if isinstance(tree_parent, Artist):
-                entry = tree_parent
-            else:
+            try:
+                entry = self.getParentEntry(entry)
+            except (AttributeError, RuntimeError):
                 return
 
     def treeClicked(self, index: QtCore.QModelIndex):
         """upon selecting one of the tree elements"""
-        model = index.model()
-        if model is not None and isinstance(model, QtGui.QStandardItemModel):
-            selected_entry = model.itemFromIndex(index)
-            if isinstance(selected_entry, myTreeWidgetItem):
-                data = selected_entry.entry
-                return self.item_clicked(data)
-        return self.item_clicked(None)
+        data = index.model().itemFromIndex(index).entry
+        return self.item_clicked(data)
 
     def treeActivated(self, index: QtCore.QModelIndex):
         """upon selecting one of the tree elements"""
-        model = index.model()
-        if model is not None and isinstance(model, QtGui.QStandardItemModel):
-            selected_entry = model.itemFromIndex(index)
-            if isinstance(selected_entry, myTreeWidgetItem):
-                data = selected_entry.entry
-                return self.item_activated(data)
-        return self.item_activated(None)
+        data = index.model().itemFromIndex(index).entry
+        return self.item_activated(data)
 
-    def eventFilter(
-        self, a0: Optional[QtCore.QObject], a1: Optional[QtCore.QEvent]
-    ) -> bool:
+    def eventFilter(self, object: QtWidgets.QWidget, event: QtCore.QEvent):
         """event filter for tree view port to handle mouse over events and marker highlighting"""
-        if a1 is None:
-            return False
-        if a1.type() == QtCore.QEvent.Type.HoverMove and isinstance(
-            a1, QtGui.QHoverEvent
-        ):
-            # HoverMove events have pos() method
-            pos = a1.pos()
-            index = self.indexAt(pos)
+        if event.type() == QtCore.QEvent.HoverMove:
+            index = self.indexAt(event.pos())
             try:
-                model = index.model()
-                if isinstance(model, QtGui.QStandardItemModel):
-                    item = model.itemFromIndex(index)
-                    if isinstance(item, myTreeWidgetItem):
-                        entry = item.entry
-                    else:
-                        entry = None
-                else:
-                    entry = None
+                item = index.model().itemFromIndex(index)
+                entry = item.entry
             except AttributeError:
+                item = None
                 entry = None
 
             # check for new item
@@ -219,14 +223,25 @@ class MyTreeView(QtWidgets.QTreeView):
         """when expanding a tree item"""
         if entry is None:
             return [self.fig]
-        return entry.get_children()
+        children = get_artist_children(entry)
+        dragger = getattr(getattr(self, "fig", None), "figure_dragger", None)
+        scene = getattr(dragger, "editor_scene", None)
+        if scene is not None:
+            return scene.tree_children(entry, children)
+        return children
 
-    def getParentEntry(self, entry: Artist) -> Artist | None:
+    def getParentEntry(self, entry: Artist) -> Artist:
         """get the parent of an item"""
+        dragger = getattr(getattr(self, "fig", None), "figure_dragger", None)
+        scene = getattr(dragger, "editor_scene", None)
+        if scene is not None:
+            return scene.tree_parent(entry)
         return getattr(entry, "tree_parent", None)
 
-    def getNameOfEntry(self, entry: Artist | None) -> str:
+    def getNameOfEntry(self, entry: Artist) -> str:
         """convert an entry to a string"""
+        if isinstance(entry, EditorGroup):
+            return entry.name
         try:
             return str(entry)
         except AttributeError:
@@ -234,17 +249,28 @@ class MyTreeView(QtWidgets.QTreeView):
 
     def getIconOfEntry(self, entry: Artist) -> QtGui.QIcon:
         """get the icon of an entry"""
-        draggable = getattr(entry, "_draggable", None)
-        if draggable:
-            if draggable.connected:
+        dragger = getattr(getattr(self, "fig", None), "figure_dragger", None)
+        scene = getattr(dragger, "editor_scene", None)
+        if scene is not None:
+            if scene.is_locked(entry):
+                return qta.icon("fa5s.lock")
+            if scene.is_explicitly_hidden(entry) or not entry.get_visible():
+                return qta.icon("fa5s.eye-slash")
+        if isinstance(entry, EditorGroup):
+            return qta.icon("fa5s.layer-group")
+        if getattr(entry, "_draggable", None):
+            if entry._draggable.connected:
                 return qta.icon("fa5.hand-paper-o")
         return QtGui.QIcon()
+
+    def getEntrySortRole(self, entry: Artist):
+        return None
 
     def getKey(self, entry: Artist) -> Artist:
         """get the key of an entry, which is the entry itself"""
         return entry
 
-    def getItemFromEntry(self, entry: Artist | None) -> Optional[myTreeWidgetItem]:
+    def getItemFromEntry(self, entry: Artist) -> Optional[QtWidgets.QTreeWidgetItem]:
         """get the tree view item for the given artist"""
         if entry is None:
             return None
@@ -254,15 +280,13 @@ class MyTreeView(QtWidgets.QTreeView):
         except KeyError:
             return None
 
-    def setItemForEntry(self, entry: Artist, item: myTreeWidgetItem):
+    def setItemForEntry(self, entry: Artist, item: QtWidgets.QTreeWidgetItem):
         """store a new artist and tree view widget pair"""
         key = self.getKey(entry)
         self.item_lookup[key] = item
 
-    def expand(self, entry: Artist | None, force_reload: bool = True):
+    def expand(self, entry: Artist, force_reload: bool = True):
         """expand the children of a tree view item"""
-        if entry is None:
-            return
         query = self.queryToExpandEntry(entry)
         parent_item = self.getItemFromEntry(entry)
         parent_entry = entry
@@ -282,21 +306,23 @@ class MyTreeView(QtWidgets.QTreeView):
         # add all marker types
         row = -1
         for row, entry in enumerate(query):
-            entry.tree_parent = parent_entry
+            dragger = getattr(getattr(self, "fig", None), "figure_dragger", None)
+            if getattr(dragger, "editor_scene", None) is None:
+                entry.tree_parent = parent_entry
             if 1:
                 if (
-                    isinstance(entry, Spine)
-                    or isinstance(entry, XAxis)
-                    or isinstance(entry, YAxis)
+                    isinstance(entry, mpl.spines.Spine)
+                    or isinstance(entry, mpl.axis.XAxis)
+                    or isinstance(entry, mpl.axis.YAxis)
                 ):
                     continue
-                if isinstance(entry, Text) and entry.get_text() == "":
+                if isinstance(entry, mpl.text.Text) and entry.get_text() == "":
                     continue
-
-                patch = getattr(parent_entry, "patch", None)
-                if patch and entry == patch:
-                    continue
-
+                try:
+                    if entry == parent_entry.patch:
+                        continue
+                except AttributeError:
+                    pass
                 try:
                     label = entry.get_label()
                     if label == "_tmp_snap" or label == "grabber":
@@ -305,8 +331,11 @@ class MyTreeView(QtWidgets.QTreeView):
                     pass
             self.addChild(parent_item, entry)
 
-    def addChild(self, parent_item: myTreeWidgetItem | None, entry: Artist, row=None):
+    def addChild(self, parent_item: QtWidgets.QWidget, entry: Artist, row=None):
         """add a child to a tree view node"""
+        if parent_item is None:
+            parent_item = self.model
+
         # add item
         item = myTreeWidgetItem(self.getNameOfEntry(entry))
         item.expanded = False
@@ -314,6 +343,7 @@ class MyTreeView(QtWidgets.QTreeView):
 
         item.setIcon(self.getIconOfEntry(entry))
         item.setEditable(False)
+        item.sort = self.getEntrySortRole(entry)
 
         if parent_item is None:
             if row is None:
@@ -331,7 +361,7 @@ class MyTreeView(QtWidgets.QTreeView):
         if self.queryToExpandEntry(entry) is not None and len(
             self.queryToExpandEntry(entry)
         ):
-            child = myTreeWidgetItem("loading")
+            child = QtGui.QStandardItem("loading")
             child.entry = None
             child.setEditable(False)
             child.setIcon(qta.icon("fa5s.hourglass-half"))
@@ -360,8 +390,8 @@ class MyTreeView(QtWidgets.QTreeView):
         self,
         entry: Artist,
         update_children: bool = False,
-        insert_before: Artist | None = None,
-        insert_after: Artist | None = None,
+        insert_before: Artist = None,
+        insert_after: Artist = None,
     ):
         """update a tree view node"""
         # get the tree view item for the database entry
@@ -384,13 +414,9 @@ class MyTreeView(QtWidgets.QTreeView):
             # define the row where the new item should be
             row = None
             if insert_before:
-                before_entry = self.getItemFromEntry(insert_before)
-                if before_entry:
-                    row = before_entry.row()
+                row = self.getItemFromEntry(insert_before).row()
             if insert_after:
-                after_entry = self.getItemFromEntry(insert_after)
-                if after_entry:
-                    row = after_entry.row() + 1
+                row = self.getItemFromEntry(insert_after).row() + 1
 
             # add the item as a child of its parent
             self.addChild(parent_item, entry, row)
@@ -405,22 +431,17 @@ class MyTreeView(QtWidgets.QTreeView):
             parent_item = self.getItemFromEntry(parent_entry)
             if parent_item != item.parent():
                 # remove the item from the old position
-                item_parent = item.parent()
-                if item_parent is None:
+                if item.parent() is None:
                     self.model.takeRow(item.row())
                 else:
-                    item_parent.takeRow(item.row())
+                    item.parent().takeRow(item.row())
 
                 # determine a potential new position
                 row = None
                 if insert_before:
-                    before_entry = self.getItemFromEntry(insert_before)
-                    if before_entry:
-                        row = before_entry.row()
+                    row = self.getItemFromEntry(insert_before).row()
                 if insert_after:
-                    after_entry = self.getItemFromEntry(insert_after)
-                    if after_entry:
-                        row = after_entry.row() + 1
+                    row = self.getItemFromEntry(insert_after).row() + 1
 
                 # move the item to the new position
                 if parent_item is None:
@@ -444,12 +465,12 @@ class MyTreeView(QtWidgets.QTreeView):
         """delete an entry from the tree"""
         # get the tree view item for the database entry
         item = self.getItemFromEntry(entry)
-        if item is None or not isinstance(item, myTreeWidgetItem):
+        if item is None:
             return
 
         parent_item = item.parent()
-        # if parent_item:
-        #    parent_entry = parent_item.entry
+        if parent_item:
+            parent_entry = parent_item.entry
 
         key = self.getKey(entry)
         del self.item_lookup[key]
@@ -458,11 +479,10 @@ class MyTreeView(QtWidgets.QTreeView):
         if parent_item is None:
             self.model.removeRow(item.row())
         else:
-            parent_item.removeRow(item.row())
-            # parent_item.removeRow(item.row(), parent_entry) # this is not working
+            item.parent().removeRow(item.row(), item.parent())
 
-        # update the label of parent item ## parent item does not have an attribute setLabel
-        # if parent_item:
-        #    name = self.getNameOfEntry(parent_entry)
-        #    if name is not None:
-        #        parent_item.setLabel(name)
+        # update the label of parent item
+        if parent_item:
+            name = self.getNameOfEntry(parent_entry)
+            if name is not None:
+                parent_item.setLabel(name)
