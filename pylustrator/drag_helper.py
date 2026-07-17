@@ -26,15 +26,19 @@ import numpy as np
 from matplotlib.artist import Artist
 from matplotlib.figure import Figure, SubFigure
 from matplotlib.axes import Axes
+from matplotlib.collections import Collection
+from matplotlib.image import AxesImage
 from matplotlib.legend import Legend
-from matplotlib.text import Text
-from matplotlib.patches import Rectangle
+from matplotlib.lines import Line2D
+from matplotlib.text import Annotation, Text
+from matplotlib.patches import Patch, Rectangle
 from matplotlib.backend_bases import MouseEvent, KeyEvent
 from typing import Iterable, Sequence
 from qtpy import QtCore, QtGui, QtWidgets
 
 from .artist_adapters import (
     ArtistAdapter,
+    PatchAdapter,
     UnsupportedArtistError,
     invalidate_legend_owner_inventory,
     iter_figure_legends,
@@ -54,7 +58,14 @@ from .change_tracker import ChangeTracker, add_text_default
 from .components.plot_layout import scene_point_to_canvas_pixels
 from .editor_model import EditorGroup, EditorScene
 from .interaction import HitCandidate, HitStack, SelectionKernel, SelectionMode
+from .interaction_index import DisplaySpaceHitIndex
 from .operations import OperationSupport, TransformIntent, TransformOperation
+from .smart_guides import Axis, StaleGuideSnapshotError
+from .smart_guide_ui import (
+    create_smart_guide_drag_session,
+    invalidate_smart_guide_cache,
+    schedule_smart_guide_warmup,
+)
 from .transform_engine import TransformPlan
 from .property_adapters import axis_tick_label_reference
 from .commands import InteractionState, ObjectLocator, semantic_equal
@@ -66,6 +77,30 @@ DIR_X1 = 4
 DIR_Y1 = 8
 
 blit = False
+
+
+# Only native containment implementations with a display-bounded contract are
+# eligible for coarse indexing.  Custom ``contains`` or adapter ``hit_test``
+# implementations remain always-tested, so extension authors cannot create an
+# invisible false-negative by returning hits outside a conventional bbox.
+_BOUNDED_NATIVE_CONTAINS = frozenset(
+    {
+        Figure.contains,
+        SubFigure.contains,
+        Axes.contains,
+        Collection.contains,
+        AxesImage.contains,
+        Legend.contains,
+        Line2D.contains,
+        Annotation.contains,
+        Text.contains,
+        Patch.contains,
+        EditorGroup.contains,
+    }
+)
+_BOUNDED_ADAPTER_HIT_TESTS = frozenset(
+    {ArtistAdapter.hit_test, PatchAdapter.hit_test}
+)
 
 
 class InteractionRollbackError(RuntimeError):
@@ -165,6 +200,7 @@ class GrabFunctions(object):
         self.parent = parent
         self.dir = dir
         self.snaps = []
+        self.smart_guide_session = None
         self.no_height = no_height
 
     def on_motion(self, evt: MouseEvent):
@@ -203,7 +239,14 @@ class GrabFunctions(object):
         for snap in self.snaps:
             snap.remove()
         self.snaps = []
+        self._close_smart_guide_session()
         self.moved = False
+
+    def _close_smart_guide_session(self) -> None:
+        session = getattr(self, "smart_guide_session", None)
+        self.smart_guide_session = None
+        if session is not None:
+            session.close()
 
     def clickedEvent(self, event: MouseEvent):
         """when the mouse is clicked"""
@@ -213,8 +256,62 @@ class GrabFunctions(object):
         for s in self.snaps:
             s.remove()
         self.snaps = []
+        self._close_smart_guide_session()
 
-        self.snaps = getSnaps(self.targets, self.dir, no_height=self.no_height)
+        whole_object = bool(
+            self.dir & DIR_X0
+            and self.dir & DIR_X1
+            and self.dir & DIR_Y0
+            and self.dir & DIR_Y1
+        )
+        if whole_object and bool(
+            getattr(self.parent, "smart_guides_enabled", True)
+        ):
+            manager = getattr(self.figure, "figure_dragger", None)
+            if manager is not None:
+                try:
+                    self.smart_guide_session = create_smart_guide_drag_session(
+                        manager,
+                        self.parent,
+                        [target.target for target in self.targets],
+                        tolerance_px=float(
+                            getattr(
+                                self.parent,
+                                "smart_guide_tolerance_px",
+                                5.0,
+                            )
+                        ),
+                        include_equal_gaps=bool(
+                            getattr(
+                                self.parent,
+                                "smart_guides_equal_gaps",
+                                True,
+                            )
+                        ),
+                        allow_cold_capture=bool(
+                            getattr(
+                                self.parent,
+                                "smart_guides_allow_blocking_capture",
+                                False,
+                            )
+                        ),
+                    )
+                except (
+                    AttributeError,
+                    IndexError,
+                    LookupError,
+                    TypeError,
+                    ValueError,
+                    RuntimeError,
+                    np.linalg.LinAlgError,
+                ):
+                    self.smart_guide_session = None
+
+        # Resize retains the legacy dimension snaps.  Translation uses the
+        # generic indexed guide session when it could be built; falling back is
+        # behavior-preserving and keeps third-party/custom Artists fail-open.
+        if self.smart_guide_session is None:
+            self.snaps = getSnaps(self.targets, self.dir, no_height=self.no_height)
 
         if blit is True:
             for target in self.targets:
@@ -231,8 +328,24 @@ class GrabFunctions(object):
         for snap in self.snaps:
             snap.remove()
         self.snaps = []
-
-        self.parent.end_move()
+        session = getattr(self, "smart_guide_session", None)
+        self.smart_guide_session = None
+        draw_pending = False
+        try:
+            # Commit the already accepted preview verbatim.  Re-solving at
+            # release would make the final position jump away from the last
+            # frame the user actually saw.
+            self.parent.end_move()
+            draw_pending = bool(getattr(self.parent, "has_moved", False))
+        finally:
+            if session is not None:
+                session.close()
+            manager = getattr(self.figure, "figure_dragger", None)
+            if manager is not None and not draw_pending:
+                # A committed move schedules a draw, whose post-layout event
+                # starts the authoritative warmup.  Only a click/no-op needs a
+                # warmup here because no draw is pending.
+                schedule_smart_guide_warmup(manager)
 
         if blit is True:
             for target in self.targets:
@@ -265,6 +378,7 @@ class GrabFunctions(object):
             keep_aspect_ratio=keep_aspect,
             ignore_snaps=ignore_snaps,
             constrain_direction=constrain_direction,
+            smart_guide_session=self.smart_guide_session,
         )
 
         if blit is True:
@@ -329,6 +443,10 @@ class GrabbableRectangleSelection(GrabFunctions):
         self.alignment_reference_mode = "selection"
         self.alignment_key = None
         self.defer_artist_updates = True
+        self.smart_guides_enabled = True
+        self.smart_guide_tolerance_px = 5.0
+        self.smart_guides_equal_gaps = True
+        self.smart_guides_allow_blocking_capture = False
 
         self.hide_grabber()
 
@@ -1944,13 +2062,17 @@ class GrabbableRectangleSelection(GrabFunctions):
         points: np.ndarray,
         selection_points: np.ndarray = None,
     ):
-        target.target._pylustrator_preview_positions = [
-            np.array(point, dtype=float).copy() for point in points
-        ]
+        # Keep one owned, contiguous buffer.  A Line2D can expose hundreds of
+        # thousands of control points; allocating one tiny ndarray per vertex
+        # dominated deferred-drag frame time and memory without adding any
+        # isolation beyond a single array copy.
+        target.target._pylustrator_preview_positions = np.array(
+            points, dtype=float, copy=True, order="C"
+        )
         if selection_points is not None:
-            target.target._pylustrator_preview_selection_points = [
-                np.array(point, dtype=float).copy() for point in selection_points
-            ]
+            target.target._pylustrator_preview_selection_points = np.array(
+                selection_points, dtype=float, copy=True, order="C"
+            )
         setattr(target.target, "_pylustrator_cached_get_extend", None)
 
     @legend_owner_snapshot()
@@ -2141,7 +2263,16 @@ class GrabbableRectangleSelection(GrabFunctions):
             self._restore_move_start(strict=False)
             self.has_moved = False
             self._clear_move_transaction()
+            dragger = getattr(self.figure, "figure_dragger", None)
+            invalidate = getattr(dragger, "_invalidate_interaction_index", None)
+            if callable(invalidate):
+                invalidate()
             raise
+        if self.has_moved:
+            dragger = getattr(self.figure, "figure_dragger", None)
+            invalidate = getattr(dragger, "_invalidate_interaction_index", None)
+            if callable(invalidate):
+                invalidate()
         self._clear_move_transaction()
 
     @legend_owner_snapshot()
@@ -2264,10 +2395,69 @@ class GrabbableRectangleSelection(GrabFunctions):
         keep_aspect_ratio: bool = False,
         ignore_snaps: bool = False,
         constrain_direction: bool = False,
+        smart_guide_session=None,
     ):
         """called from a grabber to move the selection."""
+        original_pos = np.asarray(pos, dtype=float)
         if constrain_direction:
             pos = _constrain_to_cardinal_direction(pos, dir)
+        pos = np.asarray(pos, dtype=float)
+
+        if smart_guide_session is not None:
+            adjusted_pos = pos.copy()
+            plan = None
+            if ignore_snaps:
+                smart_guide_session.hide()
+            elif bool(getattr(smart_guide_session, "active", True)):
+                axes = None
+                if constrain_direction:
+                    if np.isclose(pos[0], 0.0) and not np.isclose(pos[1], 0.0):
+                        axes = frozenset((Axis.Y,))
+                    elif np.isclose(pos[1], 0.0) and not np.isclose(pos[0], 0.0):
+                        axes = frozenset((Axis.X,))
+                    elif np.allclose(original_pos, 0.0):
+                        axes = frozenset()
+                try:
+                    plan = smart_guide_session.query(
+                        pos,
+                        axes=axes,
+                        render=False,
+                    )
+                except StaleGuideSnapshotError:
+                    smart_guide_session.invalidate()
+                except (
+                    AttributeError,
+                    IndexError,
+                    LookupError,
+                    TypeError,
+                    ValueError,
+                    RuntimeError,
+                    np.linalg.LinAlgError,
+                ):
+                    # Smart guides are an interaction aid, never a reason to
+                    # strand a drag gesture.  An invalid planner is disabled
+                    # once; subsequent frames remain raw and exception-free.
+                    smart_guide_session.invalidate()
+                else:
+                    adjusted_pos += np.asarray(plan.delta_px, dtype=float)
+            try:
+                self.addOffset(adjusted_pos, dir, keep_aspect_ratio)
+            except Exception:
+                smart_guide_session.hide()
+                raise
+            if plan is not None:
+                try:
+                    smart_guide_session.accept(plan)
+                except (
+                    AttributeError,
+                    TypeError,
+                    ValueError,
+                    RuntimeError,
+                ):
+                    smart_guide_session.invalidate()
+            self.has_moved = True
+            return
+
         self.addOffset(pos, dir, keep_aspect_ratio)
         self.has_moved = True
 
@@ -2357,6 +2547,9 @@ class DragManager:
         self._interaction_artist_ids = set()
         self._selection_parent_by_id = {}
         self._draw_child_orders = {}
+        self._interaction_revision = 0
+        self._interaction_index = DisplaySpaceHitIndex()
+        self._smart_guide_idle_warmup_enabled = True
         self.editor_scene = EditorScene(
             figure, ownership_parent=self._draw_parent
         )
@@ -2390,6 +2583,242 @@ class DragManager:
         self.figure.selection = self.selection
         self.change_tracker = ChangeTracker(figure, no_save)
         self.figure.change_tracker = self.change_tracker
+        schedule_smart_guide_warmup(self)
+
+    def _ensure_interaction_index(self) -> DisplaySpaceHitIndex:
+        index = getattr(self, "_interaction_index", None)
+        if index is None:
+            index = DisplaySpaceHitIndex()
+            self._interaction_index = index
+        if not hasattr(self, "_interaction_revision"):
+            self._interaction_revision = 0
+        return index
+
+    def _invalidate_interaction_index(self) -> None:
+        """Advance the geometry/inventory version used by pointer queries."""
+
+        index = self._ensure_interaction_index()
+        self._interaction_revision = int(self._interaction_revision) + 1
+        index.invalidate()
+        active_session = getattr(self, "_active_smart_guide_session", None)
+        if active_session is not None:
+            active_session.invalidate()
+        invalidate_smart_guide_cache(self)
+
+    @staticmethod
+    def _interaction_hit_components(artist: Artist) -> tuple[Artist, ...]:
+        """Return child Artists whose native hits contribute to *artist*."""
+
+        components: list[Artist] = []
+        if isinstance(artist, Legend):
+            components.append(artist.get_frame())
+        if isinstance(artist, Axes):
+            components.append(artist.patch)
+        if isinstance(artist, Annotation) and artist.arrow_patch is not None:
+            components.append(artist.arrow_patch)
+        if isinstance(artist, Text):
+            bbox_patch = artist.get_bbox_patch()
+            if bbox_patch is not None:
+                components.append(bbox_patch)
+        unique: list[Artist] = []
+        seen: set[int] = set()
+        for component in components:
+            if id(component) not in seen:
+                seen.add(id(component))
+                unique.append(component)
+        return tuple(unique)
+
+    @staticmethod
+    def _has_bounded_native_contains(artist: Artist) -> bool:
+        """Reject subclass and instance-level custom containment contracts."""
+
+        contains = getattr(artist, "contains", None)
+        return getattr(contains, "__func__", None) in _BOUNDED_NATIVE_CONTAINS
+
+    def _interaction_hit_padding(
+        self,
+        artist: Artist,
+        components: tuple[Artist, ...] | None = None,
+    ) -> float:
+        """Return conservative display-pixel picker and antialias padding."""
+
+        # PatchAdapter's thin-stroke fallback uses three display pixels.  Two
+        # further pixels cover antialias fringes and integer event rounding.
+        tolerance = 3.0
+        renderer = None
+        try:
+            renderer = self.figure.canvas.get_renderer()
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            pass
+
+        def include(value) -> None:
+            nonlocal tolerance
+            if isinstance(value, (bool, np.bool_)) or not isinstance(
+                value, (int, float, np.integer, np.floating)
+            ):
+                return
+            value = abs(float(value))
+            if not np.isfinite(value):
+                return
+            # Collection pick radii are consumed as display pixels while line
+            # radii and numeric pickers are conventionally typographic points.
+            # Taking both interpretations is conservative across artist types.
+            tolerance = max(tolerance, value)
+            if renderer is not None:
+                try:
+                    tolerance = max(
+                        tolerance, abs(float(renderer.points_to_pixels(value)))
+                    )
+                except (AttributeError, TypeError, ValueError, RuntimeError):
+                    pass
+            else:
+                try:
+                    tolerance = max(
+                        tolerance,
+                        value * abs(float(self.figure.dpi)) / 72.0,
+                    )
+                except (AttributeError, TypeError, ValueError, RuntimeError):
+                    pass
+
+        if components is None:
+            components = self._interaction_hit_components(artist)
+        hit_sources = (artist, *components)
+        for source in hit_sources:
+            for getter_name in ("get_picker", "get_pickradius", "get_linewidth"):
+                getter = getattr(source, getter_name, None)
+                if callable(getter):
+                    try:
+                        include(getter())
+                    except (AttributeError, TypeError, ValueError, RuntimeError):
+                        pass
+        return tolerance + 2.0
+
+    def _interaction_index_bounds(
+        self, artist: Artist
+    ) -> tuple[float, float, float, float] | None:
+        """Return a conservative bounded hit envelope, otherwise ``None``.
+
+        ``None`` means the artist is always tested; it never means the artist
+        can be omitted.  This is how unsupported foreground objects, logical
+        groups, and third-party custom hit contracts remain fail-open.
+        """
+
+        if id(artist) not in getattr(self, "_selectable_artist_ids", set()):
+            return None
+        if isinstance(artist, EditorGroup):
+            return None
+        try:
+            adapter = TargetWrapper(artist).adapter
+        except (AttributeError, LookupError, TypeError, ValueError, RuntimeError):
+            return None
+        if type(adapter).hit_test not in _BOUNDED_ADAPTER_HIT_TESTS:
+            return None
+        if not self._has_bounded_native_contains(artist):
+            return None
+        components = self._interaction_hit_components(artist)
+        if any(not self._has_bounded_native_contains(item) for item in components):
+            return None
+
+        point_sets: list[np.ndarray] = []
+        needs_adapter_envelope = isinstance(artist, Collection)
+        if needs_adapter_envelope:
+            try:
+                points = np.asarray(adapter.selection_points(), dtype=float)
+                if points.ndim == 2 and points.shape[1] >= 2:
+                    points = points[:, :2]
+                    points = points[np.all(np.isfinite(points), axis=1)]
+                    if len(points):
+                        point_sets.append(points)
+            except (
+                AttributeError,
+                IndexError,
+                LookupError,
+                NotImplementedError,
+                OverflowError,
+                TypeError,
+                ValueError,
+                RuntimeError,
+                np.linalg.LinAlgError,
+            ):
+                return None
+            if not point_sets:
+                return None
+
+        # Native Matplotlib ``contains`` commonly ignores clipping.  Use raw
+        # window extents and explicitly union every composite child whose
+        # native containment contributes to its parent contract.
+        # Collection.get_window_extent historically reports data-limit space,
+        # not display space.  Its adapter envelope is the bounded native
+        # collection hit geometry, so do not union that incompatible extent.
+        if not isinstance(artist, Collection):
+            try:
+                renderer = self.figure.canvas.get_renderer()
+                if isinstance(artist, Text) and artist.get_bbox_patch() is not None:
+                    artist.update_bbox_position_size(renderer)
+                for extent_artist in (artist, *components):
+                    extent = np.asarray(
+                        extent_artist.get_window_extent(renderer).extents,
+                        dtype=float,
+                    )
+                    if extent.shape != (4,) or not np.all(np.isfinite(extent)):
+                        return None
+                    point_sets.append(extent.reshape(2, 2))
+                if isinstance(artist, Annotation):
+                    # Annotation.get_window_extent may collapse to Bbox.unit()
+                    # under annotation clipping even though Annotation.contains
+                    # still delegates directly to Text.contains.
+                    text_extent = np.asarray(
+                        Text.get_window_extent(artist, renderer).extents,
+                        dtype=float,
+                    )
+                    if text_extent.shape != (4,) or not np.all(
+                        np.isfinite(text_extent)
+                    ):
+                        return None
+                    point_sets.append(text_extent.reshape(2, 2))
+            except (
+                AttributeError,
+                IndexError,
+                NotImplementedError,
+                OverflowError,
+                TypeError,
+                ValueError,
+                RuntimeError,
+            ):
+                return None
+
+        if not point_sets:
+            return None
+        points = np.concatenate(point_sets)
+        low = np.min(points, axis=0)
+        high = np.max(points, axis=0)
+        if not np.all(np.isfinite((low, high))):
+            return None
+        padding = self._interaction_hit_padding(artist, components)
+        return (
+            float(low[0] - padding),
+            float(low[1] - padding),
+            float(high[0] + padding),
+            float(high[1] + padding),
+        )
+
+    def _interaction_candidate_indices(
+        self, event: MouseEvent, artists: Sequence[Artist]
+    ) -> Sequence[int]:
+        """Return indexed candidates, falling back to the original full scan."""
+
+        index = self._ensure_interaction_index()
+        try:
+            candidates = index.candidate_indices(
+                event.x,
+                event.y,
+                artists,
+                revision=self._interaction_revision,
+                bounds_provider=self._interaction_index_bounds,
+            )
+        except Exception:
+            candidates = None
+        return range(len(artists)) if candidates is None else candidates
 
     def activate(self):
         """activate the interaction callbacks from the figure"""
@@ -2533,26 +2962,38 @@ class DragManager:
             emit(element)
 
     def set_selection_mode(self, mode: SelectionMode | str) -> SelectionMode:
+        if hasattr(self, "selection"):
+            self._cancel_active_pointer_transform()
         result = self._ensure_selection_kernel().set_mode(mode)
+        invalidate_smart_guide_cache(self)
+        schedule_smart_guide_warmup(self)
         self._update_interaction_controls()
         return result
 
     def enter_isolation(self, element: Artist) -> bool:
+        if hasattr(self, "selection"):
+            self._cancel_active_pointer_transform()
         entered = self._ensure_selection_kernel().enter_isolation(element)
         if entered:
+            invalidate_smart_guide_cache(self)
             self.selection.clear_targets()
             self.selected_element = None
             self.on_select(None, None)
             self._update_interaction_controls()
             self.figure.canvas.draw_idle()
+            schedule_smart_guide_warmup(self)
         return entered
 
     def exit_isolation(self) -> Artist | None:
+        if hasattr(self, "selection"):
+            self._cancel_active_pointer_transform()
         exited = self._ensure_selection_kernel().exit_isolation()
         if exited is not None:
+            invalidate_smart_guide_cache(self)
             self.select_element(exited)
             self._update_interaction_controls()
             self.figure.canvas.draw_idle()
+            schedule_smart_guide_warmup(self)
         return exited
 
     def _selected_artists(self) -> list[Artist]:
@@ -2643,6 +3084,9 @@ class DragManager:
         """Keep transient group nodes aligned with the persisted editor scene."""
 
         scene = self._ensure_editor_scene()
+        inventory_before = tuple(
+            id(item) for item in getattr(self, "_interaction_artists", ())
+        )
         active_groups = tuple(scene.groups.values())
         active_ids = {id(group) for group in active_groups}
 
@@ -2673,6 +3117,11 @@ class DragManager:
                 self._selection_parent_by_id.pop(key, None)
         for group in active_groups:
             self.make_draggable(group, group.owner)
+        inventory_after = tuple(
+            id(item) for item in getattr(self, "_interaction_artists", ())
+        )
+        if inventory_after != inventory_before:
+            self._invalidate_interaction_index()
 
     def _hide_preselection(self) -> None:
         rect = getattr(self, "preselection_rect", None)
@@ -2962,12 +3411,18 @@ class DragManager:
         # direct-selection targets without rebuilding the complete scene.
         for axes in getattr(self.figure, "axes", ()):
             self.register_axis_tick_labels(axes)
+        # Draw is the authoritative boundary for layout, visibility, z-order,
+        # and external Matplotlib mutations.  Never query pre-draw envelopes.
+        self._invalidate_interaction_index()
         # Legend/text layout is finalized by Matplotlib during draw.  Overlay
         # geometry measured before that point is necessarily provisional.
         self.refresh_selection_geometry(post_draw=True)
+        schedule_smart_guide_warmup(self)
 
     def deactivate(self):
         """deactivate the interaction callbacks from the figure"""
+        self._cancel_active_pointer_transform()
+        invalidate_smart_guide_cache(self)
         self.figure.canvas.mpl_disconnect(self.c3)
         self.figure.canvas.mpl_disconnect(self.c2)
         self.figure.canvas.mpl_disconnect(self.c4)
@@ -2999,6 +3454,8 @@ class DragManager:
         if not hasattr(self, "_interaction_artists"):
             self._interaction_artists = []
             self._interaction_artist_ids = set()
+        self._ensure_interaction_index()
+        index_changed = False
         if parent is None:
             if isinstance(target, Legend):
                 parent = getattr(target, "parent", None)
@@ -3007,7 +3464,9 @@ class DragManager:
             if parent is target or parent is None:
                 parent = getattr(target, "figure", None)
         if parent is not None and parent is not target:
-            self._selection_parent_by_id[id(target)] = parent
+            if self._selection_parent_by_id.get(id(target)) is not parent:
+                self._selection_parent_by_id[id(target)] = parent
+                index_changed = True
         finalized_on_draw = bool(
             getattr(target, "_pylustrator_geometry_finalized_on_draw", False)
             or isinstance(target, Legend)
@@ -3042,6 +3501,7 @@ class DragManager:
             self._interaction_artists.append(target)
             self._interaction_artist_ids.add(id(target))
             self._draw_child_orders = {}
+            index_changed = True
         if not TargetWrapper.supports_target(target):
             if (
                 id(target) not in self._selectable_artist_ids
@@ -3049,13 +3509,19 @@ class DragManager:
             ):
                 self._uneditable_artists.append(target)
                 self._uneditable_artist_ids.add(id(target))
+            if index_changed:
+                self._invalidate_interaction_index()
             return False
         if id(target) not in self._selectable_artist_ids:
             self._selectable_artists.append(target)
             self._selectable_artist_ids.add(id(target))
+            index_changed = True
         target._pylustrator_explicitly_editable = True
         if not target.pickable():
             target.set_picker(True)
+            index_changed = True
+        if index_changed:
+            self._invalidate_interaction_index()
         if isinstance(target, Text):
             add_text_default(target)
         if isinstance(target, Legend):
@@ -3114,6 +3580,7 @@ class DragManager:
                 for label in (tick.label1, tick.label2):
                     if label.get_visible() and label.get_text() != "":
                         label._pylustrator_geometry_finalized_on_draw = True
+                        label._pylustrator_formatter_owned_tick_label = True
                         self.make_draggable(label, axes)
 
     def make_figure_draggable(self, fig: Figure | SubFigure) -> None:
@@ -3174,7 +3641,13 @@ class DragManager:
             return self._artist_has_selection_geometry(child)
         return self._resolve_selectable_artist(child) is not None
 
-    def _is_interaction_hit(self, artist: Artist, event: MouseEvent) -> bool:
+    def _is_interaction_hit(
+        self,
+        artist: Artist,
+        event: MouseEvent,
+        *,
+        registered_editable: bool | None = None,
+    ) -> bool:
         """Return whether an explicitly discovered foreground artist was hit.
 
         Unsupported foreground objects must participate in hit ordering even
@@ -3189,7 +3662,7 @@ class DragManager:
             return False
         try:
             target = TargetWrapper(artist)
-            if target.supported:
+            if registered_editable is True or target.supported:
                 return target.adapter.hit_test(event)
             return bool(artist.contains(event)[0])
         except (AttributeError, TypeError, ValueError, RuntimeError):
@@ -3424,11 +3897,23 @@ class DragManager:
                 current = parent
             return tuple(reversed(path)), index
 
+        artists = [artist for artist, _editable in interaction_artists]
+        candidate_indices = self._interaction_candidate_indices(event, artists)
+        candidate_entries = (
+            (index, interaction_artists[index]) for index in candidate_indices
+        )
+        ordered_entries = sorted(
+            ((pick_order(entry), entry) for entry in candidate_entries),
+            key=lambda item: item[0],
+            reverse=True,
+        )
         hits: list[HitCandidate] = []
-        for index, (candidate, registered_editable) in sorted(
-            enumerate(interaction_artists), key=pick_order, reverse=True
-        ):
-            if not self._is_interaction_hit(candidate, event):
+        for draw_key, (index, (candidate, registered_editable)) in ordered_entries:
+            if not self._is_interaction_hit(
+                candidate,
+                event,
+                registered_editable=registered_editable,
+            ):
                 continue
             editable = bool(
                 registered_editable
@@ -3438,7 +3923,7 @@ class DragManager:
                 HitCandidate(
                     candidate,
                     editable,
-                    pick_order((index, (candidate, registered_editable))),
+                    draw_key,
                     index,
                 )
             )
@@ -3916,6 +4401,8 @@ class DragManager:
             )
 
     def undo(self):
+        if self._cancel_active_pointer_transform():
+            return
         print("back edit")
         self.figure.change_tracker.backEdit()
         current = [target.target for target in self.selection.targets]
@@ -3925,6 +4412,8 @@ class DragManager:
         self.figure.canvas.draw()
 
     def redo(self):
+        if self._cancel_active_pointer_transform():
+            return
         print("forward edit")
         self.figure.change_tracker.forwardEdit()
         current = [target.target for target in self.selection.targets]
@@ -3932,6 +4421,35 @@ class DragManager:
         self._update_interaction_controls()
         self._notify_selected_element_changed()
         self.figure.canvas.draw()
+
+    def _cancel_active_pointer_transform(self) -> bool:
+        """Rollback an in-flight move/resize and keep the selection intact."""
+
+        active = None
+        grabber = self.grab_element
+        if grabber is not None and bool(getattr(grabber, "got_artist", False)):
+            active = grabber
+        elif bool(getattr(self.selection, "got_artist", False)):
+            active = self.selection
+        if active is None or not hasattr(self.selection, "move_start_states"):
+            return False
+
+        try:
+            self.selection._restore_move_start(strict=False)
+            self.selection.has_moved = False
+            self.selection._clear_move_transaction()
+        finally:
+            active.cancel_event()
+            self.grab_element = None
+            scene = getattr(self.figure, "_pyl_scene", None)
+            if scene is not None:
+                scene.grabber_pressed = None
+        canvas = self.figure.canvas
+        if hasattr(canvas, "schedule_draw"):
+            canvas.schedule_draw()
+        else:
+            canvas.draw_idle()
+        return True
 
     def key_press_event(self, event: KeyEvent):
         """when a key is pressed"""
@@ -3943,6 +4461,7 @@ class DragManager:
             return
         # space: print code to restore current configuration
         if event.key == "ctrl+s":
+            self._cancel_active_pointer_transform()
             self.figure.change_tracker.save()
         if event.key == "ctrl+z":
             self.undo()
@@ -3979,6 +4498,8 @@ class DragManager:
                     scene = getattr(self.figure, "_pyl_scene", None)
                     if scene is not None:
                         scene.grabber_pressed = None
+                return
+            if self._cancel_active_pointer_transform():
                 return
             if self._ensure_selection_kernel().scope_root is not None:
                 self.exit_isolation()
