@@ -36,6 +36,17 @@ def semantic_equal(
     if isinstance(left, Number) and isinstance(right, Number):
         return bool(np.isclose(left, right, atol=atol, rtol=rtol, equal_nan=True))
     if isinstance(left, np.ndarray) or isinstance(right, np.ndarray):
+        left_masked = isinstance(left, np.ma.MaskedArray)
+        right_masked = isinstance(right, np.ma.MaskedArray)
+        if left_masked or right_masked:
+            if not (left_masked and right_masked):
+                return False
+            return _masked_array_semantic_equal(
+                left,
+                right,
+                atol=atol,
+                rtol=rtol,
+            )
         try:
             return bool(
                 np.allclose(
@@ -71,6 +82,69 @@ def semantic_equal(
         return bool(left == right)
     except (TypeError, ValueError):
         return False
+
+
+def _masked_array_semantic_equal(
+    left: np.ma.MaskedArray,
+    right: np.ma.MaskedArray,
+    *,
+    atol: float,
+    rtol: float,
+) -> bool:
+    """Compare every lossless part of a masked-array snapshot."""
+
+    left_constant = isinstance(left, type(np.ma.masked))
+    right_constant = isinstance(right, type(np.ma.masked))
+    if left_constant or right_constant:
+        return left_constant and right_constant
+    if (
+        left.shape != right.shape
+        or left.dtype != right.dtype
+        or bool(left.hardmask) != bool(right.hardmask)
+    ):
+        return False
+
+    left_nomask = left.mask is np.ma.nomask
+    right_nomask = right.mask is np.ma.nomask
+    if left_nomask != right_nomask:
+        return False
+    if not left_nomask:
+        left_mask = np.asarray(left.mask)
+        right_mask = np.asarray(right.mask)
+        if left_mask.shape != right_mask.shape or not np.array_equal(
+            left_mask, right_mask
+        ):
+            return False
+
+    if not _exact_value_equal(left.fill_value, right.fill_value):
+        return False
+
+    left_data = np.asarray(left.data)
+    right_data = np.asarray(right.data)
+    if left.dtype.kind in "fc":
+        try:
+            return bool(
+                np.allclose(
+                    left_data,
+                    right_data,
+                    atol=atol,
+                    rtol=rtol,
+                    equal_nan=True,
+                )
+            )
+        except (TypeError, ValueError):
+            return False
+    return _exact_value_equal(left_data, right_data)
+
+
+def _exact_value_equal(left: Any, right: Any) -> bool:
+    try:
+        return bool(np.array_equal(left, right, equal_nan=True))
+    except (TypeError, ValueError):
+        try:
+            return bool(np.array_equal(left, right))
+        except (TypeError, ValueError):
+            return False
 
 
 @dataclass(frozen=True)
