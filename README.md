@@ -88,9 +88,21 @@ the user-facing interaction rules shared.
 - Axis labels and formatter-owned tick labels are edited through their semantic
   axis owner, allowing content and font properties to be changed without
   accidentally moving the containing axes.
-- Interaction-scoped geometry and legend discovery caches reduce repeated
-  renderer work, while source-only saves avoid replaying unrelated figure
-  exports.
+- Line2D keeps its original ndarray/MaskedArray data semantics through
+  movement, rotation plans, replay, and Undo/Redo, including hidden masked
+  values, independent masks, dtype/shape, fill value, and hard-mask state.
+  Categorical and datetime data retain appearance editing and lossless replay
+  while unsupported geometry operations return an explicit reason.
+- Pointer hit testing uses a conservative display-space index while native
+  artist containment remains authoritative. Smart Guides add deterministic
+  edge, center, baseline, insertion-anchor, cross-feature, and equal-gap
+  snapping. Scene geometry is prepared in bounded idle batches; an unfinished
+  cache keeps the legacy snap path, so mouse press never performs a blocking
+  full-scene measurement.
+- Large Line2D drag previews use contiguous buffers rather than one allocation
+  per vertex. Interaction-scoped geometry and legend discovery caches reduce
+  repeated renderer work, while source-only saves avoid replaying unrelated
+  figure exports.
 
 ### Explicit Capability Boundaries
 
@@ -110,12 +122,13 @@ and the extension API is introduced in the [API documentation](docs/api.rst).
 
 At the current fork milestone on 2026-07-17:
 
-- the full test suite passed with **932 passed and 147 skipped**;
+- the full test suite passed with **1,019 passed and 147 skipped**;
 - Ruff and Ty completed successfully, with an explicit incremental type-check
   baseline for the dynamic Matplotlib/Qt interaction modules; and
 - the real multi-panel Fig2 workflow was used to validate selection, movement,
-  resize, rotation, alignment references, legends, axis-label editing,
-  save/replay, and undo/redo behavior.
+  resize, rotation, alignment references, Smart Guides, legends, masked Line2D
+  replay, axis-label editing, save/replay, and undo/redo behavior. The formal
+  editable Fig2 remained byte-identical during fork-based validation.
 
 ### Supported Runtime
 

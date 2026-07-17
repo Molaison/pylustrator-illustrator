@@ -424,18 +424,105 @@ was at most ``1.14e-13 px``. The formal editable Fig2 remained byte-identical at
 SHA-256
 `aba67bbd663fd16da535aa30d43f607c7205d096455f44544e518607cdce2dbb`.
 
+### P1e: Lossless Line2D raw-data semantics
+
+Implemented on 2026-07-17 without converting Matplotlib's original data into
+the finite display array used for geometry. Independent ``MaskedArray`` x/y
+containers now retain shape, dtype, raw hidden values, independent masks,
+``nomask``, fill values, and hard-mask state through snapshot, translation,
+rigid-rotation planning, generated replay, Undo, and Redo. Numeric operations
+change only rows that are valid on both axes. Integer and float32 sources
+promote when display-space motion cannot be represented exactly instead of
+silently rounding back into the original dtype.
+
+Categorical, datetime, and custom-unit Line2D remain selectable and retain
+appearance editing. Their geometry operations return an operation-specific
+typed denial rather than failing after mutation. Category and datetime arrays
+have lossless replay; arbitrary object values reject serialization until a
+semantic unit codec exists. NumPy datetime/timedelta scalars use explicit raw
+integer plus unit literals, avoiding the ``numpy.datetime64`` versus
+``np.datetime64`` repr difference between NumPy 1.23 and newer releases.
+
+Frozen Q plans include a compact content digest over data, mask, dtype, shape,
+fill value, and hard-mask state, so an in-place source mutation invalidates the
+plan without retaining a second 100k-point source copy. In local probes, the
+digest cost about ``0.6 ms`` and added about ``1.2 ms`` to a 100k-point Q plan.
+The ordinary 100k ndarray replay path fell from roughly ``323 ms`` to ``40 ms``;
+lossless MaskedArray replay was about ``104 ms``. The same semantics pass on
+the minimum supported Matplotlib 3.8.4 / NumPy 1.23.5 stack.
+
+### P1f: Indexed interaction and Smart Guides
+
+Implemented on 2026-07-17 as two fail-open acceleration layers. Pointer hit
+testing now uses a revisioned display-space grid only as a conservative coarse
+filter; native/adaptor containment remains authoritative. Custom hit contracts,
+composite Annotation arrows, Text bbox patches, Legend frames, Axes patches,
+and any object without a provably complete envelope stay in an always-tested
+set. A failed build atomically returns to the original full scan. On the real
+Fig2 fork, indexed and full hit stacks agreed at every oracle point; 2,106 warm
+queries had ``1.373 ms`` median and ``4.019 ms`` p95 versus the former roughly
+``63.9 ms`` scan path.
+
+Deferred Line2D preview now keeps one contiguous array instead of one Python
+array per vertex. A 100k-point drag frame fell from roughly ``49.7 ms`` and
+``16 MB`` peak to ``3.557 ms`` median, ``3.949 ms`` p95, and ``4.803 MB`` peak.
+
+Smart Guides use immutable display-pixel geometry and one plan for the accepted
+preview and commit. Edge, center, Text baseline, insertion-anchor, cross-feature,
+and equal-gap guides share deterministic distance/semantic/z-order/paint-order
+ties. Equal-gap neighbours use an exact vectorized path for scenes up to 1,024
+objects and retain the ``O(n log n)`` interval sweep above that threshold.
+Shift limits both the plan and its overlay to the constrained axis; Alt/Option
+temporarily disables snapping. Escape, Undo/Redo, V/A tool changes, isolation,
+and deactivation all close the same gesture lifecycle before changing policy or
+history. Formatter-owned tick labels and empty Text remain editable where
+appropriate but cannot create invisible or unstable guide sources.
+
+Scene measurement is never performed synchronously by the normal mouse-press
+path. Draw completion schedules bounded Qt-idle batches; an incomplete cache
+uses legacy snaps for that gesture. With the Fig2 scene warm, gesture creation
+is ``0.262 ms`` median (legacy ``getSnaps``: ``0.960 ms``), the first motion's
+selection-specific exact equal-gap index is about ``10.1 ms``, and later queries
+are ``0.089 ms`` median. Preview application succeeds before a plan is exposed
+or drawn, so a failed adapter cannot leave an overlay ahead of real geometry.
+
+The combined repository suite now passes 1,019 tests with 147 explicit skips.
+Matplotlib 3.8.4 / NumPy 1.23.5 passes the 87 new and directly related tests.
+A read-only real-Fig2 fork produced edge/center hits, one atomic history item,
+``2.27e-13 px`` preview/commit error, and zero Undo/Redo error. The formal Fig2
+remained byte-identical at SHA-256
+``aba67bbd663fd16da535aa30d43f607c7205d096455f44544e518607cdce2dbb``.
+
 Remaining feature work:
 
-- Preserve original MaskedArray containers, masks, and hidden values through
-  Line2D geometry snapshots, generated replay, Undo, and Redo; current numeric
-  geometry deliberately treats masked values as NaN slots.
-- Generic smart guides for edges, centers, baselines, anchors, and equal gaps.
 - Direct path/endpoint editing and inline text editing.
-- Content-following cached drag previews and spatial hit/snap indexes.
+- Content-following cached drag previews; selection outlines are fast, but
+  complex rendered content should follow the pointer without a full redraw.
 - A renderer-faithful paint-envelope policy for miter/cap joins, path effects,
   compound clip holes, and non-bbox source geometry; current axial stroke
   padding and clip-envelope polygon intersection are intentionally not
   advertised as exact raster coverage for every Matplotlib renderer effect.
+
+Next optimization sequence, with no interaction-latency regression allowed:
+
+1. Merge hit-test bounds, selection geometry, and Smart Guide capture behind a
+   shared per-revision display-geometry service. The current idle capture keeps
+   the pointer path fast, but a cold Fig2 still measures similar renderer state
+   separately for hit and guide indexes.
+2. Add content-following cached previews with an explicit memory budget,
+   invalidation token, and automatic analytic fallback for large Artists.
+3. Define renderer-faithful paint envelopes before broadening transforms to
+   effects, compound clips, and non-bbox geometry.
+4. Build Direct Selection path/endpoint editing and inline text editing on the
+   same plan/transaction boundary; do not mutate raw arrays directly from UI
+   code.
+5. Only then add semantic duplicate/copy/paste and style transfer, using stable
+   locators rather than copying Matplotlib ownership links.
+
+Performance gates for each item are: pointer press no slower than the legacy
+path, first preview below one 60 Hz frame on the Fig2 fixture, warm preview/query
+below ``4 ms`` p95, bounded memory for 100k-point Artists, and identical accepted
+preview/commit/Undo geometry within ``0.25 px``.
 
 ## P2: workflow breadth
 
