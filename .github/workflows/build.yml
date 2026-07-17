@@ -1,0 +1,38 @@
+name: Build Python Package
+
+on:
+  pull_request:
+    paths:
+      - "pyproject.toml"
+      - "uv.lock"
+      - "pylustrator/**"
+      - ".github/workflows/build.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "latest"
+
+      - name: Build distribution
+        run: uv build
+
+      - name: Upload distribution artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pylustrator-distribution
+          path: dist/
+          if-no-files-found: error
+
+# This fork intentionally has no release-triggered PyPI publish job. The
+# upstream distribution name must not be reused without an explicit package
+# naming, versioning, credential, and release policy.
