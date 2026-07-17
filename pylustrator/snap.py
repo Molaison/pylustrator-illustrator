@@ -203,9 +203,19 @@ class TargetWrapper:
         self.adapter.set_rotation(value)
 
     def plan_rigid_rotation(
-        self, angle_degrees: float, pivot
+        self,
+        angle_degrees: float,
+        pivot,
+        *,
+        control_points=None,
+        selection_points=None,
     ) -> RigidRotationPlan:
-        return self.adapter.plan_rigid_rotation(angle_degrees, pivot)
+        return self.adapter.plan_rigid_rotation(
+            angle_degrees,
+            pivot,
+            control_points=control_points,
+            selection_points=selection_points,
+        )
 
     def apply_rigid_rotation_plan(
         self, plan: RigidRotationPlan, *, record_changes: bool = True

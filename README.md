@@ -71,7 +71,9 @@ the user-facing interaction rules shared.
   multi-object rotation uses one shared pivot rather than unrelated local
   angle changes. When every selected object supports exact rigid rotation, the
   on-canvas pivot can be dragged anywhere on or beyond the artboard; native-only
-  rotation keeps the object's real fixed pivot.
+  rotation keeps the object's real fixed pivot. Line2D circle/dot markers use
+  their actual `markevery` subset at the destination, so marker-only and mixed
+  selections preview, commit, and undo around that same pivot.
 - The Align panel separates geometry scale from explicit appearance scale.
   `A+`/`A−` change supported font, stroke, and marker dimensions without moving
   coordinates or reflowing layout; mixed selections are preflighted and undo
@@ -108,7 +110,7 @@ and the extension API is introduced in the [API documentation](docs/api.rst).
 
 At the current fork milestone on 2026-07-17:
 
-- the full test suite passed with **862 passed and 147 skipped**;
+- the full test suite passed with **932 passed and 147 skipped**;
 - Ruff and Ty completed successfully, with an explicit incremental type-check
   baseline for the dynamic Matplotlib/Qt interaction modules; and
 - the real multi-panel Fig2 workflow was used to validate selection, movement,
