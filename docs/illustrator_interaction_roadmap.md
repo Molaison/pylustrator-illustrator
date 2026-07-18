@@ -24,7 +24,7 @@ Implementation order follows architectural dependencies.
 
 Status (2026-07-18): implemented on
 ``codex/p0-correctness-performance``. The current implementation is covered by
-1,187 passing tests, 178 explicit skips, no strict xfails, Ruff, the full Fig2
+1,281 passing tests, 178 explicit skips, no strict xfails, Ruff, the full Fig2
 interaction probe, and a read-only smoke replay of the unmodified formal Fig2.
 The formal file retained SHA-256
 ``aba67bbd663fd16da535aa30d43f607c7205d096455f44544e518607cdce2dbb``.
@@ -527,7 +527,21 @@ atomic index is ready, the conservative dense-point scan improves from
 it is ``1.88 ms``. All three stages return the identical eight-object hit stack
 without synchronous pointer-side bounds measurement.
 
-The combined repository suite now passes 1,187 tests with 178 explicit skips.
+Ordinary hover and click now consume that conservative candidate stream only
+until the first selection-policy decision. Object Selection can return its
+first leaf/group promotion, Direct Selection can return its first leaf, and an
+unsupported foreground object remains an immediate barrier. Alt click-through,
+right-click candidate lists, double-click isolation, and Direct Selection on an
+ambiguous group shell still consume the complete ``HitStack``. Across 480
+real-Fig2 cold/half/warm queries, streamed and full resolution agreed exactly on
+target, raw leaf, and blocked state. Cold median/p95 fell from
+``49.245/58.518 ms`` to ``4.496/18.648 ms``; half-built index queries fell from
+``31.335/36.170 ms`` to ``3.301/15.199 ms``; warm queries fell from
+``4.571/5.730 ms`` to ``0.463/1.569 ms``. The remaining cold p95 edge comes
+from a fail-open unmeasured tail whose foreground hit is late in paint order;
+no renderer measurement or object is dropped to avoid it.
+
+The combined repository suite now passes 1,281 tests with 178 explicit skips.
 Matplotlib 3.8.4 / NumPy 1.23.5 passes the 87 new and directly related tests.
 A read-only real-Fig2 fork produced edge/center hits, one atomic history item,
 ``2.27e-13 px`` preview/commit error, and zero Undo/Redo error. The formal Fig2
@@ -539,18 +553,68 @@ the conservative hit index, marquee bounds, selection geometry, and Smart Guide
 capture from the same revision and live roster; the remaining work starts after
 that common cache boundary.
 
+### P1g: Cached content previews and renderer paint envelopes
+
+Implemented on 2026-07-18 as two read-only renderer layers below the semantic
+transform boundary. A content ghost is a disposable visual aid: the adapter and
+``TransformPlan`` remain the only preview/commit/Undo truth, and a missing ghost
+never changes the accepted operation or generated source. Draw completion or a
+selection change schedules capture through Qt idle; pointer press only validates
+an immutable renderer/revision/selection/source token, and motion only translates
+one ``QGraphicsItem``.
+
+The cache has explicit memory, bounded-source, composite-leaf, and idle-work
+budgets. It renders audited shallow clones rather than live Artists, replays a
+standard Legend as its frame plus OffsetBox paint leaves in real paint order,
+and retains one budgeted scratch ``RendererAgg``. No-op click/cancel hides and
+reuses the still-current pixmap. A real-Fig2 prototype originally deep-copied
+Matplotlib's cyclic Artist/Transform/OffsetBox graph, causing a 118--139 ms
+generation-2 GC pause about every sixth capture. The shallow-clone design
+removed those collections: over 40 samples, Legend capture measured
+``3.72/4.55/7.50 ms`` median/p95/max and Text measured
+``2.11/2.37/3.35 ms``. Legend/Text hot activation remained at or below
+``0.454/0.083 ms`` p95 and motion was about ``0.029 ms`` p95.
+
+The v1 bitmap contract is deliberately translation-only. A fixed clip or
+renderer edge cannot be transformed with an already clipped raster, and an
+affine bitmap resize would incorrectly scale fixed display-space stroke,
+marker, font, and hatch appearance. Active rectangular/non-rectangular clips,
+implicit Annotation data clipping, source/destination canvas contact,
+non-translation matrices, large sources/composites/canvases, custom draw
+contracts, scalar-mappable collections, and AxesImage therefore fall back to
+the analytic preview before mutation. On the current Fig2 fork, 194 of 580
+selectable objects receive content ghosts (161 Text, 9 Legends, 9 Line2D,
+13 Rectangles, and 2 Annotations); the other 386 retain the existing analytic
+path. Panel-D Legend and Text ghost/commit/Undo errors were at most
+``2.28e-13 px``, and pixel-oracle alpha plus premultiplied RGB matched exactly.
+
+``DisplayGeometryCache`` now also exposes a separate opt-in Agg paint-envelope
+cache. A capture result is explicitly ``exact``, ``conservative``, or
+``unavailable``; lookup never draws or falls back to analytic geometry.
+Audited non-stale Patch, Line2D, and fixed-color Collection primitives render
+only through disposable clones, preserving clip, cap/join, marker,
+antialiasing, and whitelisted path-effect pixels. Pending Artists,
+scalar-mappable collections, custom callbacks/transforms/effects, unsupported
+draw contracts, and over-budget rasters remain conservative. Capture success,
+failure, and denial leave the Artist, clip dependency, Legend/Axes/Figure
+owners, callbacks, and derived draw state unchanged.
+
+The combined suite passes 1,281 tests with 178 explicit skips and Ruff. The
+read-only Fig2 fork retains identical accepted preview/commit/Undo geometry,
+and the formal file remains byte-identical at SHA-256
+``aba67bbd663fd16da535aa30d43f607c7205d096455f44544e518607cdce2dbb``.
+
 Next implementation sequence, with no interaction-latency regression allowed:
 
-1. Add content-following cached previews with an explicit memory budget,
-   invalidation token, and automatic analytic fallback for large Artists.
-2. Define renderer-faithful paint envelopes before broadening transforms to
-   effects, compound clips, and non-bbox geometry.
-3. Build Direct Selection path/endpoint editing and inline text editing on the
+1. Build Direct Selection path/endpoint editing and inline text editing on the
    same plan/transaction boundary; do not mutate raw arrays directly from UI
    code.
-4. Add semantic duplicate/copy/paste, Select Same, and style transfer using
+2. Add semantic duplicate/copy/paste, Select Same, and style transfer using
    stable locators rather than copying Matplotlib ownership links.
-5. Add workflow breadth only after those edit contracts are stable: rulers,
+3. Extend content ghosts only through fixed scene-clip layers and closed visual
+   state contracts for collections/images; do not broaden the current bitmap
+   affine approximation.
+4. Add workflow breadth only after those edit contracts are stable: rulers,
    persistent guides/grids, zoom/pan shortcuts, templates, and scientific-role
    protection.
 

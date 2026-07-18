@@ -86,11 +86,13 @@ display-space preview.
 Selection and editor groups
 ---------------------------
 
-Canvas interaction first builds a front-to-back ``HitStack`` and then resolves
-it through ``SelectionKernel``.  Object Selection groups semantic composites;
-Direct Selection keeps the exact leaf Artist.  Isolation scopes, hover
-preselection, Alt-click cycling, and the candidate menu all use this same
-resolver.
+Canvas interaction resolves a front-to-back candidate stream through
+``SelectionKernel``. Ordinary hover and click stop at the first conclusive
+foreground hit; unsupported foreground Artists remain barriers and Direct
+Selection group shells fall back to the complete oracle. Alt-click cycling,
+double-click isolation, the candidate menu, and the public candidate API still
+materialize the full ``HitStack``. Object Selection groups semantic composites;
+Direct Selection keeps the exact leaf Artist.
 
 Logical ``EditorGroup`` objects are independent of Matplotlib ownership.  Their
 membership, names, locks, visibility, and stable identifiers are stored in the
@@ -106,6 +108,39 @@ versioned figure editor state and restored before interaction starts.
    :members:
 
 .. autoclass:: pylustrator.EditorGroup
+   :members:
+
+Display geometry and renderer observations
+------------------------------------------
+
+``DisplayGeometryCache`` binds every observation to one interaction revision,
+immutable Artist roster, and renderer identity. Analytic selection bounds are
+shared by hit indexing, marquee selection, overlays, and Smart Guides. Its
+optional paint-envelope path is deliberately separate: capture may render one
+audited disposable clone from idle work, while ``paint_envelope`` and
+``paint_bounds`` are cache-only lookups and never invoke Matplotlib drawing.
+
+Paint results have three explicit states. ``EXACT`` means Agg observed the
+reported pixel-edge bounds (or exact empty paint); ``CONSERVATIVE`` means the
+Artist must remain in fail-open candidate handling; ``UNAVAILABLE`` means the
+current renderer/roster contract cannot be observed. Pending Artists,
+scalar-mappable collections, arbitrary callbacks/transforms/effects, and
+over-budget rasters never masquerade as exact.
+
+The deferred content ghost is an internal visual optimization over the same
+revision boundary. It is enabled only for a ready, budgeted, renderer-faithful
+translation capture. Fixed clips, canvas-edge paint, non-translation matrices,
+large/open-ended sources, and unsupported Artist types retain the analytic
+preview. Adapters and transform plans remain the sole commit and Undo/Redo
+authority.
+
+.. autoclass:: pylustrator.display_geometry.DisplayGeometryCache
+   :members:
+
+.. autoclass:: pylustrator.display_geometry.PaintEnvelope
+   :members:
+
+.. autoclass:: pylustrator.display_geometry.PaintEnvelopeAccuracy
    :members:
 
 Semantic transforms and replay
