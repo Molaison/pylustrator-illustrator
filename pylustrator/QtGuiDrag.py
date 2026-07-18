@@ -233,6 +233,25 @@ def _live_window(figure):
     return None
 
 
+def _deactivate_stale_figure_windows(managed_figures) -> None:
+    """Tear down shared windows before rebuilding any attached Figure.
+
+    A window owns one or more Figure sessions.  Rebuilding one stale Figure
+    while iterating that window would deactivate sessions already prepared
+    earlier in the same pass, so stale ownership must be resolved up front.
+    """
+
+    stale_windows = {
+        window
+        for figure in managed_figures
+        if isinstance((window := getattr(figure, "window", None)), PlotWindow)
+        and not getattr(window, "_deactivated", False)
+        and _live_window(figure) is None
+    }
+    for window in stale_windows:
+        window.deactivate()
+
+
 def _prepare_figure(window, figure, *, source_stack_position=None):
     """Attach one Figure to one window exactly once."""
 
@@ -285,22 +304,7 @@ def pyl_show(hide_window: bool = False):
     if not managed_figures:
         return None
 
-    attached_windows = {
-        window
-        for figure in managed_figures
-        if isinstance((window := getattr(figure, "window", None)), PlotWindow)
-        and not getattr(window, "_deactivated", False)
-    }
-    # A stale Figure invalidates its shared multi-Figure window. Tear it down
-    # before iteration so an earlier fresh Figure is not detached after its
-    # turn has already passed.
-    if any(
-        getattr(figure, "window", None) in attached_windows
-        and _live_window(figure) is None
-        for figure in managed_figures
-    ):
-        for attached in attached_windows:
-            attached.deactivate()
+    _deactivate_stale_figure_windows(managed_figures)
 
     existing_windows = {
         window
@@ -334,7 +338,11 @@ def show(hide_window: bool = False):
     application = _ensure_application()
     windows = []
     try:
-        for figure_number, manager in _pylab_helpers.Gcf.figs.copy().items():
+        managed_entries = tuple(_pylab_helpers.Gcf.figs.copy().items())
+        _deactivate_stale_figure_windows(
+            [manager.canvas.figure for _number, manager in managed_entries]
+        )
+        for figure_number, manager in managed_entries:
             if setting_use_global_variable_names:
                 setFigureVariableNames(figure_number)
             figure = manager.canvas.figure

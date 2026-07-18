@@ -151,6 +151,50 @@ def test_replaced_figure_structure_starts_fresh_session_in_caller_source() -> No
         QtGuiDrag.no_save_allowed = original_no_save
 
 
+def test_show_rebuilds_every_session_after_shared_window_structure_change() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    original_show = plt.show
+    original_no_save = QtGuiDrag.no_save_allowed
+    _close_all_windows()
+    try:
+        QtGuiDrag.initialize(disable_save=True)
+        fig1, ax1 = plt.subplots()
+        fig2, ax2 = plt.subplots()
+        (line1,) = ax1.plot([0.1, 0.9], [0.2, 0.8])
+        ax2.plot([0.1, 0.9], [0.8, 0.2])
+        shared_window = QtGuiDrag.pyl_show(hide_window=True)
+        old_managers = (fig1.figure_dragger, fig2.figure_dragger)
+
+        fig2.clear()
+        new_axes = fig2.subplots()
+        (new_line,) = new_axes.plot([0.2, 0.8], [0.7, 0.3])
+        fig2.canvas.draw()
+
+        windows = QtGuiDrag.show(hide_window=True)
+
+        assert shared_window._deactivated
+        assert len(windows) == 2
+        assert all(not window._deactivated for window in windows)
+        assert fig1.window is windows[0]
+        assert fig2.window is windows[1]
+        assert fig1.figure_dragger is not old_managers[0]
+        assert fig2.figure_dragger is not old_managers[1]
+        assert line1 in fig1.figure_dragger._interaction_artists
+        assert new_line in fig2.figure_dragger._interaction_artists
+        assert all(
+            figure.figure_dragger.figure_structure_matches()
+            for figure in (fig1, fig2)
+        )
+        for window in windows:
+            window.deactivate()
+            window.deleteLater()
+    finally:
+        _close_all_windows()
+        _flush_deferred_deletes(app)
+        plt.show = original_show
+        QtGuiDrag.no_save_allowed = original_no_save
+
+
 def test_drag_manager_activate_deactivate_is_idempotent() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     original_no_save = QtGuiDrag.no_save_allowed
