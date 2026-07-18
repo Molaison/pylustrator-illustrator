@@ -342,6 +342,40 @@ class PropertyPlan:
         for operation, value in zip(self.operations, state):
             operation.apply(value)
 
+    def _apply_state_atomically(
+        self,
+        destination: Sequence[object],
+        destination_recording,
+    ) -> None:
+        """Restore one history side without exposing a half-applied closure.
+
+        ``ChangeTracker`` advances its history pointer and redraws only after
+        an Undo/Redo closure returns successfully.  Keep that contract: this
+        helper changes neither the pointer nor the canvas.  If any setter (or
+        recording restore) fails, every operation is returned to the state at
+        closure entry and the original exception is re-raised with any
+        rollback failures attached.
+        """
+
+        current = self._capture()
+        current_recording = _recording_state(self.tracker)
+        try:
+            self._apply_state(destination)
+            _restore_recording(self.tracker, destination_recording)
+        except Exception as error:
+            rollback_failures = []
+            for operation, value in reversed(tuple(zip(self.operations, current))):
+                try:
+                    operation.apply(value)
+                except Exception as rollback_error:
+                    rollback_failures.append((operation.target, rollback_error))
+            try:
+                _restore_recording(self.tracker, current_recording)
+            except Exception as rollback_error:
+                rollback_failures.append((self.tracker, rollback_error))
+            _annotate_rollback_failures(error, rollback_failures)
+            raise
+
     def _record_changes(
         self, before: Sequence[object], after: Sequence[object]
     ) -> None:
@@ -403,12 +437,10 @@ class PropertyPlan:
             recording_after = _recording_state(self.tracker)
 
             def undo():
-                self._apply_state(before)
-                _restore_recording(self.tracker, recording_before)
+                self._apply_state_atomically(before, recording_before)
 
             def redo():
-                self._apply_state(after)
-                _restore_recording(self.tracker, recording_after)
+                self._apply_state_atomically(after, recording_after)
 
             self.figure.canvas.draw()
             self._notify()

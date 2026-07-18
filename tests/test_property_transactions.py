@@ -283,3 +283,113 @@ def test_common_property_has_one_atomic_undo_redo_and_real_commands(
     tracker.forwardEdit()
     assert (text.get_label(), rectangle.get_label()) == ("shared", "shared")
     assert [command for _target, command in tracker.changes.values()] == commands
+
+
+def test_mixed_property_undo_redo_failures_restore_entry_side_atomically(
+    text_and_rectangle,
+) -> None:
+    fig, text, rectangle, tracker = text_and_rectangle
+    before = (text.get_label(), rectangle.get_label())
+    recording_before = tracker.capture_recording_state()
+    original_set_label = rectangle.set_label
+    failure_value = {"value": None}
+
+    def conditional_set_label(value):
+        if value == failure_value["value"]:
+            raise RuntimeError("injected mixed-property history failure")
+        return original_set_label(value)
+
+    rectangle.set_label = conditional_set_label
+    plan = PropertyPlan.for_selection(
+        text,
+        (text, rectangle),
+        "label",
+        "shared",
+    )
+    assert plan.commit("Change label")
+    recording_after = tracker.capture_recording_state()
+    original_draw = fig.canvas.draw
+    draw_calls = 0
+
+    def counted_draw(*args, **kwargs):
+        nonlocal draw_calls
+        draw_calls += 1
+        return original_draw(*args, **kwargs)
+
+    fig.canvas.draw = counted_draw
+    try:
+        failure_value["value"] = before[1]
+        with pytest.raises(RuntimeError, match="mixed-property history failure"):
+            tracker.backEdit()
+        assert (text.get_label(), rectangle.get_label()) == ("shared", "shared")
+        assert tracker.capture_recording_state() == recording_after
+        assert tracker.last_edit == 0
+        assert draw_calls == 0
+
+        failure_value["value"] = None
+        tracker.backEdit()
+        assert (text.get_label(), rectangle.get_label()) == before
+        assert tracker.capture_recording_state() == recording_before
+        assert tracker.last_edit == -1
+        assert draw_calls == 1
+
+        draw_calls = 0
+        failure_value["value"] = "shared"
+        with pytest.raises(RuntimeError, match="mixed-property history failure"):
+            tracker.forwardEdit()
+        assert (text.get_label(), rectangle.get_label()) == before
+        assert tracker.capture_recording_state() == recording_before
+        assert tracker.last_edit == -1
+        assert draw_calls == 0
+
+        failure_value["value"] = None
+        tracker.forwardEdit()
+        assert (text.get_label(), rectangle.get_label()) == ("shared", "shared")
+        assert tracker.capture_recording_state() == recording_after
+        assert tracker.last_edit == 0
+        assert draw_calls == 1
+    finally:
+        rectangle.set_label = original_set_label
+        fig.canvas.draw = original_draw
+
+
+def test_history_rollback_failure_is_attached_to_original_setter_error() -> None:
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    first = ax.text(0.2, 0.5, "first", fontsize=10)
+    second = ax.text(0.7, 0.5, "second", fontsize=11)
+    fig.canvas.draw()
+    tracker = install_tracker(fig, selected=(first, second))
+    before = (first.get_fontsize(), second.get_fontsize())
+    original_second_setter = second.set_fontsize
+    failure_enabled = {"value": False}
+
+    def fail_destination_and_rollback(value):
+        if failure_enabled["value"] and value == before[1]:
+            raise RuntimeError("injected undo destination failure")
+        if failure_enabled["value"] and value == 20:
+            raise RuntimeError("injected undo rollback failure")
+        return original_second_setter(value)
+
+    second.set_fontsize = fail_destination_and_rollback
+    plan = PropertyPlan.for_targets((first, second), {"fontsize": 20})
+    assert plan.commit("Change font size")
+    recording_after = tracker.capture_recording_state()
+    failure_enabled["value"] = True
+
+    try:
+        with pytest.raises(
+            RuntimeError, match="injected undo destination failure"
+        ) as raised:
+            tracker.backEdit()
+    finally:
+        failure_enabled["value"] = False
+        second.set_fontsize = original_second_setter
+
+    assert (first.get_fontsize(), second.get_fontsize()) == (20, 20)
+    assert tracker.capture_recording_state() == recording_after
+    assert tracker.last_edit == 0
+    failures = raised.value.pylustrator_rollback_failures
+    assert len(failures) == 1
+    assert failures[0][0] is second
+    assert "injected undo rollback failure" in str(failures[0][1])
+    plt.close(fig)

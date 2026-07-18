@@ -10,6 +10,7 @@ from matplotlib.backend_bases import KeyEvent, MouseEvent
 from matplotlib.patches import Rectangle
 from qtpy import QtGui, QtWidgets
 
+from pylustrator.change_tracker import ChangeTracker
 from pylustrator.commands import semantic_equal
 from pylustrator.interaction import SelectionMode
 from test_selection_indicator import attach_drag_manager
@@ -41,6 +42,19 @@ def overlapping_rectangles(ax, zorders):
         )
         for index, zorder in enumerate(zorders)
     )
+
+
+def install_real_tracker(fig):
+    tracker = ChangeTracker.__new__(ChangeTracker)
+    tracker.figure = fig
+    tracker.changes = {}
+    tracker.saved = True
+    tracker.edits = []
+    tracker.last_edit = -1
+    tracker.update_changes_signal = None
+    tracker.no_save = False
+    fig.change_tracker = tracker
+    return tracker
 
 
 def test_bring_forward_crosses_next_visible_sibling_and_updates_hit_stack() -> None:
@@ -239,6 +253,85 @@ def test_arrange_failure_rolls_back_artists_recording_history_and_selection() ->
     assert tracker.capture_recording_state() == recording_before
     assert tracker.edits == history_before
     assert [target.target for target in manager.selection.targets] == [selected]
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_zorder_undo_redo_setter_failures_restore_all_siblings_atomically() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    first, second, third = overlapping_rectangles(ax, (1, 10, 20))
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    tracker = install_real_tracker(fig)
+    manager.select_elements([first, second], primary=second)
+    original_second_setter = second.set_zorder
+    failure_value = {"value": None}
+
+    def conditional_set_zorder(value):
+        if value == failure_value["value"]:
+            raise RuntimeError("injected z-order history failure")
+        return original_second_setter(value)
+
+    second.set_zorder = conditional_set_zorder
+    assert manager.change_selection_zorder("forward")
+    after = (first.get_zorder(), second.get_zorder(), third.get_zorder())
+    assert after == (10, 20, 1)
+    recording_after = tracker.capture_recording_state()
+    original_draw = fig.canvas.draw
+    draw_calls = 0
+
+    def counted_draw(*args, **kwargs):
+        nonlocal draw_calls
+        draw_calls += 1
+        return original_draw(*args, **kwargs)
+
+    fig.canvas.draw = counted_draw
+    try:
+        failure_value["value"] = 10
+        with pytest.raises(RuntimeError, match="z-order history failure"):
+            tracker.backEdit()
+        assert (first.get_zorder(), second.get_zorder(), third.get_zorder()) == after
+        assert tracker.capture_recording_state() == recording_after
+        assert tracker.last_edit == 0
+        assert draw_calls == 0
+
+        failure_value["value"] = None
+        tracker.backEdit()
+        assert (first.get_zorder(), second.get_zorder(), third.get_zorder()) == (
+            1,
+            10,
+            20,
+        )
+        assert tracker.last_edit == -1
+        assert draw_calls == 1
+        recording_before = tracker.capture_recording_state()
+
+        draw_calls = 0
+        failure_value["value"] = 20
+        with pytest.raises(RuntimeError, match="z-order history failure"):
+            tracker.forwardEdit()
+        assert (first.get_zorder(), second.get_zorder(), third.get_zorder()) == (
+            1,
+            10,
+            20,
+        )
+        assert tracker.capture_recording_state() == recording_before
+        assert tracker.last_edit == -1
+        assert draw_calls == 0
+
+        failure_value["value"] = None
+        tracker.forwardEdit()
+        assert (first.get_zorder(), second.get_zorder(), third.get_zorder()) == after
+        assert tracker.capture_recording_state() == recording_after
+        assert tracker.last_edit == 0
+        assert draw_calls == 1
+    finally:
+        second.set_zorder = original_second_setter
+        fig.canvas.draw = original_draw
+
+    assert [target.target for target in manager.selection.targets] == [first, second]
     manager.selection.clear_targets()
     plt.close(fig)
     assert app is not None
