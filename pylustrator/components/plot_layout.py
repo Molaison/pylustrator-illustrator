@@ -318,11 +318,23 @@ class Canvas(QtWidgets.QWidget):
             canvas.window_pylustrator = None
             toolbar = getattr(canvas, "pyl_toolbar", None)
             if toolbar is not None:
-                toolbar.setParent(None)
+                navigation = getattr(toolbar, "navi_toolbar", None)
+                if navigation is not None:
+                    for name in ("_id_press", "_id_release", "_id_drag"):
+                        connection = getattr(navigation, name, None)
+                        if connection is not None:
+                            canvas.mpl_disconnect(connection)
+                        setattr(navigation, name, None)
+                    if getattr(canvas, "toolbar", None) is navigation:
+                        canvas.toolbar = None
+                    navigation.deleteLater()
+                toolbar.canvas = None
+                toolbar.fig = None
+                toolbar.navi_toolbar = None
                 toolbar.deleteLater()
                 canvas.pyl_toolbar = None
+            canvas.dispose()
             self.canvas_wrapper_layout.removeWidget(canvas)
-            canvas.setParent(None)
             canvas.deleteLater()
 
         for root in tuple(self._scene_roots.values()):
@@ -334,6 +346,7 @@ class Canvas(QtWidgets.QWidget):
         self._figure_canvases.clear()
         self._source_canvases.clear()
         self._scene_roots.clear()
+        self.selections_view.canvas_canvas = None
         self.canvas = None
         self.fig = None
 

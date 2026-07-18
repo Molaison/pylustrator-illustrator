@@ -405,7 +405,7 @@ def warnAboutTicks(fig):
 """ Window """
 
 
-class Signals(QtWidgets.QWidget):
+class Signals(QtCore.QObject):
     figure_changed = QtCore.Signal(Figure)
     canvas_changed = QtCore.Signal(object)
     figure_size_changed = QtCore.Signal()
@@ -441,6 +441,8 @@ class PlotWindow(QtWidgets.QWidget):
         if self._deactivated:
             raise RuntimeError("Cannot attach a Figure to a closed PlotWindow")
         already_current = self.fig is figure and self.owns_figure(figure)
+        if not already_current:
+            self._unbind_current_tracker()
         self.fig = figure
         if figure not in self._owned_figures:
             self._owned_figures.append(figure)
@@ -448,10 +450,12 @@ class PlotWindow(QtWidgets.QWidget):
         figure.signals = self.signals
         if already_current:
             self.configure_figure_manager(figure)
+            self._bind_current_tracker()
             self.updateSelectionControls()
             return
         self.signals.figure_changed.emit(figure)
         self.configure_figure_manager(figure)
+        self._bind_current_tracker()
         self.updateSelectionControls()
 
     def setCanvas(self, canvas):
@@ -592,7 +596,7 @@ class PlotWindow(QtWidgets.QWidget):
 
         self.figures = []
         self._owned_figures = []
-        self._bound_trackers = {}
+        self._bound_tracker = None
         self._deactivated = False
         self._initial_layout_applied = False
         self.fast_drag_preview = True
@@ -600,7 +604,7 @@ class PlotWindow(QtWidgets.QWidget):
         self.selection_mode = SelectionMode.OBJECT
         self.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
 
-        self.signals = Signals()
+        self.signals = Signals(self)
         self.signals.canvas_changed.connect(self.setCanvas)
         self.signals.figure_selection_property_changed.connect(
             self.selectionProperyChanged
@@ -963,14 +967,28 @@ class PlotWindow(QtWidgets.QWidget):
 
     def update(self):
         """update the tree view"""
-        tracker = self.fig.change_tracker
-        previous = self._bound_trackers.get(id(self.fig))
-        if previous is not None and previous is not tracker:
-            previous.update_changes_signal = None
-        tracker.update_changes_signal = self.update_changes_signal
-        self._bound_trackers[id(self.fig)] = tracker
-        self.update_changes_signal.emit(True, True, "", "")
+        self._bind_current_tracker()
         self.signals.figure_element_selected.emit(self.fig)
+
+    def _unbind_current_tracker(self) -> None:
+        tracker = self._bound_tracker
+        if tracker is not None:
+            tracker.update_changes_signal = None
+        self._bound_tracker = None
+
+    def _bind_current_tracker(self) -> bool:
+        if self.fig is None:
+            return False
+        tracker = getattr(self.fig, "change_tracker", None)
+        if tracker is None or tracker is self._bound_tracker:
+            return False
+        self._unbind_current_tracker()
+        tracker.update_changes_signal = self.update_changes_signal
+        self._bound_tracker = tracker
+        refresh = getattr(tracker, "changeCountChanged", None)
+        if callable(refresh):
+            refresh()
+        return True
 
     def updateTitle(self):
         """update the title of the window to display if it is saved or not"""
@@ -1023,9 +1041,7 @@ class PlotWindow(QtWidgets.QWidget):
         self._deactivated = True
         self.hide()
 
-        for tracker in tuple(self._bound_trackers.values()):
-            tracker.update_changes_signal = None
-        self._bound_trackers.clear()
+        self._unbind_current_tracker()
 
         owned_figures = tuple(self._owned_figures)
         for figure in owned_figures:

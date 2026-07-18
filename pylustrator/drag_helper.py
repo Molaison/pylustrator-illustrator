@@ -4053,6 +4053,8 @@ class DragManager:
                 selection.c4 = None
         self._selection_refresh_on_draw = False
         self._interaction_active = False
+        self._callback_canvas = None
+        self._selection_callback_canvas = None
 
         self.selection.clear_targets()
         self.selected_element = None

@@ -42,16 +42,86 @@ from qtpy import QtWidgets, QtCore
 try:  # for matplotlib > 3.0
     from matplotlib.backends.backend_qtagg import (
         FigureCanvas,
-        FigureManager,
         NavigationToolbar2QT as NavigationToolbar,
     )
 except ModuleNotFoundError:
     from matplotlib.backends.backend_qt5agg import (
         FigureCanvas,
-        FigureManager,
         NavigationToolbar2QT as NavigationToolbar,
     )
 from matplotlib.figure import Figure
+
+
+class EmbeddedFigureManager:
+    """Minimal manager contract for a canvas already owned by another window.
+
+    ``FigureManagerQT`` always creates a top-level ``MainWindow`` and reparents
+    the canvas into it.  Pylustrator embeds the canvas in its own ``PlotWindow``,
+    so constructing that manager leaves one hidden top-level window per reopen.
+    This manager deliberately owns no Qt widgets or default callbacks.  A
+    Figure's CallbackRegistry is shared by all of its canvases, so installing
+    (or disconnecting) the standard handlers here could mutate the source
+    canvas manager's callbacks.
+    """
+
+    def __init__(self, canvas, num: int):
+        self.canvas = canvas
+        self.num = num
+        self.toolbar = None
+        self.toolmanager = None
+        self._window_title = f"Figure {num:d}"
+        canvas.manager = self
+        self.key_press_handler_id = None
+        self.button_press_handler_id = None
+
+    def destroy(self, *args) -> None:
+        canvas = self.canvas
+        if canvas is None:
+            return
+        for name in ("key_press_handler_id", "button_press_handler_id"):
+            connection = getattr(self, name, None)
+            if isinstance(connection, int):
+                canvas.mpl_disconnect(connection)
+            setattr(self, name, None)
+        connection = getattr(self, "_cidgcf", None)
+        if isinstance(connection, int):
+            canvas.mpl_disconnect(connection)
+        if hasattr(self, "_cidgcf"):
+            del self._cidgcf
+        if getattr(canvas, "manager", None) is self:
+            canvas.manager = None
+        self.canvas = None
+        self.toolbar = None
+        self.toolmanager = None
+
+    def show(self) -> None:
+        canvas = self.canvas
+        if canvas is None:
+            return
+        window = getattr(canvas, "window_pylustrator", None) or getattr(
+            canvas, "window", None
+        )
+        (window or canvas).show()
+
+    def resize(self, width: int, height: int) -> None:
+        if self.canvas is not None:
+            self.canvas.resize(width, height)
+
+    def get_window_title(self) -> str:
+        return self._window_title
+
+    def set_window_title(self, title: str) -> None:
+        self._window_title = str(title)
+
+    def full_screen_toggle(self) -> None:
+        canvas = self.canvas
+        if canvas is None:
+            return
+        window = canvas.window()
+        if window.isFullScreen():
+            window.showNormal()
+        else:
+            window.showFullScreen()
 
 
 class MatplotlibWidget(FigureCanvas):
@@ -71,10 +141,9 @@ class MatplotlibWidget(FigureCanvas):
         self.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
         self.updateGeometry()
 
-        self.manager = FigureManager(self, 1)
-        self.manager._cidgcf = self.figure
+        self.manager = EmbeddedFigureManager(self, num)
 
-        self.timer = QtCore.QTimer()
+        self.timer = QtCore.QTimer(self)
         self.timer.setSingleShot(True)
         self.timer.setInterval(16)
         self.timer.timeout.connect(self.draw)
@@ -102,6 +171,30 @@ class MatplotlibWidget(FigureCanvas):
 
     def show(self):
         self.draw()
+
+    def dispose(self) -> None:
+        """Break every non-Qt ownership edge before deferred widget deletion."""
+
+        if getattr(self, "_disposed", False):
+            return
+        self._disposed = True
+        timer = self.timer
+        if timer is not None:
+            timer.stop()
+            try:
+                timer.timeout.disconnect(self.draw)
+            except (TypeError, RuntimeError):
+                pass
+            timer.deleteLater()
+            self.timer = None
+        manager = getattr(self, "manager", None)
+        if manager is not None:
+            manager.destroy()
+        self.manager = None
+        self.toolbar = None
+        self.window_pylustrator = None
+        self.pyl_toolbar = None
+        self.figure = None
 
     def sizeHint(self):
         w, h = self.get_width_height()

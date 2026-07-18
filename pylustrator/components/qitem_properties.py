@@ -971,14 +971,19 @@ class LegendPropertiesWidget(QtWidgets.QWidget):
 
 
 class QTickEdit(QtWidgets.QWidget):
-    def __init__(self, axis: str, signal_target_changed: QtCore.Signal):
+    def __init__(
+        self,
+        axis: str,
+        signal_target_changed: QtCore.Signal,
+        parent: QtWidgets.QWidget = None,
+    ):
         """A widget to change the tick properties
 
         Args:
             axis: whether to use the "x" or "y" axis
             signal_target_changed: a signal to emit when the target changed
         """
-        QtWidgets.QWidget.__init__(self)
+        QtWidgets.QWidget.__init__(self, parent, QtCore.Qt.Window)
         self.setWindowTitle("Figure - " + axis + "-Axis - Ticks - Pylustrator")
         self.setWindowIcon(
             QtGui.QIcon(
@@ -1545,7 +1550,7 @@ class QAxesProperties(QtWidgets.QWidget):
         self.button_ticks.clicked.connect(self.showTickWidget)
         self.layout.addWidget(self.button_ticks)
 
-        self.tick_edit = QTickEdit(axis, signal_target_changed)
+        self.tick_edit = QTickEdit(axis, signal_target_changed, parent=self)
 
     def showTickWidget(self):
         """open the tick edit dialog"""
