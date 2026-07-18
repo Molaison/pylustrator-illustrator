@@ -71,6 +71,29 @@ class HitResolution:
     blocked: bool
 
 
+class TopHitStatus(str, Enum):
+    """Whether a streamed foreground hit is final or needs the full stack."""
+
+    RESOLVED = "resolved"
+    NEEDS_FULL_STACK = "needs_full_stack"
+
+
+@dataclass(frozen=True)
+class TopHitDecision:
+    """A short-circuitable interpretation of a front-to-back hit stream.
+
+    Direct Selection cannot decide a group-shell hit without knowing whether a
+    descendant leaf appears later in the stream.  In that one case ``status``
+    requests the existing full-stack resolver instead of returning a partial
+    :class:`HitResolution` whose candidate list would be incomplete.
+    """
+
+    status: TopHitStatus
+    target: Optional[Artist] = None
+    raw_leaf: Optional[Artist] = None
+    blocked: bool = False
+
+
 @dataclass(frozen=True)
 class SelectionScope:
     """One entered logical group in the isolation stack."""
@@ -248,6 +271,43 @@ class SelectionKernel:
             blocked=bool(raw_barrier or (raw_leaf is not None and not candidates)),
         )
 
+    def resolve_top(
+        self,
+        candidates: Iterable[HitCandidate],
+    ) -> TopHitDecision:
+        """Resolve the first conclusive item in a front-to-back hit stream.
+
+        ``candidates`` must contain only actual visual hits in paint order.  The
+        iterator is consumed only until selection policy becomes conclusive.
+        Callers must build a complete :class:`HitStack` when the returned status
+        is :attr:`TopHitStatus.NEEDS_FULL_STACK`.
+        """
+
+        root = self.scope_root
+        for candidate in candidates:
+            artist = candidate.artist
+            if not self._in_scope(artist):
+                continue
+            if root is not None and artist is root:
+                continue
+            if not candidate.editable:
+                return TopHitDecision(
+                    status=TopHitStatus.RESOLVED,
+                    blocked=True,
+                )
+            if self.mode is SelectionMode.DIRECT and self._is_group(artist):
+                return TopHitDecision(
+                    status=TopHitStatus.NEEDS_FULL_STACK,
+                    raw_leaf=artist,
+                )
+            return TopHitDecision(
+                status=TopHitStatus.RESOLVED,
+                target=self.object_target(artist),
+                raw_leaf=artist,
+            )
+
+        return TopHitDecision(status=TopHitStatus.RESOLVED)
+
     def map_artists(self, artists: Iterable[Artist]) -> list[Artist]:
         """Resolve an unordered marquee result through the active tool mode."""
 
@@ -290,4 +350,6 @@ __all__ = [
     "SelectionKernel",
     "SelectionMode",
     "SelectionScope",
+    "TopHitDecision",
+    "TopHitStatus",
 ]

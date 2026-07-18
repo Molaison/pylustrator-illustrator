@@ -155,6 +155,15 @@ The following behavior passes for every type that advertises it:
 - Annotation bounds include the visible arrow stroke as well as text/bbox
   artwork. Nested Legend and EditorGroup measurements reuse one immutable
   geometry value per Artist and selection action.
+- Ordinary hover and click resolve a streamed top hit without changing the
+  complete hit-stack oracle used by Alt cycling, candidate menus, and
+  double-click isolation. Object/Direct scope, group-shell fallback, and
+  unsupported foreground barriers are identical in both paths.
+- A ready cached content ghost is visual-only and translation-only. It follows
+  the same accepted display delta as the semantic plan, while commit and Undo
+  remain adapter-owned. A missing, stale, clipped, edge-touching, oversized,
+  custom, collection/image, or non-translation cache automatically leaves the
+  analytic preview active with zero Artist/history mutation.
 
 Native R retains the `native_rotation` preview strategy. Q has a distinct
 `rigid_rotation` strategy and an immutable `RigidRotationPlan` containing the
@@ -459,11 +468,15 @@ Fixture/test limitations, not confirmed implementation defects:
 - Exotic custom transforms beyond data, axes, figure, display identity, mixed
   Annotation coordinates, and log non-affine data transforms were not
   exhaustively enumerated.
-- Stroke envelopes are a common-case geometry approximation, not a rasterized
-  paint envelope. Miter/cap joins, path effects, and clipping can extend or trim
-  painted pixels beyond the current axial `linewidth / 2` padding; a 30 pt
-  miter triangle raster probe missed as much as about 18.8 px. This is tracked
-  as future paint-envelope policy, not claimed as exact coverage here.
+- Transform capability and its hot selection geometry still use the documented
+  common-case analytic stroke envelope; the adapter matrix does not silently
+  broaden those mutations from a raster observation. A separate revision-bound
+  paint cache can explicitly capture exact Agg pixels for audited, non-stale
+  Patch, Line2D, and fixed-colour Collection primitives, including cap/join,
+  clip, markers, antialiasing, and whitelisted path effects. It returns
+  conservative/unavailable for every open-ended state and never draws on a
+  cache-only pointer lookup. The earlier 30 pt miter miss (about 18.8 px)
+  remains evidence for why analytic bounds cannot be relabelled exact.
 - Generated blocks saved from this version replay NaN/Inf safely. A historical
   source block that already contains bare `nan`/`inf` can fail before runtime
   migration starts; the offline `pylustrator-source` doctor diagnoses and can
@@ -478,7 +491,7 @@ QT_QPA_PLATFORM=offscreen uv run pytest tests -q
 uv run ruff check .
 ```
 
-The current full suite reports 1,187 passed and 178 skipped tests, with no strict
+The current full suite reports 1,281 passed and 178 skipped tests, with no strict
 xfails. Within the dedicated matrix, supported-operation tests skip denied types
 while rejection tests skip supported types; those skips are branch accounting,
 not missing Artist coverage. Registry equality covers all 23 always-present

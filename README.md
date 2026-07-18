@@ -70,6 +70,16 @@ the user-facing interaction rules shared.
   markers, transformed paths, and renderer-managed collection offsets. Hit
   testing, marquee selection, overlays, and Smart Guides reuse one revisioned
   display-geometry service instead of measuring the same scene independently.
+- Deferred translation can show a renderer-faithful cached content ghost while
+  the semantic Artist remains untouched until commit. Captures run only from
+  idle work, retain an explicit memory/source/complexity budget, and validate a
+  renderer/revision/source token on activation. Unsupported, clipped,
+  canvas-edge, oversized, or non-translation cases automatically keep the
+  existing analytic outline rather than showing a misleading bitmap.
+- The display-geometry service also exposes opt-in, revision-bound Agg paint
+  envelopes with explicit exact/conservative/unavailable states. Capture draws
+  only audited disposable clones; pending or open-ended visual state stays
+  conservative, and pointer cache misses never invoke a renderer.
 - Alignment supports selection bounds, the canvas/artboard, and an explicit
   key object without allowing stale key-object mode to intercept ordinary
   single-object drags.
@@ -108,7 +118,10 @@ the user-facing interaction rules shared.
   snapping. Bounded idle batches publish the hit index atomically before
   finishing Smart Guide capture; an unfinished index keeps unmeasured Artists
   in the conservative native-hit path, so mouse press never performs a blocking
-  full-scene measurement or loses a selectable object.
+  full-scene measurement or loses a selectable object. Ordinary hover and
+  click stream only to the first conclusive foreground hit; Alt click-through,
+  candidate menus, double-click isolation, and ambiguous Direct Selection
+  group shells retain the complete hit-stack oracle.
 - Bring Forward/Backward and Send to Front/Back operate on Matplotlib's actual
   stable paint order, update hit ordering immediately, and undo atomically.
 - Editor windows can be closed and reopened without accumulating hidden Qt
@@ -138,14 +151,17 @@ and the extension API is introduced in the [API documentation](docs/api.rst).
 
 At the current fork milestone on 2026-07-18:
 
-- the full test suite passed with **1,187 passed and 178 skipped**;
+- the full test suite passed with **1,281 passed and 178 skipped**;
 - Ruff and Ty completed successfully, with an explicit incremental type-check
   baseline for the dynamic Matplotlib/Qt interaction modules; and
 - the real multi-panel Fig2 workflow was used to validate selection, movement,
   resize, rotation, alignment references, Smart Guides, legends, masked Line2D
   replay, axis-label editing, true paint-order stacking, window close/reopen,
-  cold and warm hit latency, save/replay, and undo/redo behavior. The formal
-  editable Fig2 remained byte-identical during fork-based validation.
+  cold and warm hit latency, cached content previews, save/replay, and
+  undo/redo behavior. On the current real-case fork, cached-ghost activation
+  stayed below 0.46 ms p95 and motion below 0.03 ms p95; warm ordinary top-hit
+  resolution stayed below 1.57 ms p95. The formal editable Fig2 remained
+  byte-identical during fork-based validation.
 
 ### Supported Runtime
 

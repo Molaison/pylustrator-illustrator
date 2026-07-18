@@ -58,7 +58,13 @@ from .change_tracker import ChangeTracker, add_text_default, getReference
 from .components.plot_layout import scene_point_to_canvas_pixels
 from .editor_model import EditorGroup, EditorScene
 from .display_geometry import ArtistRoster, DisplayGeometryCache
-from .interaction import HitCandidate, HitStack, SelectionKernel, SelectionMode
+from .interaction import (
+    HitCandidate,
+    HitStack,
+    SelectionKernel,
+    SelectionMode,
+    TopHitStatus,
+)
 from .interaction_index import DisplaySpaceHitIndex
 from .operations import OperationSupport, TransformIntent, TransformOperation
 from .smart_guides import Axis, StaleGuideSnapshotError
@@ -72,6 +78,17 @@ from .property_adapters import axis_tick_label_reference
 from .property_transactions import PropertyOperation, PropertyPlan
 from .commands import InteractionState, ObjectLocator, semantic_equal
 from .lifecycle_commands import delete_selection
+from .content_preview_cache import (
+    DEFAULT_MAX_ARTISTS,
+    DEFAULT_MEMORY_BUDGET_BYTES,
+    DEFAULT_SOURCE_FINGERPRINT_BUDGET_BYTES,
+    activate_content_preview,
+    close_content_preview_cache,
+    deactivate_content_preview,
+    invalidate_content_preview_cache,
+    schedule_content_preview_warmup,
+    update_content_preview,
+)
 from pylustrator.change_tracker import UndoRedo
 
 DIR_X0 = 1
@@ -348,7 +365,19 @@ class GrabFunctions(object):
                 # A committed move schedules a draw, whose post-layout event
                 # starts the authoritative warmup.  Only a click/no-op needs a
                 # warmup here because no draw is pending.
-                schedule_smart_guide_warmup(manager)
+                try:
+                    schedule_smart_guide_warmup(manager)
+                except (
+                    AttributeError,
+                    IndexError,
+                    LookupError,
+                    TypeError,
+                    ValueError,
+                    RuntimeError,
+                ):
+                    # Guide warmup is an independent fail-open accelerator;
+                    # the unchanged content token/pixmap remains reusable.
+                    pass
 
         if blit is True:
             for target in self.targets:
@@ -449,6 +478,12 @@ class GrabbableRectangleSelection(GrabFunctions):
         self.alignment_reference_mode = "selection"
         self.alignment_key = None
         self.defer_artist_updates = True
+        self.content_preview_enabled = True
+        self.content_preview_max_artists = DEFAULT_MAX_ARTISTS
+        self.content_preview_memory_budget_bytes = DEFAULT_MEMORY_BUDGET_BYTES
+        self.content_preview_source_budget_bytes = (
+            DEFAULT_SOURCE_FINGERPRINT_BUDGET_BYTES
+        )
         self.smart_guides_enabled = True
         self.smart_guide_tolerance_px = 5.0
         self.smart_guides_equal_gaps = True
@@ -607,6 +642,9 @@ class GrabbableRectangleSelection(GrabFunctions):
 
         if update:
             self.update_extent()
+        manager = getattr(self.figure, "figure_dragger", None)
+        if manager is not None:
+            schedule_content_preview_warmup(manager)
 
     @selection_geometry_snapshot()
     def update_extent(self):
@@ -1590,6 +1628,9 @@ class GrabbableRectangleSelection(GrabFunctions):
             self.update_extent()
             self.update_selection_rectangles()
         self._notify_alignment_state_changed()
+        manager = getattr(self.figure, "figure_dragger", None)
+        if manager is not None and self.targets:
+            schedule_content_preview_warmup(manager)
 
     def update_grabber(self):
         """update the position of the grabber elements"""
@@ -1629,6 +1670,9 @@ class GrabbableRectangleSelection(GrabFunctions):
         """remove all elements from the selection"""
         self.rotation_grabber.cancel_pivot_event(restore=True)
         self.clear_move_previews()
+        manager = getattr(self.figure, "figure_dragger", None)
+        if manager is not None:
+            invalidate_content_preview_cache(manager, "selection-cleared")
         for rect in self.targets_rects:
             self.graphics_scene.scene().removeItem(rect)
             # self.figure.patches.remove(rect)
@@ -2141,6 +2185,8 @@ class GrabbableRectangleSelection(GrabFunctions):
         self.move_start_ui_state_captured = True
 
         self.store_start = self.get_save_point(self.save_targets)
+        if self.defer_current_move:
+            activate_content_preview(self)
 
     @staticmethod
     def _copy_edit_history(edits) -> list:
@@ -2168,6 +2214,7 @@ class GrabbableRectangleSelection(GrabFunctions):
         setattr(target.target, "_pylustrator_cached_get_extend", None)
 
     def clear_move_previews(self):
+        deactivate_content_preview(self)
         for target in self._unique_wrappers(getattr(self, "targets", [])):
             self._clear_preview(target)
 
@@ -2327,6 +2374,7 @@ class GrabbableRectangleSelection(GrabFunctions):
         return tuple(failures)
 
     def _clear_move_transaction(self) -> None:
+        deactivate_content_preview(self)
         self.move_start_positions = {}
         self.move_start_raw_selection_points = {}
         self.move_start_selection_points = {}
@@ -2499,6 +2547,7 @@ class GrabbableRectangleSelection(GrabFunctions):
             self.move_current_selection_points[id(target.target)] = selection_points
 
         self.update_selection_rectangles(use_previous_offset=True)
+        update_content_preview(self, transform)
         # for rect in self.targets_rects:
         #    self.transform_target(transform, TargetWrapper(rect))
 
@@ -2889,6 +2938,7 @@ class DragManager:
         if active_session is not None:
             active_session.invalidate()
         invalidate_smart_guide_cache(self)
+        invalidate_content_preview_cache(self, "interaction-revision")
 
     @staticmethod
     def _interaction_hit_components(artist: Artist) -> tuple[Artist, ...]:
@@ -3234,6 +3284,62 @@ class DragManager:
             parent = getattr(artist, "_parent", None)
         return parent
 
+    def _paint_order_key(
+        self,
+        artist: Artist,
+        *,
+        fallback: int = 0,
+        registration_order: dict[int, int] | None = None,
+    ) -> tuple:
+        """Return the authoritative back-to-front Matplotlib paint key.
+
+        Hit testing and cached content ghosts share this exact ownership/zorder
+        model so a same-z multi-selection cannot reverse overlapping paint.
+        """
+
+        if registration_order is None:
+            registration_order = {
+                id(item): index
+                for index, item in enumerate(
+                    getattr(self, "_interaction_artists", ())
+                )
+            }
+        child_orders: dict[int, dict[int, int]] = getattr(
+            self, "_draw_child_orders", {}
+        )
+        self._draw_child_orders = child_orders
+
+        def child_order(parent, child, default):
+            parent_key = id(parent)
+            if parent_key not in child_orders:
+                try:
+                    children = get_artist_children(parent)
+                except (AttributeError, TypeError, ValueError, RuntimeError):
+                    children = []
+                child_orders[parent_key] = {
+                    id(item): index for index, item in enumerate(children)
+                }
+            return child_orders[parent_key].get(id(child), default)
+
+        path = []
+        current = artist
+        seen = set()
+        while current is not None and not isinstance(current, Figure):
+            current_key = id(current)
+            if current_key in seen:
+                break
+            seen.add(current_key)
+            parent = self._draw_parent(current)
+            default = registration_order.get(current_key, int(fallback))
+            order = (
+                child_order(parent, current, default)
+                if parent is not None
+                else default
+            )
+            path.append((float(current.get_zorder()), order))
+            current = parent
+        return tuple(reversed(path)), int(fallback)
+
     def _ensure_editor_scene(self) -> EditorScene:
         scene = getattr(self, "editor_scene", None)
         if scene is None:
@@ -3533,7 +3639,7 @@ class DragManager:
         if event.x is None or event.y is None or getattr(self, "grab_element", None):
             self._hide_preselection()
             return None
-        target = self._ensure_selection_kernel().pick(self.get_hit_stack(event))
+        target = self._resolve_top_hit(event).target
         if target is None:
             self._hide_preselection()
             return None
@@ -4095,6 +4201,7 @@ class DragManager:
         # geometry measured before that point is necessarily provisional.
         self.refresh_selection_geometry(post_draw=True)
         schedule_smart_guide_warmup(self)
+        schedule_content_preview_warmup(self)
 
     def deactivate(self, *, redraw: bool = True):
         """deactivate the interaction callbacks from the figure"""
@@ -4102,6 +4209,7 @@ class DragManager:
             return False
         self._cancel_active_pointer_transform()
         invalidate_smart_guide_cache(self)
+        close_content_preview_cache(self)
         session = getattr(self, "_active_smart_guide_session", None)
         if session is not None:
             session.close()
@@ -4591,47 +4699,22 @@ class DragManager:
     def _get_hit_stack(self, event: MouseEvent) -> HitStack:
         """Return every visual hit from front to back using one draw-order model."""
 
+        return HitStack(tuple(self._iter_hit_candidates(event)))
+
+    def _iter_hit_candidates(self, event: MouseEvent):
+        """Yield actual hits front-to-back, allowing top-hit short circuiting."""
+
         roster, editable_flags, registration_order = (
             self._interaction_roster_snapshot()
         )
         artists = roster.artists
-        child_orders: dict[int, dict[int, int]] = getattr(
-            self, "_draw_child_orders", {}
-        )
-        self._draw_child_orders = child_orders
-
-        def child_order(parent, child, fallback):
-            parent_key = id(parent)
-            if parent_key not in child_orders:
-                try:
-                    children = get_artist_children(parent)
-                except (AttributeError, TypeError, ValueError, RuntimeError):
-                    children = []
-                child_orders[parent_key] = {
-                    id(item): index for index, item in enumerate(children)
-                }
-            return child_orders[parent_key].get(id(child), fallback)
 
         def pick_order(index):
-            artist = artists[index]
-            path = []
-            current = artist
-            seen = set()
-            while current is not None and not isinstance(current, Figure):
-                current_key = id(current)
-                if current_key in seen:
-                    break
-                seen.add(current_key)
-                parent = self._draw_parent(current)
-                fallback = registration_order.get(current_key, index)
-                order = (
-                    child_order(parent, current, fallback)
-                    if parent is not None
-                    else fallback
-                )
-                path.append((float(current.get_zorder()), order))
-                current = parent
-            return tuple(reversed(path)), index
+            return self._paint_order_key(
+                artists[index],
+                fallback=index,
+                registration_order=registration_order,
+            )
 
         candidate_indices = self._interaction_candidate_indices(
             event,
@@ -4643,7 +4726,6 @@ class DragManager:
             key=lambda item: item[0],
             reverse=True,
         )
-        hits: list[HitCandidate] = []
         for draw_key, index in ordered_entries:
             candidate = artists[index]
             registered_editable = editable_flags[index]
@@ -4657,15 +4739,33 @@ class DragManager:
                 registered_editable
                 and self._resolve_selectable_artist(candidate) is not None
             )
-            hits.append(
-                HitCandidate(
-                    candidate,
-                    editable,
-                    draw_key,
-                    index,
-                )
+            yield HitCandidate(
+                candidate,
+                editable,
+                draw_key,
+                index,
             )
-        return HitStack(tuple(hits))
+
+    def _resolve_top_hit(self, event: MouseEvent):
+        """Resolve an ordinary click without materializing the full hit stack."""
+
+        geometry = self._ensure_display_geometry_cache()
+        with geometry.snapshot():
+            iterator = iter(self._iter_hit_candidates(event))
+            consumed: list[HitCandidate] = []
+
+            def recording_stream():
+                for candidate in iterator:
+                    consumed.append(candidate)
+                    yield candidate
+
+            kernel = self._ensure_selection_kernel()
+            decision = kernel.resolve_top(recording_stream())
+            if decision.status is TopHitStatus.RESOLVED:
+                return decision
+            # Direct Selection encountered a group shell.  Continue the same
+            # iterator and reuse already-tested hits in the full oracle path.
+            return kernel.resolve(HitStack(tuple(consumed) + tuple(iterator)))
 
     def get_hit_candidates(self, event: MouseEvent) -> tuple[Artist, ...]:
         """Public candidate-list API resolved through the active selection tool."""
@@ -5044,17 +5144,21 @@ class DragManager:
                 else (selected[-1] if selected else None)
             )
 
-            hit_stack = self.get_hit_stack(event)
             click_through = _event_has_modifier(
                 event, "alt"
             ) or _event_has_modifier(event, "option")
             shift = _event_has_modifier(event, "shift")
             kernel = self._ensure_selection_kernel()
-            resolution = kernel.resolve(
-                hit_stack,
-                cycle_from=last if click_through else None,
-                wrap=click_through,
-            )
+            hit_stack = None
+            if click_through or event.dblclick:
+                hit_stack = self.get_hit_stack(event)
+                resolution = kernel.resolve(
+                    hit_stack,
+                    cycle_from=last if click_through else None,
+                    wrap=click_through,
+                )
+            else:
+                resolution = self._resolve_top_hit(event)
             picked_element = resolution.target
             self._last_pick_blocked = resolution.blocked
             picked_is_selected = any(
@@ -5079,6 +5183,7 @@ class DragManager:
 
             if event.dblclick and picked_element is not None:
                 if self.enter_isolation(picked_element, notify=False):
+                    assert hit_stack is not None
                     inner = kernel.resolve(hit_stack).target
                     if inner is not None:
                         self.select_element(inner, event)

@@ -346,13 +346,18 @@ def test_pointer_press_uses_one_resolution_and_foreground_wins_old_selection() -
     press = MouseEvent("button_press_event", fig.canvas, x, y, button=1)
     release = MouseEvent("button_release_event", fig.canvas, x, y, button=1)
 
-    calls = {"hit_stack": 0, "lower_contains": 0}
+    calls = {"top_hit": 0, "hit_stack": 0, "lower_contains": 0}
     original_get_hit_stack = manager.get_hit_stack
+    original_resolve_top_hit = manager._resolve_top_hit
     original_lower_contains = lower.contains
 
     def counted_hit_stack(event):
         calls["hit_stack"] += 1
         return original_get_hit_stack(event)
+
+    def counted_top_hit(event):
+        calls["top_hit"] += 1
+        return original_resolve_top_hit(event)
 
     def counted_lower_contains(event):
         calls["lower_contains"] += 1
@@ -362,12 +367,13 @@ def test_pointer_press_uses_one_resolution_and_foreground_wins_old_selection() -
         raise AssertionError("pointer press must not perform a second raw-leaf lookup")
 
     manager.get_hit_stack = counted_hit_stack
+    manager._resolve_top_hit = counted_top_hit
     manager.get_picked_element = forbidden_legacy_pick
     lower.contains = counted_lower_contains
 
     manager.button_press_event0(press)
 
-    assert calls == {"hit_stack": 1, "lower_contains": 1}
+    assert calls == {"top_hit": 1, "hit_stack": 0, "lower_contains": 0}
     assert manager.selected_element is upper
     assert [target.target for target in manager.selection.targets] == [upper]
     manager.button_release_event0(release)
