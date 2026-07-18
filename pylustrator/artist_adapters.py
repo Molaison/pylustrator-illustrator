@@ -6,10 +6,12 @@ between those two worlds.  Every editable artist is resolved to one adapter
 which owns its geometry, capabilities, mutations, undo snapshots, and change
 records.
 
-The registry deliberately resolves by MRO specificity.  That makes subclass
-semantics explicit: for example, ``Annotation`` is handled before ``Text`` and
-``ConnectionPatch`` before ``FancyArrowPatch`` without depending on a fragile
-order of ``isinstance`` branches.
+The registry deliberately resolves by MRO specificity while making inheritance
+an explicit contract.  Registrations match their exact Artist type by default;
+an adapter must opt in before subclasses may inherit its mutation semantics.
+That keeps semantic subclasses such as Matplotlib's 3D artists from silently
+using incompatible 2D writers while still allowing explicitly validated
+extension hierarchies.
 """
 
 from __future__ import annotations
@@ -19,11 +21,13 @@ from copy import copy, deepcopy
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
+from enum import Enum
 from numbers import Integral, Real
 from threading import RLock
 from typing import Iterable, Optional, Sequence
 
 import matplotlib as mpl
+import matplotlib.collections as mpl_collections
 import numpy as np
 from matplotlib.artist import Artist
 
@@ -37,6 +41,9 @@ from matplotlib.legend import Legend
 from matplotlib.lines import Line2D, _mark_every_path  # ty: ignore[unresolved-import]
 from matplotlib.path import Path, get_path_collection_extents
 from matplotlib.patches import (
+    Arc,
+    Circle,
+    CirclePolygon,
     ConnectionPatch,
     Ellipse,
     FancyArrowPatch,
@@ -83,6 +90,8 @@ _SELECTION_GEOMETRY_CACHE = ContextVar(
 _LEGEND_OWNER_CACHE = ContextVar("pylustrator_legend_owner_cache", default=None)
 _LEGEND_OWNER_INVENTORY_ATTR = "_pylustrator_legend_owner_inventory"
 _ACTIVE_LAYOUT_OWNER_SNAPSHOT_KEY = object()
+_ACTIVE_LAYOUT_EXTRAS_SNAPSHOT_KEY = object()
+_CONTAINER_OWNER_SNAPSHOT_KEY = object()
 
 
 @contextmanager
@@ -119,15 +128,21 @@ def legend_owner_snapshot():
 
 
 @contextmanager
-def selection_geometry_snapshot():
-    """Reuse one immutable geometry measurement during a selection action."""
+def selection_geometry_snapshot(cache: dict | None = None):
+    """Reuse one immutable geometry measurement during a selection action.
+
+    A caller-owned cache may span several read-only interaction phases that
+    belong to the same renderer revision.  Nested callers always reuse the
+    active cache, so mutation/preview code cannot accidentally switch snapshots
+    midway through one operation.
+    """
 
     with legend_owner_snapshot():
         existing = _SELECTION_GEOMETRY_CACHE.get()
         if existing is not None:
             yield existing
             return
-        cache = {}
+        cache = {} if cache is None else cache
         token = _SELECTION_GEOMETRY_CACHE.set(cache)
         try:
             yield cache
@@ -570,28 +585,82 @@ def active_layout_owner_for_artist(target: Artist) -> Artist | None:
         )
     if not layout_active:
         return None
+
+    if isinstance(target, Text):
+        owner = layout_owner_for_text(target)
+        if target is getattr(owner, "label", None):
+            # Axis.draw always owns one label coordinate, while an active
+            # Figure layout can also move the Axes itself. ``in_layout=False``
+            # on the Text does not disable either channel; the labelpad-aware
+            # adapter is exact only while the Figure layout is inactive.
+            return getattr(owner, "axes", None) or owner
+
     if not target.get_visible() or not getattr(
         target, "get_in_layout", lambda: True
     )():
         return None
+
+    # Constrained layout rewrites the automatic coordinate of Figure and
+    # SubFigure super labels after a drag preview. Matplotlib marks exactly
+    # those auto-positioned labels with ``_autopos``. A manually positioned
+    # super label, ordinary ``figure.text``, or an object explicitly removed
+    # from layout remains independently movable.
+    if (
+        isinstance(target, Text)
+        and getattr(target, "axes", None) is None
+        and bool(getattr(target, "_autopos", False))
+    ):
+        owner = layout_owner_for_text(target)
+        if owner is not None:
+            return owner
+
     axes = getattr(target, "axes", None)
     if axes is None:
         return None
 
     snapshot = _SELECTION_GEOMETRY_CACHE.get()
+    if snapshot is None:
+        # Transform capability preflight already has an ownership snapshot.
+        # Reuse it so a mixed selection asks Matplotlib for each Axes' bbox
+        # extras once rather than once per selected Artist.
+        snapshot = _LEGEND_OWNER_CACHE.get()
     snapshot_key = (_ACTIVE_LAYOUT_OWNER_SNAPSHOT_KEY, id(target))
     if snapshot is not None:
         entry = snapshot.get(snapshot_key)
         if entry is not None and entry[0] is target:
             return entry[1]
 
-    try:
-        extras = axes.get_default_bbox_extra_artists()
-    except (AttributeError, TypeError, ValueError, RuntimeError):
+    extras = None
+    extras_inventory = None
+    extras_key = (_ACTIVE_LAYOUT_EXTRAS_SNAPSHOT_KEY, id(axes))
+    if snapshot is not None:
+        entry = snapshot.get(extras_key)
+        if entry is not None and entry[0] is axes:
+            extras = entry[1]
+            extras_inventory = entry[2]
+    if extras is None:
+        try:
+            extras = tuple(axes.get_default_bbox_extra_artists())
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            extras = None
+        extras_inventory = (
+            None
+            if extras is None
+            else {id(artist): artist for artist in extras}
+        )
+        if snapshot is not None:
+            snapshot[extras_key] = (axes, extras, extras_inventory)
+
+    if extras is None:
         owner = axes
     else:
         owner = None
-        if any(target is artist for artist in extras):
+        if extras_inventory is not None:
+            candidate = extras_inventory.get(id(target))
+            is_extra = candidate is target
+        else:
+            is_extra = any(target is artist for artist in extras)
+        if is_extra:
             try:
                 bbox = target.get_tightbbox(figure.canvas.get_renderer())
                 bounds = np.asarray(bbox.extents, dtype=float)
@@ -615,6 +684,41 @@ def container_owner_for_artist(target: Artist) -> Artist | None:
     figure = getattr(target, "figure", None)
     if figure is None:
         return None
+
+    get_root = getattr(target, "get_figure", None)
+    if callable(get_root):
+        try:
+            root = get_root(root=True)
+        except (AttributeError, TypeError, ValueError):
+            root = figure
+    else:
+        root = figure
+
+    snapshot = _LEGEND_OWNER_CACHE.get()
+    snapshot_key = (_CONTAINER_OWNER_SNAPSHOT_KEY, id(root))
+    if snapshot is not None:
+        entry = snapshot.get(snapshot_key)
+        if entry is not None and entry[0] is root:
+            owned = entry[1].get(id(target))
+            return owned[1] if owned is not None and owned[0] is target else None
+
+        inventory = {}
+
+        def collect(owner) -> None:
+            patch = getattr(owner, "patch", None)
+            if patch is not None:
+                inventory[id(patch)] = (patch, owner)
+            for axes in getattr(owner, "axes", []):
+                patch = getattr(axes, "patch", None)
+                if patch is not None:
+                    inventory[id(patch)] = (patch, axes)
+            for subfigure in getattr(owner, "subfigs", []):
+                collect(subfigure)
+
+        collect(root)
+        snapshot[snapshot_key] = (root, inventory)
+        owned = inventory.get(id(target))
+        return owned[1] if owned is not None and owned[0] is target else None
 
     def visit(owner):
         if target is getattr(owner, "patch", None):
@@ -655,6 +759,12 @@ class ArtistCapabilities:
 
     @property
     def editable(self) -> bool:
+        """Backward-compatible shorthand for directly movable selections.
+
+        Use ``can_select`` for selection admission and the individual
+        operation fields for actions; a selectable Artist need not move.
+        """
+
         return self.can_select and self.can_translate
 
 
@@ -863,12 +973,25 @@ class ArtistAdapter:
 
     @property
     def supported(self) -> bool:
-        return self.capabilities.editable
+        """Whether the Artist may enter selection.
+
+        Selection is intentionally independent from translation.  Property-
+        only and layout-managed Artists still need an honest selection box;
+        each mutation checks its own semantic operation at gesture start.
+        """
+
+        return self.capabilities.can_select
 
     def operation_support(
         self, operation: TransformOperation | str
     ) -> OperationSupport:
         operation = TransformOperation.coerce(operation)
+        container_geometry_operation = operation in {
+            TransformOperation.TRANSLATE,
+            TransformOperation.RESIZE_GEOMETRY,
+            TransformOperation.ROTATE,
+            TransformOperation.RIGID_ROTATE,
+        }
         if operation in {
             TransformOperation.ROTATE,
             TransformOperation.RIGID_ROTATE,
@@ -895,21 +1018,23 @@ class ArtistAdapter:
                         f"{type(layout_owner).__name__} layout and has no stable "
                         "native pivot",
                     )
+        if container_geometry_operation:
             container_owner = container_owner_for_artist(self.target)
             if container_owner is not None:
                 return OperationSupport.denied(
                     operation,
                     f"{type(self.target).__name__} is the background of "
-                    f"{type(container_owner).__name__} and cannot rotate "
-                    "independently",
+                    f"{type(container_owner).__name__} and cannot be transformed "
+                    "independently; select the container instead",
                 )
             active_layout_owner = active_layout_owner_for_artist(self.target)
             if active_layout_owner is not None:
                 return OperationSupport.denied(
                     operation,
                     f"{type(self.target).__name__} participates in active "
-                    f"{type(active_layout_owner).__name__} layout; rotation could "
-                    "move its coordinate system during draw",
+                    f"{type(active_layout_owner).__name__} layout; a draw could "
+                    "move its coordinate system after the preview. Set "
+                    "in_layout=False before transforming it independently",
                 )
         capabilities = self.capabilities
         legacy_support = {
@@ -2023,6 +2148,25 @@ class ArtistAdapter:
             f"{type(self.target).__name__} has no native rotation property"
         )
 
+    def preview_native_rotation_selection_points(self, value: float) -> np.ndarray:
+        """Measure one absolute native angle without mutating the live Artist."""
+
+        clone = copy(self.target)
+        for attribute in (
+            "_pylustrator_preview_positions",
+            "_pylustrator_preview_selection_points",
+        ):
+            try:
+                delattr(clone, attribute)
+            except AttributeError:
+                pass
+        adapter = type(self)(clone)
+        with suspend_change_recording():
+            adapter._apply_rotation(float(value))
+        return adapter.point_array(
+            adapter.clip_selection_points(adapter.selection_points())
+        )
+
     def rotation_pivot(self) -> np.ndarray:
         """Return the native-rotation anchor in display coordinates."""
 
@@ -2108,12 +2252,78 @@ class ArtistAdapter:
         ]
 
 
+class AdapterInheritancePolicy(str, Enum):
+    """Whether one adapter registration may serve Artist subclasses.
+
+    ``EXACT`` is the safe default: only the registered concrete Artist type is
+    accepted.  ``VALIDATED`` is an explicit assertion by the adapter author
+    that every subclass covered by that registration preserves the adapter's
+    geometry, mutation, snapshot, and serialization contracts.
+    """
+
+    EXACT = "exact"
+    VALIDATED = "validated"
+
+    @classmethod
+    def coerce(
+        cls, value: "AdapterInheritancePolicy | str"
+    ) -> "AdapterInheritancePolicy":
+        if isinstance(value, cls):
+            return value
+        try:
+            return cls(str(value).lower())
+        except ValueError as error:
+            choices = ", ".join(policy.value for policy in cls)
+            raise ValueError(
+                f"inheritance_policy must be one of: {choices}"
+            ) from error
+
+
+class UnsupportedSubclassAdapter(ArtistAdapter):
+    """Fail-closed adapter for a subclass without an inheritance contract."""
+
+    def __init__(
+        self,
+        target: Artist,
+        *,
+        blocked_registration: "AdapterRegistration | None" = None,
+    ):
+        super().__init__(target)
+        self.blocked_registration = blocked_registration
+
+    def operation_support(
+        self, operation: TransformOperation | str
+    ) -> OperationSupport:
+        operation = TransformOperation.coerce(operation)
+        registration = self.blocked_registration
+        if registration is None:  # pragma: no cover - registry always supplies it
+            reason = (
+                f"{type(self.target).__name__} has no validated adapter "
+                "inheritance contract"
+            )
+        else:
+            reason = (
+                f"{type(self.target).__name__} is a subclass of registered "
+                f"{registration.artist_type.__name__}, but "
+                f"{registration.adapter_type.__name__} is exact-only; register "
+                "this concrete Artist type or explicitly use validated "
+                "inheritance"
+            )
+        return OperationSupport.denied(operation, reason)
+
 @dataclass(frozen=True)
 class AdapterRegistration:
     artist_type: type
     adapter_type: type[ArtistAdapter]
     priority: int
     order: int
+    inheritance_policy: AdapterInheritancePolicy = AdapterInheritancePolicy.EXACT
+
+    def accepts(self, concrete: type) -> bool:
+        return concrete is self.artist_type or (
+            self.inheritance_policy is AdapterInheritancePolicy.VALIDATED
+            and issubclass(concrete, self.artist_type)
+        )
 
 
 class ArtistAdapterRegistry:
@@ -2122,6 +2332,7 @@ class ArtistAdapterRegistry:
     def __init__(self):
         self._registrations: list[AdapterRegistration] = []
         self._cache: dict[type, type[ArtistAdapter]] = {}
+        self._blocked_cache: dict[type, AdapterRegistration] = {}
         self._lock = RLock()
         self._next_order = 0
 
@@ -2132,6 +2343,9 @@ class ArtistAdapterRegistry:
         *,
         priority: int = 0,
         replace: bool = False,
+        inheritance_policy: AdapterInheritancePolicy | str = (
+            AdapterInheritancePolicy.EXACT
+        ),
     ) -> type[ArtistAdapter]:
         if not isinstance(artist_type, type) or not issubclass(artist_type, Artist):
             raise TypeError("artist_type must be an Artist subclass")
@@ -2139,6 +2353,7 @@ class ArtistAdapterRegistry:
             adapter_type, ArtistAdapter
         ):
             raise TypeError("adapter_type must be an ArtistAdapter subclass")
+        inheritance_policy = AdapterInheritancePolicy.coerce(inheritance_policy)
         with self._lock:
             if replace:
                 self._registrations = [
@@ -2148,11 +2363,16 @@ class ArtistAdapterRegistry:
                 ]
             self._registrations.append(
                 AdapterRegistration(
-                    artist_type, adapter_type, int(priority), self._next_order
+                    artist_type,
+                    adapter_type,
+                    int(priority),
+                    self._next_order,
+                    inheritance_policy,
                 )
             )
             self._next_order += 1
             self._cache.clear()
+            self._blocked_cache.clear()
         return adapter_type
 
     def unregister(
@@ -2170,6 +2390,7 @@ class ArtistAdapterRegistry:
                 )
             ]
             self._cache.clear()
+            self._blocked_cache.clear()
 
     def registrations(self) -> tuple[AdapterRegistration, ...]:
         with self._lock:
@@ -2184,38 +2405,62 @@ class ArtistAdapterRegistry:
             # MRO matches more specific.
             return len(concrete.mro()) + 1
 
+    def _registration_rank(
+        self, concrete: type, registration: AdapterRegistration
+    ) -> tuple[int, int, int]:
+        return (
+            self._mro_distance(concrete, registration.artist_type),
+            -registration.priority,
+            -registration.order,
+        )
+
+    def _resolve_uncached(self, concrete: type) -> type[ArtistAdapter]:
+        candidates = [
+            item
+            for item in self._registrations
+            if issubclass(concrete, item.artist_type)
+        ]
+        if not candidates:
+            raise LookupError(f"No artist adapter registered for {concrete!r}")
+        selected = min(
+            candidates,
+            key=lambda item: self._registration_rank(concrete, item),
+        )
+        if selected.accepts(concrete):
+            adapter_type = selected.adapter_type
+        else:
+            adapter_type = UnsupportedSubclassAdapter
+            self._blocked_cache[concrete] = selected
+        self._cache[concrete] = adapter_type
+        return adapter_type
+
     def resolve_type(self, target_or_type) -> type[ArtistAdapter]:
         concrete = target_or_type if isinstance(target_or_type, type) else type(target_or_type)
         with self._lock:
             cached = self._cache.get(concrete)
             if cached is not None:
                 return cached
-            matches = [
-                item
-                for item in self._registrations
-                if issubclass(concrete, item.artist_type)
-            ]
-            if not matches:
-                raise LookupError(f"No artist adapter registered for {concrete!r}")
-            selected = min(
-                matches,
-                key=lambda item: (
-                    self._mro_distance(concrete, item.artist_type),
-                    -item.priority,
-                    -item.order,
-                ),
-            )
-            self._cache[concrete] = selected.adapter_type
-            return selected.adapter_type
+            return self._resolve_uncached(concrete)
 
     def create(self, target: Artist) -> ArtistAdapter:
-        return self.resolve_type(target)(target)
+        with self._lock:
+            concrete = type(target)
+            adapter_type = self._cache.get(concrete)
+            if adapter_type is None:
+                adapter_type = self._resolve_uncached(concrete)
+            blocked_registration = self._blocked_cache.get(concrete)
+        if blocked_registration is not None:
+            return UnsupportedSubclassAdapter(
+                target,
+                blocked_registration=blocked_registration,
+            )
+        return adapter_type(target)
 
     def capabilities_for(self, target: Artist) -> ArtistCapabilities:
         return self.resolve_type(target).capabilities_for(target)
 
     def supports(self, target: Artist) -> bool:
-        return self.capabilities_for(target).editable
+        return self.capabilities_for(target).can_select
 
 
 class PatchAdapter(ArtistAdapter):
@@ -2713,6 +2958,108 @@ class EllipseAdapter(PatchAdapter):
         )
 
 
+class _CenterOnlyPatchAdapter(PatchAdapter):
+    """Conservative contract for semantic patches positioned by a center."""
+
+    default_capabilities = ArtistCapabilities(
+        can_select=True,
+        can_translate=True,
+        can_snapshot=True,
+        can_serialize=True,
+    )
+    unsupported_operation_reasons = {
+        TransformOperation.TRANSLATE: (
+            "Semantic patch translation requires an invertible affine "
+            "transform and independent layout ownership"
+        ),
+        TransformOperation.RESIZE_GEOMETRY: (
+            "Semantic patch resize requires a type-specific size contract"
+        ),
+        TransformOperation.ROTATE: (
+            "Semantic patch rotation requires a type-specific angle contract"
+        ),
+        TransformOperation.RIGID_ROTATE: (
+            "Semantic patch common-pivot rotation has not been validated"
+        ),
+    }
+
+    @classmethod
+    def capabilities_for(cls, target) -> ArtistCapabilities:
+        transform = target.get_data_transform()
+        movable = bool(
+            transform.is_affine
+            and getattr(transform, "has_inverse", True)
+            and legend_owner_for_artist(target) is None
+            and container_owner_for_artist(target) is None
+            and active_layout_owner_for_artist(target) is None
+        )
+        if movable:
+            try:
+                transform.inverted()
+            except (
+                TypeError,
+                ValueError,
+                NotImplementedError,
+                RuntimeError,
+                np.linalg.LinAlgError,
+            ):
+                movable = False
+        return ArtistCapabilities(
+            can_select=True,
+            can_translate=movable,
+            can_snapshot=movable,
+            can_serialize=True,
+        )
+
+    def native_control_points(self):
+        return [np.asarray(self.target.center, dtype=float)]
+
+    def _apply_native_control_points(self, points) -> None:
+        self.target.set_center(tuple(float(value) for value in points[0]))
+
+    def serialize_changes(self):
+        return (
+            ChangeRecord.command_change(
+                self.target,
+                f".set_center({replay_literal(tuple(self.target.center))})",
+            ),
+        )
+
+
+class ArcAdapter(_CenterOnlyPatchAdapter):
+    """Translate Arc centers without rewriting its ellipse/angle semantics."""
+
+    unsupported_operation_reasons = {
+        **_CenterOnlyPatchAdapter.unsupported_operation_reasons,
+        TransformOperation.RESIZE_GEOMETRY: (
+            "Arc resize must preserve width, height, and angular span semantics"
+        ),
+        TransformOperation.ROTATE: (
+            "Arc rotation must update its semantic angle contract"
+        ),
+        TransformOperation.RIGID_ROTATE: (
+            "Arc common-pivot rotation has not been validated"
+        ),
+    }
+
+
+class CircleAdapter(_CenterOnlyPatchAdapter):
+    """Translate Circle centers without stretching its radius semantics."""
+
+    unsupported_operation_reasons = {
+        **_CenterOnlyPatchAdapter.unsupported_operation_reasons,
+        TransformOperation.RESIZE_GEOMETRY: (
+            "Circle resize must update one semantic radius without stretching"
+        ),
+        TransformOperation.ROTATE: (
+            "Circle native rotation has no independently saveable visual effect"
+        ),
+        TransformOperation.RIGID_ROTATE: (
+            "Circle common-pivot rotation has not been validated"
+        ),
+    }
+
+
 class FancyArrowPatchAdapter(PatchAdapter):
     default_capabilities = ArtistCapabilities(
         can_select=True,
@@ -2748,6 +3095,21 @@ class ConnectionPatchAdapter(FancyArrowPatchAdapter):
 
 
 class FancyBboxPatchAdapter(PatchAdapter):
+    def operation_support(
+        self, operation: TransformOperation | str
+    ) -> OperationSupport:
+        operation = TransformOperation.coerce(operation)
+        if (
+            operation is TransformOperation.TRANSLATE
+            and legend_owner_for_artist(self.target) is not None
+        ):
+            return OperationSupport.denied(
+                operation,
+                "Legend frame geometry is owned by its layout and is recomputed "
+                "on draw; select the Legend instead",
+            )
+        return super().operation_support(operation)
+
     @classmethod
     def capabilities_for(cls, target: FancyBboxPatch) -> ArtistCapabilities:
         # BoxStyle padding and corners do not follow a display delta through a
@@ -2816,6 +3178,30 @@ class RegularPolygonAdapter(PatchAdapter):
                 self.target, f".xy = {replay_literal(self.target.xy)}"
             ),
         )
+
+
+class CirclePolygonAdapter(RegularPolygonAdapter):
+    """Exact, translation-only contract for CirclePolygon."""
+
+    unsupported_operation_reasons = {
+        TransformOperation.TRANSLATE: (
+            "CirclePolygon translation requires an invertible affine "
+            "transform and independent layout ownership"
+        ),
+        TransformOperation.RESIZE_GEOMETRY: (
+            "CirclePolygon resize must update its semantic radius"
+        ),
+        TransformOperation.ROTATE: (
+            "CirclePolygon rotation must update its semantic orientation"
+        ),
+        TransformOperation.RIGID_ROTATE: (
+            "CirclePolygon common-pivot rotation has not been validated"
+        ),
+    }
+
+    @classmethod
+    def capabilities_for(cls, target) -> ArtistCapabilities:
+        return _CenterOnlyPatchAdapter.capabilities_for(target)
 
 
 class WedgeAdapter(PatchAdapter):
@@ -3104,13 +3490,51 @@ class TextAdapter(ArtistAdapter):
             )
         if (
             operation is TransformOperation.TRANSLATE
-            and axis_tick_label_reference(self.target) is not None
+            and (
+                getattr(
+                    self.target,
+                    "_pylustrator_formatter_owned_tick_label",
+                    False,
+                )
+                or axis_tick_label_reference(self.target) is not None
+            )
         ):
             return OperationSupport.denied(
                 operation,
                 "Tick-label position is managed by its Axis; edit tick content "
                 "or Axis spacing instead of dragging the generated Text",
             )
+        if operation is TransformOperation.TRANSLATE:
+            legend_owner = legend_owner_for_text(self.target)
+            if (
+                legend_owner is not None
+                and self.target is legend_owner.get_title()
+                and (
+                    not self.target.get_visible()
+                    or not self.target.get_text().strip()
+                )
+            ):
+                return OperationSupport.denied(
+                    operation,
+                    "An empty or hidden Legend title has no stable visible "
+                    "geometry and its position is recomputed on draw",
+                )
+            layout_owner = layout_owner_for_text(self.target)
+            if isinstance(layout_owner, Axes) and bool(
+                getattr(layout_owner, "_autotitlepos", True)
+            ):
+                return OperationSupport.denied(
+                    operation,
+                    "Axes title position is managed by automatic title layout "
+                    "and is recomputed on draw; pass an explicit title y position "
+                    "before translating it independently",
+                )
+            if self.target is getattr(layout_owner, "offsetText", None):
+                return OperationSupport.denied(
+                    operation,
+                    "Axis offset-text position is formatter-owned and is "
+                    "recomputed on draw",
+                )
         return super().operation_support(operation)
 
     def appearance_state(self):
@@ -3555,6 +3979,22 @@ class AxesAdapter(ArtistAdapter):
         points = self._constrain_native_control_points(points)
         position = np.array([points[0], points[1] - points[0]]).flatten()
         self.target.set_position(position)
+
+    def snapshot(self):
+        state = super().snapshot()
+        state["in_layout"] = bool(self.target.get_in_layout())
+        return state
+
+    def restore(self, state) -> None:
+        if state.get("type") != "positions":
+            raise ValueError(
+                f"Unsupported snapshot for {type(self).__name__}: {state!r}"
+            )
+        self._apply_native_control_points(state["positions"])
+        if "in_layout" in state:
+            self.target.set_in_layout(bool(state["in_layout"]))
+        self._record_restored_state()
+        self.invalidate_geometry_cache()
 
     def serialize_changes(self):
         return (ChangeRecord.axes_change(self.target),)
@@ -6259,13 +6699,25 @@ def register_artist_adapter(
     *,
     priority: int = 0,
     replace: bool = False,
+    inheritance_policy: AdapterInheritancePolicy | str = (
+        AdapterInheritancePolicy.EXACT
+    ),
     registry: ArtistAdapterRegistry = artist_adapter_registry,
 ):
-    """Decorator for built-in or third-party adapter registration."""
+    """Decorator for built-in or third-party adapter registration.
+
+    Registrations are exact-only unless the adapter author explicitly sets
+    ``inheritance_policy=AdapterInheritancePolicy.VALIDATED`` after validating
+    the full subclass geometry, mutation, snapshot, and replay contract.
+    """
 
     def decorator(adapter_type: type[ArtistAdapter]):
         registry.register(
-            artist_type, adapter_type, priority=priority, replace=replace
+            artist_type,
+            adapter_type,
+            priority=priority,
+            replace=replace,
+            inheritance_policy=inheritance_policy,
         )
         return adapter_type
 
@@ -6278,8 +6730,13 @@ def get_artist_adapter(target: Artist) -> ArtistAdapter:
 
 # Registration order is intentionally not semantic.  Resolution uses MRO
 # distance, then priority and only then registration order for true ties.
-for _artist_type, _adapter_type in (
-    (Artist, ArtistAdapter),
+artist_adapter_registry.register(
+    Artist,
+    ArtistAdapter,
+    inheritance_policy=AdapterInheritancePolicy.VALIDATED,
+)
+
+_BUILTIN_ADAPTER_REGISTRATIONS = (
     (EditorGroup, EditorGroupAdapter),
     (Axes, AxesAdapter),
     (Text, TextAdapter),
@@ -6289,23 +6746,37 @@ for _artist_type, _adapter_type in (
     (AxesImage, AxesImageAdapter),
     (Rectangle, RectangleAdapter),
     (Ellipse, EllipseAdapter),
+    (Arc, ArcAdapter),
+    (Circle, CircleAdapter),
     (FancyArrowPatch, FancyArrowPatchAdapter),
     (ConnectionPatch, ConnectionPatchAdapter),
     (FancyBboxPatch, FancyBboxPatchAdapter),
     (RegularPolygon, RegularPolygonAdapter),
+    (CirclePolygon, CirclePolygonAdapter),
     (Wedge, WedgeAdapter),
     (Polygon, PolygonAdapter),
     (PathPatch, PathPatchAdapter),
     (PathCollection, PathCollectionAdapter),
     (LineCollection, LineCollectionAdapter),
     (PolyCollection, PolyCollectionAdapter),
-):
+)
+_fill_between_type = getattr(
+    mpl_collections, "FillBetweenPolyCollection", None
+)
+if _fill_between_type is not None:
+    _BUILTIN_ADAPTER_REGISTRATIONS += (
+        (_fill_between_type, PolyCollectionAdapter),
+    )
+
+for _artist_type, _adapter_type in _BUILTIN_ADAPTER_REGISTRATIONS:
     artist_adapter_registry.register(_artist_type, _adapter_type)
 
 
 __all__ = [
+    "AdapterInheritancePolicy",
     "AdapterRegistration",
     "AnnotationAdapter",
+    "ArcAdapter",
     "AppearanceScalePlan",
     "ArtistAdapter",
     "ArtistAdapterRegistry",
@@ -6313,6 +6784,8 @@ __all__ = [
     "AxesAdapter",
     "AxesImageAdapter",
     "ChangeRecord",
+    "CircleAdapter",
+    "CirclePolygonAdapter",
     "CollectionAdapter",
     "ConnectionPatchAdapter",
     "EllipseAdapter",
@@ -6331,6 +6804,7 @@ __all__ = [
     "RigidRotationPlan",
     "TextAdapter",
     "UnsupportedArtistError",
+    "UnsupportedSubclassAdapter",
     "WedgeAdapter",
     "artist_adapter_registry",
     "active_layout_owner_for_artist",

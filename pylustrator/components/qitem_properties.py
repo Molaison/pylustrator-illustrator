@@ -59,6 +59,10 @@ from pylustrator.legend_replay import (
 )
 from pylustrator.legend_layout import LEGEND_LAYOUT_FIELDS
 from pylustrator.change_tracker import UndoRedo, add_text_default, add_axes_default
+from pylustrator.property_transactions import (
+    PropertyPlan,
+    PropertyPreflightError,
+)
 
 
 class TextPropertiesWidget(QtWidgets.QWidget):
@@ -147,24 +151,54 @@ class TextPropertiesWidget(QtWidgets.QWidget):
 
     def selectFont(self):
         """open a font select dialog"""
+        if self.target is None or not self.label.isEnabled():
+            return
         font0 = QtGui.QFont()
         font0.setFamily(self.target.get_fontname())
         font0.setWeight(self.convertMplWeightToQtWeight(self.target.get_weight()))
         font0.setItalic(self.target.get_style() == "italic")
         font0.setPointSizeF(int(self.target.get_fontsize()))
-        font, x = QtWidgets.QFontDialog.getFont(font0, self)
+        font, accepted = QtWidgets.QFontDialog.getFont(font0, self)
+        if not accepted:
+            return
 
-        with UndoRedo(self.target_list, "Change font size"):
-            for element in self.target_list:
-                element.set_fontname(font.family())
-                if font.weight() != font0.weight():
-                    element.set_weight(self.convertQtWeightToMplWeight(font.weight()))
-                if font.pointSizeF() != font0.pointSizeF():
-                    element.set_fontsize(font.pointSizeF())
-                if font.italic() != font0.italic():
-                    element.set_style("italic" if font.italic() else "normal")
+        changes = {"fontname": font.family()}
+        if font.weight() != font0.weight():
+            changes["weight"] = self.convertQtWeightToMplWeight(font.weight())
+        if font.pointSizeF() != font0.pointSizeF():
+            changes["fontsize"] = font.pointSizeF()
+        if font.italic() != font0.italic():
+            changes["style"] = "italic" if font.italic() else "normal"
 
-        self.setTarget(self.target_list)
+        if self._commit(changes, "Change font"):
+            self.setTarget(self.target_list)
+
+    def _plan(self, changes):
+        if not self.target_list:
+            raise PropertyPreflightError(
+                "A property edit needs at least one Artist"
+            )
+        return PropertyPlan.for_selection_changes(
+            self.target_list[0], self.target_list[1:], changes
+        )
+
+    def _commit(self, changes, name: str) -> bool:
+        try:
+            plan = self._plan(changes)
+        except PropertyPreflightError:
+            return False
+        return plan.commit(name)
+
+    def _set_property_control_support(self, control, changes) -> bool:
+        try:
+            self._plan(changes)
+        except PropertyPreflightError as error:
+            control.setEnabled(False)
+            control.setToolTip(str(error))
+            return False
+        control.setEnabled(True)
+        control.setToolTip("")
+        return True
 
     def setTarget(self, element: Artist):
         """set the target artist for this widget"""
@@ -188,6 +222,35 @@ class TextPropertiesWidget(QtWidgets.QWidget):
         self.button_color.setColor(element.get_color())
 
         self.target = element
+        self._set_property_control_support(
+            self.font_size, {"fontsize": element.get_fontsize()}
+        )
+        self._set_property_control_support(
+            self.button_bold, {"weight": element.get_weight()}
+        )
+        self._set_property_control_support(
+            self.button_italic, {"style": element.get_style()}
+        )
+        self._set_property_control_support(
+            self.button_color, {"color": element.get_color()}
+        )
+        align_supported = self._set_property_control_support(
+            self.buttons_align[0], {"ha": element.get_ha()}
+        )
+        for button in self.buttons_align[1:]:
+            button.setEnabled(align_supported)
+            button.setToolTip(
+                "" if align_supported else self.buttons_align[0].toolTip()
+            )
+        self._set_property_control_support(
+            self.label,
+            {
+                "fontname": element.get_fontname(),
+                "weight": element.get_weight(),
+                "fontsize": element.get_fontsize(),
+                "style": element.get_style(),
+            },
+        )
 
     def delete(self):
         """delete the target text"""
@@ -200,38 +263,32 @@ class TextPropertiesWidget(QtWidgets.QWidget):
 
     def changeWeight(self, checked: bool):
         """set bold or normal"""
-        if self.target:
-            with UndoRedo(self.target_list, "Change weight"):
-                for element in self.target_list:
-                    element.set_weight("bold" if checked else "normal")
+        if self.target and self.button_bold.isEnabled():
+            self._commit(
+                {"weight": "bold" if checked else "normal"}, "Change weight"
+            )
 
     def changeStyle(self, checked: bool):
         """set italic or normal"""
-        if self.target:
-            with UndoRedo(self.target_list, "Change style"):
-                for element in self.target_list:
-                    element.set_style("italic" if checked else "normal")
+        if self.target and self.button_italic.isEnabled():
+            self._commit(
+                {"style": "italic" if checked else "normal"}, "Change style"
+            )
 
     def changeColor(self, color: str):
         """set the text color"""
-        if self.target:
-            with UndoRedo(self.target_list, "Change color"):
-                for element in self.target_list:
-                    element.set_color(color)
+        if self.target and self.button_color.isEnabled():
+            self._commit({"color": color}, "Change color")
 
     def changeAlign(self, align: str):
         """set the text algin"""
-        if self.target:
-            with UndoRedo(self.target_list, "Change alignment"):
-                for element in self.target_list:
-                    element.set_ha(align)
+        if self.target and all(button.isEnabled() for button in self.buttons_align):
+            self._commit({"ha": align}, "Change alignment")
 
     def changeFontSize(self, value: int):
         """set the font size"""
-        if self.target:
-            with UndoRedo(self.target_list, "Change font size"):
-                for element in self.target_list:
-                    element.set_fontsize(value)
+        if self.target and self.font_size.isEnabled():
+            self._commit({"fontsize": value}, "Change font size")
 
 
 class TextPropertiesWidget2(QtWidgets.QWidget):
@@ -914,14 +971,19 @@ class LegendPropertiesWidget(QtWidgets.QWidget):
 
 
 class QTickEdit(QtWidgets.QWidget):
-    def __init__(self, axis: str, signal_target_changed: QtCore.Signal):
+    def __init__(
+        self,
+        axis: str,
+        signal_target_changed: QtCore.Signal,
+        parent: QtWidgets.QWidget = None,
+    ):
         """A widget to change the tick properties
 
         Args:
             axis: whether to use the "x" or "y" axis
             signal_target_changed: a signal to emit when the target changed
         """
-        QtWidgets.QWidget.__init__(self)
+        QtWidgets.QWidget.__init__(self, parent, QtCore.Qt.Window)
         self.setWindowTitle("Figure - " + axis + "-Axis - Ticks - Pylustrator")
         self.setWindowIcon(
             QtGui.QIcon(
@@ -1488,7 +1550,7 @@ class QAxesProperties(QtWidgets.QWidget):
         self.button_ticks.clicked.connect(self.showTickWidget)
         self.layout.addWidget(self.button_ticks)
 
-        self.tick_edit = QTickEdit(axis, signal_target_changed)
+        self.tick_edit = QTickEdit(axis, signal_target_changed, parent=self)
 
     def showTickWidget(self):
         """open the tick edit dialog"""

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from time import monotonic
+from time import monotonic, perf_counter
 from types import SimpleNamespace
 
 import matplotlib
@@ -508,10 +508,24 @@ def test_idle_warmup_publishes_cache_before_nonblocking_gesture() -> None:
     manager._smart_guide_scene_cache = None
 
     assert schedule_smart_guide_warmup(manager, batch_budget_ms=0.25)
+    roster, _editable, _order = manager._interaction_roster_snapshot()
     deadline = monotonic() + 2.0
-    while _cached_scene_guides(manager) is None and monotonic() < deadline:
+    while (
+        (
+            _cached_scene_guides(manager) is None
+            or not manager._interaction_index.is_current(
+                revision=manager._interaction_revision,
+                source_ids=roster.source_ids,
+            )
+        )
+        and monotonic() < deadline
+    ):
         app.processEvents()
     assert _cached_scene_guides(manager) is not None
+    assert manager._interaction_index.is_current(
+        revision=manager._interaction_revision,
+        source_ids=roster.source_ids,
+    )
 
     selection, _before, raw_dx, press_x, press_y = _start_snap_drag(
         manager, moving, source
@@ -525,6 +539,130 @@ def test_idle_warmup_publishes_cache_before_nonblocking_gesture() -> None:
     manager.key_press_event(KeyEvent("key_press_event", fig.canvas, key="escape"))
     manager._smart_guide_idle_warmup_enabled = False
     selection.clear_targets()
+    plt.close(fig)
+
+
+def test_idle_warmup_publishes_hit_index_before_guides(monkeypatch) -> None:
+    fig, ax = plt.subplots(figsize=(7, 5), dpi=100)
+    for ix in range(24):
+        for iy in range(18):
+            ax.add_patch(
+                Rectangle(
+                    (ix / 24, iy / 18),
+                    0.7 / 24,
+                    0.7 / 18,
+                    linewidth=0.2,
+                )
+            )
+    fig.canvas.draw()
+    manager = _attach_manager(fig)
+    manager._smart_guide_idle_warmup_enabled = True
+    manager._smart_guide_scene_cache = None
+    roster, _editable, _order = manager._interaction_roster_snapshot()
+    queued = []
+    monkeypatch.setattr(
+        QtCore.QTimer,
+        "singleShot",
+        lambda _delay, callback: queued.append(callback),
+    )
+
+    assert schedule_smart_guide_warmup(manager, batch_budget_ms=0.25)
+    turns = 0
+    while not manager._interaction_index.is_current(
+        revision=manager._interaction_revision,
+        source_ids=roster.source_ids,
+    ):
+        assert queued
+        queued.pop(0)()
+        turns += 1
+        assert turns < 5000
+
+    pending = manager._smart_guide_pending_capture
+    assert pending is not None
+    assert _cached_scene_guides(manager) is None
+    assert pending.next_index < len(pending.artists)
+    hit_turns = turns
+
+    while _cached_scene_guides(manager) is None:
+        assert queued
+        queued.pop(0)()
+        turns += 1
+        assert turns < 5000
+    assert turns > hit_turns
+    assert manager._smart_guide_pending_capture is None
+
+    manager._smart_guide_idle_warmup_enabled = False
+    manager.selection.clear_targets()
+    plt.close(fig)
+
+
+def test_idle_warmup_makes_first_fig2_scale_hit_query_hot(monkeypatch) -> None:
+    app = QtWidgets.QApplication.instance()
+    fig, ax = plt.subplots(figsize=(7, 5), dpi=100)
+    rectangles = []
+    for ix in range(24):
+        for iy in range(18):
+            rectangles.append(
+                ax.add_patch(
+                    Rectangle(
+                        (ix / 24, iy / 18),
+                        0.7 / 24,
+                        0.7 / 18,
+                        linewidth=0.2,
+                    )
+                )
+            )
+    fig.canvas.draw()
+    manager = _attach_manager(fig)
+    manager._smart_guide_idle_warmup_enabled = True
+    manager._smart_guide_scene_cache = None
+    roster, _editable, _order = manager._interaction_roster_snapshot()
+    measured = 0
+    original_bounds = manager._interaction_index_bounds
+
+    def counted_bounds(*args, **kwargs):
+        nonlocal measured
+        measured += 1
+        return original_bounds(*args, **kwargs)
+
+    monkeypatch.setattr(manager, "_interaction_index_bounds", counted_bounds)
+    assert schedule_smart_guide_warmup(manager, batch_budget_ms=0.25)
+    # Scheduling performs no synchronous per-Artist hit-envelope work on draw.
+    assert measured == 0
+
+    deadline = monotonic() + 5.0
+    while (
+        not manager._interaction_index.is_current(
+            revision=manager._interaction_revision,
+            source_ids=roster.source_ids,
+        )
+        and monotonic() < deadline
+    ):
+        app.processEvents()
+    assert manager._interaction_index.is_current(
+        revision=manager._interaction_revision,
+        source_ids=roster.source_ids,
+    )
+    assert measured == len(roster.artists)
+
+    def unexpected_pointer_measurement(*_args, **_kwargs):
+        raise AssertionError("first pointer query rebuilt the full scene")
+
+    monkeypatch.setattr(
+        manager, "_interaction_index_bounds", unexpected_pointer_measurement
+    )
+    x, y = ax.transData.transform((0.51, 0.51))
+    event = _event(fig, "button_press_event", float(x), float(y))
+    samples = []
+    for _ in range(80):
+        started = perf_counter()
+        stack = manager.get_hit_stack(event)
+        samples.append(perf_counter() - started)
+    assert any(rectangle in stack.artists for rectangle in rectangles)
+    assert np.percentile(samples, 95) < 0.004
+
+    manager._smart_guide_idle_warmup_enabled = False
+    manager.selection.clear_targets()
     plt.close(fig)
 
 
@@ -595,6 +733,46 @@ def test_text_guides_capture_insertion_anchor_and_unrotated_baseline() -> None:
     assert len(by_artist[normal].anchors) == 1
     assert by_artist[rotated].baseline_y is None
     assert len(by_artist[rotated].anchors) == 1
+    plt.close(fig)
+
+
+def test_hit_and_guides_share_one_renderer_revision_geometry_measurement() -> None:
+    fig = plt.figure(figsize=(4, 3), dpi=100)
+    rectangle = _figure_rectangle(fig, (0.2, 0.3, 0.2, 0.2))
+    fig.canvas.draw()
+    calls = 0
+    original_get_window_extent = rectangle.get_window_extent
+
+    def counted_get_window_extent(renderer=None):
+        nonlocal calls
+        calls += 1
+        return original_get_window_extent(renderer)
+
+    rectangle.get_window_extent = counted_get_window_extent
+    manager = _attach_manager(fig)
+    x, y = fig.transFigure.transform((0.3, 0.4))
+    event = _event(fig, "button_press_event", float(x), float(y))
+
+    assert rectangle in manager.get_hit_stack(event).artists
+    _capture_scene_guides(manager)
+
+    geometry = manager._ensure_display_geometry_cache()
+    assert calls == 1
+    assert geometry.revision == manager._interaction_revision
+    assert geometry.renderer is fig.canvas.get_renderer()
+    assert geometry.roster is manager._selectable_roster_snapshot()
+
+    geometry.bind(
+        revision=manager._interaction_revision,
+        roster=manager._selectable_roster_snapshot(),
+        renderer=object(),
+    )
+    assert geometry.selection_bounds(rectangle) is not None
+    assert calls == 2
+
+    manager.invalidate_geometry_cache()
+    _capture_scene_guides(manager)
+    assert calls == 3
     plt.close(fig)
 
 

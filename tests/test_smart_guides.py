@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
+import gc
 import math
 from time import perf_counter
 
@@ -481,9 +482,22 @@ def _timed_row_build(
         )
         for index in range(source_count)
     ]
-    start = perf_counter()
-    index = _index(*sources)
-    return index, perf_counter() - start
+    # Isolate the algorithmic build from cyclic garbage accumulated by earlier
+    # Matplotlib/Qt tests in a full-suite process. Source construction is not
+    # timed; collect before the region, then restore the caller's GC policy
+    # exactly instead of weakening the performance threshold.
+    gc.collect()
+    gc_was_enabled = gc.isenabled()
+    if gc_was_enabled:
+        gc.disable()
+    try:
+        start = perf_counter()
+        index = _index(*sources)
+        elapsed = perf_counter() - start
+    finally:
+        if gc_was_enabled:
+            gc.enable()
+    return index, elapsed
 
 
 def _best_query_time(index: GuideCandidateIndex, repetitions: int = 250) -> float:

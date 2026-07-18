@@ -29,12 +29,25 @@ from matplotlib.text import Text
 from matplotlib.axes import Axes
 from qtpy import QtCore, QtGui, QtWidgets
 from .helper_functions import main_figure
+from .property_transactions import (
+    PropertyOperation,
+    PropertyPlan,
+    PropertyPreflightError,
+)
+from .replay import replay_literal
 
 
 class Linkable:
     """a class that automatically links a widget with the property of a matplotlib artist"""
 
     editingFinished = QtCore.Signal()
+
+    @staticmethod
+    def _selection_targets(fig):
+        selection = getattr(fig, "selection", None)
+        if selection is None:
+            selection = getattr(getattr(fig, "figure_dragger", None), "selection", None)
+        return tuple(getattr(selection, "targets", ()))
 
     def link(
         self,
@@ -200,8 +213,28 @@ class Linkable:
         """set the target for the widget"""
         self.element = element
         try:
-            self.set(self.getLinkedProperty())
-            self.setEnabled(self.condition(element))
+            current = self.getLinkedProperty()
+            self.set(current)
+            enabled = bool(self.condition(element))
+            if enabled and not self.direct:
+                fig = (
+                    element
+                    if isinstance(element, mpl.figure.Figure)
+                    else main_figure(element)
+                )
+                try:
+                    PropertyPlan.for_selection(
+                        element,
+                        self._selection_targets(fig),
+                        self.property_name,
+                        current,
+                    )
+                except PropertyPreflightError as error:
+                    enabled = False
+                    self.setToolTip(str(error))
+                else:
+                    self.setToolTip("")
+            self.setEnabled(enabled)
         except (AttributeError, TypeError, ValueError):
             self.hide()
         else:
@@ -218,11 +251,12 @@ class Linkable:
 
     def updateLink(self):
         """update the linked property"""
+        if self.element is None or not self.isEnabled():
+            return
         if isinstance(self.element, mpl.figure.Figure):
             fig = self.element
         else:
             fig = main_figure(self.element)
-        tracker = fig.change_tracker
 
         # Tick-label text is owned by an Axis formatter.  Treating it as an
         # ordinary Text property appears to work until canvas.draw(), which
@@ -247,61 +281,43 @@ class Linkable:
                     self.last_text = self.input1.text()
                 return
 
-        capture = getattr(tracker, "capture_recording_state", None)
-        recording_before = capture() if capture is not None else None
-        old_value = self.getLinkedPropertyAll()
-
+        value = self.get()
         try:
-            elements = self.setLinkedProperty(self.get())
-        except AttributeError:
+            if self.direct:
+                # Direct attribute links are rare (currently Axis labelpad),
+                # but they still use the same atomic state/recording/history
+                # boundary as ordinary set_* properties.
+                replay_literal(value)
+                operation = PropertyOperation(
+                    owner=self.element,
+                    target=self.element,
+                    property_name=self.property_name,
+                    getter=self.getLinkedProperty,
+                    setter=lambda new_value: self.setLinkedProperty(new_value),
+                    requested_value=value,
+                    command_factory=lambda actual: (
+                        f".{self.property_name} = {replay_literal(actual)}"
+                    ),
+                )
+                plan = PropertyPlan(fig, (operation,))
+            else:
+                plan = PropertyPlan.for_selection(
+                    self.element,
+                    self._selection_targets(fig),
+                    self.property_name,
+                    value,
+                )
+        except PropertyPreflightError:
+            # Selection may have changed between target display and the Qt
+            # editingFinished event.  Revert the editor instead of inventing a
+            # command or partially changing the still-selected primary.
+            self.set(self.getLinkedProperty())
+            self.setEnabled(False)
             return
 
-        new_value = self.getLinkedPropertyAll()
-
-        def save_change(element):
-            if isinstance(element, mpl.figure.Figure):
-                fig = element
-            else:
-                fig = main_figure(element)
-
-            if isinstance(element, Text):
-                fig.change_tracker.addNewTextChange(element)
-            else:
-                fig.change_tracker.addChange(
-                    element, self.serializeLinkedProperty(self.getSerialized(element))
-                )
-
-        if (
-            self.property_name == "xlim"
-            or self.property_name == "ylim"
-            or self.property_name == "xlabel"
-            or self.property_name == "ylabel"
-        ):
-
-            def save_change(element):
-                element.figure.change_tracker.addNewAxesChange(element)
-
-        def apply(values, recording_state):
-            for elem, property_name, value in values:
-                getattr(elem, "set_" + property_name, lambda x: None)(value)
-                if recording_state is None:
-                    save_change(elem)
-            restore_recording = getattr(tracker, "restore_recording_state", None)
-            if recording_state is not None and restore_recording is not None:
-                restore_recording(recording_state)
-
-        def undo():
-            apply(old_value, recording_before)
-
-        def redo():
-            apply(new_value, recording_after)
-
-        for element in elements:
-            save_change(element)
-        recording_after = capture() if capture is not None else None
-        fig.change_tracker.addEdit([undo, redo, "Change property"])
-        fig.canvas.draw()
-        main_figure(self.element).signals.figure_selection_property_changed.emit()
+        plan.commit("Change property")
+        if hasattr(self, "last_text"):
+            self.last_text = self.input1.text()
 
     def set(self, value):
         """set the value (to be overloaded)"""

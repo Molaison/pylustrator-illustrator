@@ -22,12 +22,12 @@ editor must preserve semantic figure structure and reproducible Python output.
 
 Implementation order follows architectural dependencies.
 
-Status (2026-07-16): implemented on
-``refactor/artist-adapter-architecture``.  The P0 implementation is covered by
-712 passing tests, 147 explicit capability-branch skips, no xfails, Ruff, the
-full Fig2 interaction probe, and a read-only smoke replay of
-the unmodified formal Fig2.  The formal file retained SHA-256
-``b0cd72abf3962cd6cd2354467ad57aa37ecc213332645d7cb56e6f4af598ad70``.
+Status (2026-07-18): implemented on
+``codex/p0-correctness-performance``. The current implementation is covered by
+1,187 passing tests, 178 explicit skips, no strict xfails, Ruff, the full Fig2
+interaction probe, and a read-only smoke replay of the unmodified formal Fig2.
+The formal file retained SHA-256
+``aba67bbd663fd16da535aa30d43f607c7205d096455f44544e518607cdce2dbb``.
 
 Manual Fig2 follow-up found two Legend-specific violations and added them to
 the P0 invariants.  Selection and alignment now use the union of visible
@@ -111,6 +111,31 @@ before any Artist, change record, selection, or undo state mutates. Legend is
 explicitly exempt from its container-level clip metadata because Matplotlib
 draws the frame, handles, and texts as independent children.
 
+The 2026-07-18 correctness/performance closeout completed four cross-cutting
+foundations. Hit filtering, marquee selection, selection overlays, and Smart
+Guides now consume one revisioned display-geometry service with a shared live
+Artist roster; draw/structure revisions invalidate it and removed Artists are
+pruned before they can become ghost hits. Bring Forward/Backward and Send to
+Front/Back now operate on the stable paint order inside the correct owner,
+including equal-z-order siblings, and update hit order through one atomic,
+replayable transaction. Finally, the embedded Qt lifecycle is idempotent:
+close/reopen and Figure replacement tear down managers, timers, callbacks, and
+per-Figure history UI without hidden top-level windows, while the source
+Figure's default key handler is suspended only while the editor owns it.
+
+Translation, resize, and native-rotation transactions now freeze immutable
+absolute display/native destinations. Commit revalidates every selected source,
+adapter-specific storage token, EditorGroup membership, transform, viewport,
+clip, and layout before taking a rollback snapshot or touching history; a stale
+member rejects the complete selection with zero mutation. Zero translation,
+identity resize, and full-turn native rotation remain strict no-ops. Matplotlib
+layout ownership is also an explicit capability boundary: automatic Axes and
+Figure/SubFigure titles, Axis offset text, constrained-layout labels and bbox
+extras, Legend layout-only geometry, and container backgrounds reject before
+the draw-time owner can pull them away from the preview. Stable manual titles,
+ordinary Legend children, and layout-independent labels retain their exact
+editing paths.
+
 ### P0.1 Selection kernel
 
 - Add an ordered hit stack rather than returning only one picked Artist.
@@ -187,7 +212,7 @@ safely.
 
 ## P1: Illustrator productivity
 
-Foundation status (2026-07-15): visible/preview bounds are now explicit and
+Foundation status (2026-07-18): visible/preview bounds are now explicit and
 separate from transformable geometry. Patch, Line2D, and collection adapters
 include common-case per-item stroke/marker envelopes. Geometry
 resize reapplies fixed display-space appearance outsets, so thick-stroke
@@ -486,38 +511,48 @@ selection-specific exact equal-gap index is about ``10.1 ms``, and later queries
 are ``0.089 ms`` median. Preview application succeeds before a plan is exposed
 or drawn, so a failed adapter cannot leave an overlay ahead of real geometry.
 
-The combined repository suite now passes 1,019 tests with 147 explicit skips.
+The same bounded idle turns now build the conservative hit index incrementally
+and publish it only when complete. On the current Fig2 fork, the first hit after
+idle warmup fell from ``49.72/52.12 ms`` median/p95 to
+``0.445/0.553 ms``; warm dense hits remain below ``4 ms`` p95. Invalidation
+remains about ``3.46 ms`` and performs no renderer measurement. Idle slices
+measured ``4.16/5.04/7.50 ms`` median/p95/max, below one 60 Hz frame, while
+unmeasured Artists remain conservative native-hit candidates.
+
+Within those same slices, hit envelopes are now completed before the remaining
+Smart Guide capture. This reduced the real-Fig2 time-to-published-hit-index from
+``126.27 ms`` to ``66.89 ms`` without delaying Guide completion. Before the
+atomic index is ready, the conservative dense-point scan improves from
+``41.80 ms`` immediately to ``22.82 ms`` partway through capture; after publish
+it is ``1.88 ms``. All three stages return the identical eight-object hit stack
+without synchronous pointer-side bounds measurement.
+
+The combined repository suite now passes 1,187 tests with 178 explicit skips.
 Matplotlib 3.8.4 / NumPy 1.23.5 passes the 87 new and directly related tests.
 A read-only real-Fig2 fork produced edge/center hits, one atomic history item,
 ``2.27e-13 px`` preview/commit error, and zero Undo/Redo error. The formal Fig2
 remained byte-identical at SHA-256
 ``aba67bbd663fd16da535aa30d43f607c7205d096455f44544e518607cdce2dbb``.
 
-Remaining feature work:
+The shared per-revision display-geometry service is complete. It now supplies
+the conservative hit index, marquee bounds, selection geometry, and Smart Guide
+capture from the same revision and live roster; the remaining work starts after
+that common cache boundary.
 
-- Direct path/endpoint editing and inline text editing.
-- Content-following cached drag previews; selection outlines are fast, but
-  complex rendered content should follow the pointer without a full redraw.
-- A renderer-faithful paint-envelope policy for miter/cap joins, path effects,
-  compound clip holes, and non-bbox source geometry; current axial stroke
-  padding and clip-envelope polygon intersection are intentionally not
-  advertised as exact raster coverage for every Matplotlib renderer effect.
+Next implementation sequence, with no interaction-latency regression allowed:
 
-Next optimization sequence, with no interaction-latency regression allowed:
-
-1. Merge hit-test bounds, selection geometry, and Smart Guide capture behind a
-   shared per-revision display-geometry service. The current idle capture keeps
-   the pointer path fast, but a cold Fig2 still measures similar renderer state
-   separately for hit and guide indexes.
-2. Add content-following cached previews with an explicit memory budget,
+1. Add content-following cached previews with an explicit memory budget,
    invalidation token, and automatic analytic fallback for large Artists.
-3. Define renderer-faithful paint envelopes before broadening transforms to
+2. Define renderer-faithful paint envelopes before broadening transforms to
    effects, compound clips, and non-bbox geometry.
-4. Build Direct Selection path/endpoint editing and inline text editing on the
+3. Build Direct Selection path/endpoint editing and inline text editing on the
    same plan/transaction boundary; do not mutate raw arrays directly from UI
    code.
-5. Only then add semantic duplicate/copy/paste and style transfer, using stable
-   locators rather than copying Matplotlib ownership links.
+4. Add semantic duplicate/copy/paste, Select Same, and style transfer using
+   stable locators rather than copying Matplotlib ownership links.
+5. Add workflow breadth only after those edit contracts are stable: rulers,
+   persistent guides/grids, zoom/pan shortcuts, templates, and scientific-role
+   protection.
 
 Performance gates for each item are: pointer press no slower than the legacy
 path, first preview below one 60 Hz frame on the Fig2 fixture, warm preview/query
@@ -526,7 +561,8 @@ preview/commit/Undo geometry within ``0.25 px``.
 
 ## P2: workflow breadth
 
-- Duplicate/copy/paste, Select Same, style copy, and complete z-order actions.
+- True paint-order Send to Front/Back and Bring Forward/Backward are complete.
+- Duplicate/copy/paste, Select Same, and style copy remain to be implemented.
 - Rulers, guides, grids, familiar zoom/pan shortcuts, and panel templates.
 - Scientific roles and protection for panels, labels, legends, annotations, and
   data marks.

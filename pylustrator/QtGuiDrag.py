@@ -60,8 +60,31 @@ sys.excepthook = my_excepthook
 figures = {}
 app = None
 keys_for_lines = {}
+old_pltshow = plt.show
+old_pltfigure = plt.figure
+setting_use_global_variable_names = False
 
 no_save_allowed = False
+
+
+def _ensure_application():
+    """Return the live Qt application instead of trusting a stale global."""
+
+    global app
+    current = QtWidgets.QApplication.instance()
+    if current is None:
+        current = QtWidgets.QApplication(sys.argv)
+    app = current
+    return current
+
+
+def _restore_matplotlib_entry_points() -> None:
+    """Undo only pylustrator's own temporary pyplot replacements."""
+
+    if plt.show is show:
+        plt.show = old_pltshow
+    if plt.figure is figure:
+        plt.figure = old_pltfigure
 
 
 def initialize(
@@ -159,8 +182,7 @@ def initialize(
     if use_exception_silencer:
         swallow_get_exceptions()
 
-    if app is None:
-        app = QtWidgets.QApplication(sys.argv)
+    _ensure_application()
     if plt.show is not show:
         old_pltshow = plt.show
     if plt.figure is not figure:
@@ -188,81 +210,157 @@ def initialize(
         Figure.savefig = savefig
 
 
-def pyl_show(hide_window: bool = False):
-    """the function overloads the matplotlib show function.
-    It opens a DragManager window instead of the default matplotlib window.
+def _managed_figures():
+    return [
+        manager.canvas.figure
+        for manager in _pylab_helpers.Gcf.figs.copy().values()
+    ]
+
+
+def _live_window(figure):
+    window = getattr(figure, "window", None)
+    manager = getattr(figure, "figure_dragger", None)
+    structure_matches = getattr(manager, "figure_structure_matches", None)
+    if (
+        isinstance(window, PlotWindow)
+        and not getattr(window, "_deactivated", False)
+        and window.owns_figure(figure)
+        and manager is not None
+        and callable(structure_matches)
+        and structure_matches()
+    ):
+        return window
+    return None
+
+
+def _deactivate_stale_figure_windows(managed_figures) -> None:
+    """Tear down shared windows before rebuilding any attached Figure.
+
+    A window owns one or more Figure sessions.  Rebuilding one stale Figure
+    while iterating that window would deactivate sessions already prepared
+    earlier in the same pass, so stale ownership must be resolved up front.
     """
-    global figures, app
-    # set an application id, so that windows properly stacks them in the task bar
-    if sys.platform[:3] == "win":
-        import ctypes
 
-        myappid = "rgerum.pylustrator"  # arbitrary string
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
+    stale_windows = {
+        window
+        for figure in managed_figures
+        if isinstance((window := getattr(figure, "window", None)), PlotWindow)
+        and not getattr(window, "_deactivated", False)
+        and _live_window(figure) is None
+    }
+    for window in stale_windows:
+        window.deactivate()
 
-    if app is None:
-        app = QtWidgets.QApplication(sys.argv)
-    # iterate over figures
-    window = PlotWindow()
-    for figure_number in _pylab_helpers.Gcf.figs.copy():
-        fig = _pylab_helpers.Gcf.figs[figure_number].canvas.figure
 
-        # get variable names that point to this figure
-        # if setting_use_global_variable_names:
-        #    setFigureVariableNames(figure_number)
-        # get the window
-        # window = _pylab_helpers.Gcf.figs[figure].canvas.window_pylustrator
-        # warn about ticks not fitting tick labels
-        warnAboutTicks(fig)
-        # add dragger
-        DragManager(fig, no_save_allowed)
-        init_figure(fig)
-        window.setFigure(fig)
-        window.addFigure(fig)
+def _prepare_figure(window, figure, *, source_stack_position=None):
+    """Attach one Figure to one window exactly once."""
+
+    current_window = getattr(figure, "window", None)
+    if not isinstance(current_window, PlotWindow) or getattr(
+        current_window, "_deactivated", False
+    ):
+        current_window = None
+    if current_window is not None and current_window is not window:
+        current_window.deactivate()
+
+    owns_figure = getattr(window, "owns_figure", lambda _figure: False)
+    manager = getattr(figure, "figure_dragger", None)
+    if owns_figure(figure) and manager is not None:
+        window.setFigure(figure)
         window.update()
-        # and show it
-        if hide_window is False:
-            window.show()
-    if hide_window is False:
-        # execute the application
-        app.exec_()
+        return manager
+
+    window.setFigure(figure)
+    init_figure(figure)
+    warnAboutTicks(figure)
+    manager = DragManager(
+        figure,
+        no_save_allowed,
+        source_stack_position=source_stack_position,
+    )
+    configure = getattr(window, "configure_figure_manager", None)
+    if configure is not None:
+        configure(figure)
+    window.update()
+    return manager
+
+
+def _set_windows_app_id() -> None:
+    if sys.platform[:3] != "win":
+        return
+    import ctypes
+
+    myappid = "rgerum.pylustrator"  # arbitrary string
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
+
+
+def pyl_show(hide_window: bool = False):
+    """Open all pyplot figures in one reusable Pylustrator window."""
+
+    source_stack_position = traceback.extract_stack()[-2]
+    _set_windows_app_id()
+    application = _ensure_application()
+    managed_figures = _managed_figures()
+    if not managed_figures:
+        return None
+
+    _deactivate_stale_figure_windows(managed_figures)
+
+    existing_windows = {
+        window
+        for figure in managed_figures
+        if (window := _live_window(figure)) is not None
+    }
+    window = (
+        next(iter(existing_windows))
+        if len(existing_windows) == 1
+        else PlotWindow()
+    )
+    for figure in managed_figures:
+        _prepare_figure(
+            window,
+            figure,
+            source_stack_position=source_stack_position,
+        )
+        window.addFigure(figure)
+    if not hide_window:
+        window.show()
+        application.exec_()
+    return window
 
 
 def show(hide_window: bool = False):
     """the function overloads the matplotlib show function.
     It opens a DragManager window instead of the default matplotlib window.
     """
-    global figures
-    # set an application id, so that windows properly stacks them in the task bar
-    if sys.platform[:3] == "win":
-        import ctypes
-
-        myappid = "rgerum.pylustrator"  # arbitrary string
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
-    # iterate over figures
-    for figure in _pylab_helpers.Gcf.figs.copy():
-        # get variable names that point to this figure
-        if setting_use_global_variable_names:
-            setFigureVariableNames(figure)
-        # get the window
-        # window = _pylab_helpers.Gcf.figs[figure].canvas.window_pylustrator
-        window = PlotWindow()
-        window.setFigure(_pylab_helpers.Gcf.figs[figure].canvas.figure)
-        # warn about ticks not fitting tick labels
-        warnAboutTicks(window.fig)
-        # add dragger
-        DragManager(_pylab_helpers.Gcf.figs[figure].canvas.figure, no_save_allowed)
-        init_figure(_pylab_helpers.Gcf.figs[figure].canvas.figure)
-        window.update()
-        # and show it
-        if hide_window is False:
-            window.show()
-    if hide_window is False:
-        # execute the application
-        app.exec_()
-
-    plt.show = old_pltshow
-    plt.figure = old_pltfigure
+    source_stack_position = traceback.extract_stack()[-2]
+    _set_windows_app_id()
+    application = _ensure_application()
+    windows = []
+    try:
+        managed_entries = tuple(_pylab_helpers.Gcf.figs.copy().items())
+        _deactivate_stale_figure_windows(
+            [manager.canvas.figure for _number, manager in managed_entries]
+        )
+        for figure_number, manager in managed_entries:
+            if setting_use_global_variable_names:
+                setFigureVariableNames(figure_number)
+            figure = manager.canvas.figure
+            window = _live_window(figure) or PlotWindow()
+            _prepare_figure(
+                window,
+                figure,
+                source_stack_position=source_stack_position,
+            )
+            if window not in windows:
+                windows.append(window)
+            if not hide_window:
+                window.show()
+        if windows and not hide_window:
+            application.exec_()
+        return windows
+    finally:
+        _restore_matplotlib_entry_points()
 
 
 class CmapColor(list):
@@ -355,7 +453,7 @@ def warnAboutTicks(fig):
 """ Window """
 
 
-class Signals(QtWidgets.QWidget):
+class Signals(QtCore.QObject):
     figure_changed = QtCore.Signal(Figure)
     canvas_changed = QtCore.Signal(object)
     figure_size_changed = QtCore.Signal()
@@ -370,14 +468,11 @@ class PlotWindow(QtWidgets.QWidget):
     fig = None
     update_changes_signal = QtCore.Signal(bool, bool, str, str)
 
-    def setFigure(self, figure):
-        if self.fig is not None:
-            self.fig.window = None
-            self.fig.signals = None
+    def owns_figure(self, figure) -> bool:
+        return self.plot_layout.canvas_canvas.has_figure(figure)
+
+    def configure_figure_manager(self, figure) -> None:
         figure.no_figure_dragger_selection_update = False
-        self.fig = figure
-        self.fig.window = self
-        self.fig.signals = self.signals
         if getattr(figure, "_pylustrator_initial_dpi", None) is None:
             figure._pylustrator_initial_dpi = figure.get_dpi()
         selection = getattr(figure, "selection", None)
@@ -389,20 +484,42 @@ class PlotWindow(QtWidgets.QWidget):
                 self.marquee_select_containers_only
             )
             dragger.set_selection_mode(self.selection_mode)
-        self.updateSelectionControls()
+
+    def setFigure(self, figure):
+        if self._deactivated:
+            raise RuntimeError("Cannot attach a Figure to a closed PlotWindow")
+        already_current = self.fig is figure and self.owns_figure(figure)
+        if not already_current:
+            self._unbind_current_tracker()
+        self.fig = figure
+        if figure not in self._owned_figures:
+            self._owned_figures.append(figure)
+        figure.window = self
+        figure.signals = self.signals
+        if already_current:
+            self.configure_figure_manager(figure)
+            self._bind_current_tracker()
+            self.updateSelectionControls()
+            return
         self.signals.figure_changed.emit(figure)
+        self.configure_figure_manager(figure)
+        self._bind_current_tracker()
+        self.updateSelectionControls()
 
     def setCanvas(self, canvas):
         self.canvas = canvas
         self.canvas.window_pylustrator = self
 
     def addFigure(self, figure):
+        if figure in self.figures:
+            return
         self.figures.append(figure)
 
         undo_act = QAction(f"Figure {figure.number}", self)
 
         def undo():
             self.setFigure(figure)
+            self.update()
 
         undo_act.triggered.connect(undo)
         self.menu_edit.addAction(undo_act)
@@ -446,7 +563,7 @@ class PlotWindow(QtWidgets.QWidget):
 
         self.redo_act = QAction("Redo", self)
         self.redo_act.triggered.connect(self.redo)
-        self.redo_act.setShortcut("Ctrl+Y")
+        self.redo_act.setShortcuts(["Ctrl+Y", "Ctrl+Shift+Z"])
         file_menu.addAction(self.redo_act)
 
         delete_act = QAction("Delete", self)
@@ -526,12 +643,16 @@ class PlotWindow(QtWidgets.QWidget):
         super().__init__()
 
         self.figures = []
+        self._owned_figures = []
+        self._bound_tracker = None
+        self._deactivated = False
         self._initial_layout_applied = False
         self.fast_drag_preview = True
         self.marquee_select_containers_only = False
         self.selection_mode = SelectionMode.OBJECT
+        self.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
 
-        self.signals = Signals()
+        self.signals = Signals(self)
         self.signals.canvas_changed.connect(self.setCanvas)
         self.signals.figure_selection_property_changed.connect(
             self.selectionProperyChanged
@@ -565,6 +686,7 @@ class PlotWindow(QtWidgets.QWidget):
         layout_top_bar.addWidget(button_redo)
 
         def updateChangesSignal(undo, redo, undo_text, redo_text):
+            self.updateTitle()
             button_undo.setDisabled(undo)
             self.undo_act.setDisabled(undo)
             if undo_text != "":
@@ -893,36 +1015,33 @@ class PlotWindow(QtWidgets.QWidget):
 
     def update(self):
         """update the tree view"""
-
-        # self.input_size.setValue(np.array(self.fig.get_size_inches()) * 2.54)
-
-        def wrap(func):
-            def newfunc(element, event=None):
-                self.fig.no_figure_dragger_selection_update = True
-                self.signals.figure_element_selected.emit(element)
-                ret = func(element, event)
-                self.fig.no_figure_dragger_selection_update = False
-                return ret
-
-            return newfunc
-
-        self.fig.figure_dragger.on_select = wrap(self.fig.figure_dragger.on_select)
-        self.fig.change_tracker.update_changes_signal = self.update_changes_signal
-        self.update_changes_signal.emit(True, True, "", "")
-
-        def wrap(func):
-            def newfunc(*args):
-                self.updateTitle()
-                return func(*args)
-
-            return newfunc
-
-        self.fig.change_tracker.addChange = wrap(self.fig.change_tracker.addChange)
-        self.fig.change_tracker.save = wrap(self.fig.change_tracker.save)
+        self._bind_current_tracker()
         self.signals.figure_element_selected.emit(self.fig)
+
+    def _unbind_current_tracker(self) -> None:
+        tracker = self._bound_tracker
+        if tracker is not None:
+            tracker.update_changes_signal = None
+        self._bound_tracker = None
+
+    def _bind_current_tracker(self) -> bool:
+        if self.fig is None:
+            return False
+        tracker = getattr(self.fig, "change_tracker", None)
+        if tracker is None or tracker is self._bound_tracker:
+            return False
+        self._unbind_current_tracker()
+        tracker.update_changes_signal = self.update_changes_signal
+        self._bound_tracker = tracker
+        refresh = getattr(tracker, "changeCountChanged", None)
+        if callable(refresh):
+            refresh()
+        return True
 
     def updateTitle(self):
         """update the title of the window to display if it is saved or not"""
+        if self.fig is None:
+            return
         if self.fig.change_tracker.saved:
             self.setWindowTitle("Figure %s - Pylustrator" % self.fig.number)
         else:
@@ -930,13 +1049,23 @@ class PlotWindow(QtWidgets.QWidget):
 
     def closeEvent(self, event: QtCore.QEvent):
         """when the window is closed, ask the user to save"""
-        if self.fig is None:
+        if self._deactivated:
+            event.accept()
             return
-        if not self.fig.change_tracker.saved and not no_save_allowed:
+        dirty_figures = []
+        for figure in self._owned_figures:
+            tracker = getattr(figure, "change_tracker", None)
+            if (
+                tracker is not None
+                and not getattr(tracker, "saved", True)
+                and not getattr(tracker, "no_save", no_save_allowed)
+            ):
+                dirty_figures.append(figure)
+        for figure in dirty_figures:
             reply = QtWidgets.QMessageBox.question(
                 self,
                 "Warning - Pylustrator",
-                "The figure has not been saved. "
+                f"Figure {figure.number} has not been saved. "
                 "All data will be lost.\nDo you want to save it?",
                 QtWidgets.QMessageBox.Cancel
                 | QtWidgets.QMessageBox.No
@@ -946,6 +1075,42 @@ class PlotWindow(QtWidgets.QWidget):
 
             if reply == QtWidgets.QMessageBox.Cancel:
                 event.ignore()
+                return
             if reply == QtWidgets.QMessageBox.Yes:
-                self.fig.change_tracker.save()
-                # app.clipboard().setText("\r\n".join(output))
+                figure.change_tracker.save()
+        self.deactivate()
+        event.accept()
+
+    def deactivate(self) -> bool:
+        """Release every Figure, callback, and Qt canvas owned by this window."""
+
+        if self._deactivated:
+            return False
+        self._deactivated = True
+        self.hide()
+
+        self._unbind_current_tracker()
+
+        owned_figures = tuple(self._owned_figures)
+        for figure in owned_figures:
+            if getattr(figure, "window", None) is self:
+                figure.window = None
+            if getattr(figure, "signals", None) is self.signals:
+                figure.signals = None
+            manager = getattr(figure, "figure_dragger", None)
+            if manager is not None:
+                manager.deactivate(redraw=False)
+                if getattr(figure, "figure_dragger", None) is manager:
+                    figure.figure_dragger = None
+                if getattr(figure, "selection", None) is getattr(
+                    manager, "selection", None
+                ):
+                    figure.selection = None
+            figure._pyl_graphics_scene_snapparent = None
+
+        self.plot_layout.release_figures()
+        self.canvas = None
+        self.fig = None
+        self.figures.clear()
+        self._owned_figures.clear()
+        return True

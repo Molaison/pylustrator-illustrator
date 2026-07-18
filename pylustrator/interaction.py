@@ -55,6 +55,23 @@ class HitStack:
 
 
 @dataclass(frozen=True)
+class HitResolution:
+    """One immutable interpretation of a pointer event's visual hit stack.
+
+    ``raw_leaf`` exposes the foreground editable Artist for legacy callers,
+    while ``target`` is the only object canvas selection and dragging may use.
+    Keeping both values in one result prevents a later raw-Artist lookup from
+    bypassing grouping or isolation policy.
+    """
+
+    hit_stack: HitStack
+    raw_leaf: Optional[Artist]
+    candidates: tuple[Artist, ...]
+    target: Optional[Artist]
+    blocked: bool
+
+
+@dataclass(frozen=True)
 class SelectionScope:
     """One entered logical group in the isolation stack."""
 
@@ -176,6 +193,15 @@ class SelectionKernel:
         wrap: bool = False,
     ) -> Optional[Artist]:
         candidates = self.candidates(hit_stack)
+        return self._pick_candidate(candidates, cycle_from=cycle_from, wrap=wrap)
+
+    @staticmethod
+    def _pick_candidate(
+        candidates: tuple[Artist, ...],
+        *,
+        cycle_from: Optional[Artist] = None,
+        wrap: bool = False,
+    ) -> Optional[Artist]:
         if not candidates:
             return None
         if cycle_from is None or cycle_from not in candidates:
@@ -184,6 +210,43 @@ class SelectionKernel:
         if index < len(candidates):
             return candidates[index]
         return candidates[0] if wrap else None
+
+    def resolve(
+        self,
+        hit_stack: HitStack,
+        *,
+        cycle_from: Optional[Artist] = None,
+        wrap: bool = False,
+    ) -> HitResolution:
+        """Resolve one already-built stack without performing another hit test."""
+
+        root = self.scope_root
+        raw_leaf = None
+        raw_barrier = False
+        for candidate in hit_stack:
+            if not self._in_scope(candidate.artist):
+                continue
+            if root is not None and candidate.artist is root:
+                continue
+            if not candidate.editable:
+                raw_barrier = True
+                break
+            raw_leaf = candidate.artist
+            break
+
+        candidates = self.candidates(hit_stack)
+        target = self._pick_candidate(
+            candidates,
+            cycle_from=cycle_from,
+            wrap=wrap,
+        )
+        return HitResolution(
+            hit_stack=hit_stack,
+            raw_leaf=raw_leaf,
+            candidates=candidates,
+            target=target,
+            blocked=bool(raw_barrier or (raw_leaf is not None and not candidates)),
+        )
 
     def map_artists(self, artists: Iterable[Artist]) -> list[Artist]:
         """Resolve an unordered marquee result through the active tool mode."""
@@ -222,6 +285,7 @@ class SelectionKernel:
 
 __all__ = [
     "HitCandidate",
+    "HitResolution",
     "HitStack",
     "SelectionKernel",
     "SelectionMode",

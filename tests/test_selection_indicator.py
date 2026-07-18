@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import gc
+from time import perf_counter
 from types import SimpleNamespace
+import weakref
 
 import matplotlib
 
@@ -30,7 +33,9 @@ from matplotlib.transforms import IdentityTransform
 from qtpy import QtCore, QtGui, QtWidgets
 
 from pylustrator.artist_adapters import (
+    PolygonAdapter,
     UnsupportedArtistError,
+    artist_adapter_registry,
     selection_geometry_snapshot,
 )
 from pylustrator.components.plot_layout import (
@@ -104,10 +109,21 @@ class ChangeTracker:
         self.change_count = 0
         self.edits = []
         self.changes = []
+        self.last_edit = -1
+        self.saved = True
 
     def addEdit(self, edit):
         self.edit = edit
         self.edits.append(edit)
+        self.last_edit = len(self.edits) - 1
+
+    def capture_recording_state(self):
+        return list(self.changes), bool(self.saved)
+
+    def restore_recording_state(self, state):
+        changes, saved = state
+        self.changes = list(changes)
+        self.saved = bool(saved)
 
     def addNewLegendChange(self, target):
         self.legend_change_count += 1
@@ -318,6 +334,48 @@ def test_hit_stack_is_front_to_back_and_exposes_all_overlapping_candidates() -> 
     assert app is not None
 
 
+def test_pointer_press_uses_one_resolution_and_foreground_wins_old_selection() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    lower = ax.add_patch(Rectangle((0.2, 0.2), 0.6, 0.6, zorder=2))
+    upper = ax.add_patch(Rectangle((0.2, 0.2), 0.6, 0.6, zorder=5))
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_element(lower)
+    x, y = ax.transData.transform((0.5, 0.5))
+    press = MouseEvent("button_press_event", fig.canvas, x, y, button=1)
+    release = MouseEvent("button_release_event", fig.canvas, x, y, button=1)
+
+    calls = {"hit_stack": 0, "lower_contains": 0}
+    original_get_hit_stack = manager.get_hit_stack
+    original_lower_contains = lower.contains
+
+    def counted_hit_stack(event):
+        calls["hit_stack"] += 1
+        return original_get_hit_stack(event)
+
+    def counted_lower_contains(event):
+        calls["lower_contains"] += 1
+        return original_lower_contains(event)
+
+    def forbidden_legacy_pick(*_args, **_kwargs):
+        raise AssertionError("pointer press must not perform a second raw-leaf lookup")
+
+    manager.get_hit_stack = counted_hit_stack
+    manager.get_picked_element = forbidden_legacy_pick
+    lower.contains = counted_lower_contains
+
+    manager.button_press_event0(press)
+
+    assert calls == {"hit_stack": 1, "lower_contains": 1}
+    assert manager.selected_element is upper
+    assert [target.target for target in manager.selection.targets] == [upper]
+    manager.button_release_event0(release)
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
 def test_hover_preselection_and_candidate_entries_use_same_resolver() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
@@ -399,17 +457,21 @@ def test_double_click_enters_legend_isolation_and_escape_exits_one_scope() -> No
     manager = attach_drag_manager(fig)
     text = legend.get_texts()[0]
     event = _center_event(fig, text, dblclick=True)
+    fig.signals.selected.clear()
 
     manager.button_press_event0(event)
 
     assert manager.isolation_breadcrumbs == ("Legend",)
     assert manager.selected_element is text
     assert [target.target for target in manager.selection.targets] == [text]
+    assert fig.signals.selected == [text]
 
+    fig.signals.selected.clear()
     manager.key_press_event(KeyEvent("key_press_event", fig.canvas, "escape"))
     assert manager.isolation_breadcrumbs == ()
     assert manager.selected_element is legend
     assert [target.target for target in manager.selection.targets] == [legend]
+    assert fig.signals.selected == [legend]
 
     manager.selection.clear_targets()
     plt.close(fig)
@@ -442,6 +504,90 @@ def test_logical_group_selects_as_one_object_but_direct_tool_reaches_member() ->
     assert app is not None
 
 
+def test_v_a_switch_reconciles_group_and_leaf_selection_semantics() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    first = ax.add_patch(Rectangle((0.15, 0.2), 0.25, 0.3, zorder=3))
+    second = ax.add_patch(Rectangle((0.55, 0.2), 0.25, 0.3, zorder=3))
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_elements([first, second], primary=second)
+    group = manager.group_selection("Pair")
+
+    manager.key_press_event(KeyEvent("key_press_event", fig.canvas, "a"))
+
+    assert manager.selection_mode is SelectionMode.DIRECT
+    assert manager.selection.targets == []
+    assert manager.selected_element is None
+
+    press = _center_event(fig, first)
+    manager.button_press_event0(press)
+    manager.button_release_event0(press)
+    assert [target.target for target in manager.selection.targets] == [first]
+
+    manager.key_press_event(KeyEvent("key_press_event", fig.canvas, "v"))
+
+    assert manager.selection_mode is SelectionMode.OBJECT
+    assert [target.target for target in manager.selection.targets] == [group]
+    assert manager.selected_element is group
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_direct_isolation_never_falls_back_to_leaf_outside_scope() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    first = ax.add_patch(Rectangle((0.1, 0.2), 0.2, 0.25, zorder=3))
+    second = ax.add_patch(Rectangle((0.4, 0.2), 0.2, 0.25, zorder=3))
+    outside = ax.add_patch(Rectangle((0.72, 0.65), 0.18, 0.2, zorder=8))
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_elements([first, second], primary=second)
+    group = manager.group_selection("Isolated pair")
+    assert manager.enter_isolation(group)
+    manager.set_selection_mode(SelectionMode.DIRECT)
+    press = _center_event(fig, outside)
+
+    manager.button_press_event0(press)
+
+    assert manager.marquee_start is not None
+    assert manager.selected_element is None
+    assert manager.selection.targets == []
+    manager.button_release_event0(press)
+    assert outside not in [target.target for target in manager.selection.targets]
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_shift_click_selected_member_toggles_without_starting_drag() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    first = ax.add_patch(Rectangle((0.12, 0.2), 0.18, 0.2))
+    second = ax.add_patch(Rectangle((0.64, 0.58), 0.16, 0.17))
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_elements([first, second], primary=second)
+    manager.selection.set_alignment_reference("key_object", key=second)
+    press = _center_event(fig, first, key="shift")
+    fig.signals.selected.clear()
+
+    manager.button_press_event0(press)
+
+    assert [target.target for target in manager.selection.targets] == [second]
+    assert manager.selected_element is second
+    assert manager.selection.alignment_reference_mode == "selection"
+    assert manager.selection.alignment_key is None
+    assert not manager.selection.got_artist
+    assert fig.signals.selected == [second]
+    manager.button_release_event0(press)
+    assert [target.target for target in manager.selection.targets] == [second]
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
 def test_direct_marquee_skips_empty_logical_group_bounds() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
@@ -461,6 +607,37 @@ def test_direct_marquee_skips_empty_logical_group_bounds() -> None:
     manager.set_selection_mode(SelectionMode.DIRECT)
     assert manager.select_elements_in_bbox(x - 1, y - 1, x + 1, y + 1) == []
     assert manager.selection.targets == []
+    plt.close(fig)
+    assert app is not None
+
+
+def test_marquee_revalidates_leaf_promoted_to_logical_group() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    first = ax.add_patch(Rectangle((0.15, 0.2), 0.25, 0.3, zorder=3))
+    second = ax.add_patch(Rectangle((0.55, 0.2), 0.25, 0.3, zorder=3))
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_elements([first, second], primary=second)
+    group = manager.group_selection("Pair")
+    manager.selection.clear_targets()
+    manager.selected_element = None
+    original_has_geometry = manager._artist_has_selection_geometry
+
+    def group_has_no_valid_geometry(artist):
+        return False if artist is group else original_has_geometry(artist)
+
+    manager._artist_has_selection_geometry = group_has_no_valid_geometry
+    bounds = artist_visible_extent(first)
+    selected = manager.select_elements_in_bbox(*bounds)
+
+    assert selected == []
+    assert manager.selection.targets == []
+
+    manager._artist_has_selection_geometry = original_has_geometry
+    manager.editor_scene.set_locked([group], True)
+    assert manager.select_elements_in_bbox(*bounds) == []
+    manager.selection.clear_targets()
     plt.close(fig)
     assert app is not None
 
@@ -648,15 +825,19 @@ def test_undo_redo_preserves_selection_and_isolation_scope() -> None:
     manager.selection.end_move()
     assert len(tracker.edits) == 1
 
+    fig.signals.selected.clear()
     manager.undo()
     assert manager.isolation_breadcrumbs == ("Legend",)
     assert manager.selected_element is text
     assert [target.target for target in manager.selection.targets] == [text]
+    assert fig.signals.selected == [text]
 
+    fig.signals.selected.clear()
     manager.redo()
     assert manager.isolation_breadcrumbs == ("Legend",)
     assert manager.selected_element is text
     assert [target.target for target in manager.selection.targets] == [text]
+    assert fig.signals.selected == [text]
 
     manager.selection.clear_targets()
     plt.close(fig)
@@ -3437,7 +3618,9 @@ def test_escape_cancels_native_rotation_preview_without_recording() -> None:
     assert app is not None
 
 
-def test_rigid_preview_rollback_continues_after_one_target_restore_fails() -> None:
+def test_rigid_preview_rollback_continues_after_one_target_restore_fails(
+    request,
+) -> None:
     class PersistentFailurePolygon(Polygon):
         def __init__(self, *args, **kwargs):
             self.set_xy_calls = 0
@@ -3461,6 +3644,12 @@ def test_rigid_preview_rollback_continues_after_one_target_restore_fails() -> No
         )
     )
     artists = [first, second]
+    artist_adapter_registry.register(PersistentFailurePolygon, PolygonAdapter)
+    request.addfinalizer(
+        lambda: artist_adapter_registry.unregister(
+            PersistentFailurePolygon, PolygonAdapter
+        )
+    )
     fig.canvas.draw()
     manager = attach_drag_manager(fig)
     fig.signals.figure_selection_property_changed = Signal()
@@ -4343,8 +4532,41 @@ def test_backspace_deletes_selected_object() -> None:
         KeyEvent("key_press_event", fig.canvas, "backspace")
     )
 
-    assert fig.change_tracker.removed is ax
     assert not ax.get_visible()
+    assert len(fig.change_tracker.edits) == 1
+    assert fig.change_tracker.edits[0][2] == "Delete object"
+
+    fig.change_tracker.edits[0][0]()
+    assert ax.get_visible()
+    assert [target.target for target in manager.selection.targets] == [ax]
+    plt.close(fig)
+    assert app is not None
+
+
+def test_delete_undo_redo_emit_one_final_selection_refresh() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 2), dpi=100)
+    rectangle = ax.add_patch(Rectangle((0.2, 0.3), 0.25, 0.2))
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    _install_real_history_tracker(fig)
+    manager.select_element(rectangle)
+
+    fig.signals.selected.clear()
+    manager.selection.delete_targets()
+    assert fig.signals.selected == [None]
+
+    fig.signals.selected.clear()
+    manager.undo()
+    assert rectangle.get_visible()
+    assert fig.signals.selected == [rectangle]
+
+    fig.signals.selected.clear()
+    manager.redo()
+    assert not rectangle.get_visible()
+    assert fig.signals.selected == [None]
+
+    manager.selection.clear_targets()
     plt.close(fig)
     assert app is not None
 
@@ -4422,7 +4644,7 @@ def test_drag_rectangle_omits_containing_axes_by_default() -> None:
     assert app is not None
 
 
-def test_marquee_reuses_one_geometry_snapshot_per_artist_and_action() -> None:
+def test_marquee_reuses_revision_geometry_until_explicit_invalidation() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
     rectangle = ax.add_patch(
@@ -4445,7 +4667,234 @@ def test_marquee_reuses_one_geometry_snapshot_per_artist_and_action() -> None:
     assert calls == 1
 
     manager.select_elements_in_bbox(*bounds)
+    assert calls == 1
+
+    manager.invalidate_geometry_cache()
+    manager.select_elements_in_bbox(*bounds)
     assert calls == 2
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_marquee_spatial_index_preserves_targets_without_full_roster_scan() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig = plt.figure(figsize=(8, 6), dpi=100)
+    rectangles = []
+    for ix in range(25):
+        for iy in range(16):
+            rectangle = Rectangle(
+                (ix / 25 + 0.004, iy / 16 + 0.004),
+                0.018,
+                0.025,
+                transform=fig.transFigure,
+            )
+            fig.add_artist(rectangle)
+            rectangles.append(rectangle)
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    target = rectangles[8 * 16 + 7]
+    bounds = artist_visible_extent(target)
+    calls = 0
+    original_pick_candidate = manager._is_pick_candidate
+
+    def counted_pick_candidate(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_pick_candidate(*args, **kwargs)
+
+    manager._is_pick_candidate = counted_pick_candidate
+    selected = manager.select_elements_in_bbox(*bounds)
+
+    assert selected == [target]
+    assert calls < len(rectangles) // 10
+    assert manager._marquee_index.built_revision == manager._interaction_revision
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_large_selection_uses_constant_overlay_items_and_fast_warm_reselect() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig = plt.figure(figsize=(8, 6), dpi=100)
+    texts = [
+        fig.text((index % 25) / 25, (index // 25) / 15, str(index), fontsize=4)
+        for index in range(365)
+    ]
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+
+    start = perf_counter()
+    selected = manager.select_elements_in_bbox(*fig.bbox.extents)
+    cold_elapsed = perf_counter() - start
+
+    assert selected == texts
+    assert manager.selection.targets_rects == []
+    overlay_items = manager.selection._batched_selection_overlay_items
+    assert len(overlay_items) == 3
+    assert overlay_items[0].path().elementCount() == 5 * len(texts)
+    assert overlay_items[2].path().isEmpty()
+    assert cold_elapsed < 0.100
+
+    manager.selection.set_alignment_reference("key_object", key=texts[0])
+    assert overlay_items[0].path().elementCount() == 5 * (len(texts) - 1)
+    assert overlay_items[2].path().elementCount() == 5
+    assert overlay_items[2].pen().width() == 5
+
+    start = perf_counter()
+    manager.select_elements_in_bbox(*fig.bbox.extents)
+    assert perf_counter() - start < 0.050
+
+    manager.selection.update_selection_rectangles(target_indices=(0, len(texts) - 1))
+    manager.selection.refresh_targets_after_draw((0, len(texts) - 1))
+    manager.selection.remove_target(texts[0])
+    assert len(manager.selection.targets) == len(texts) - 1
+    assert manager.selection.targets_rects == []
+    assert manager.selection._batched_selection_overlay_items == overlay_items
+    assert overlay_items[2].path().isEmpty()
+
+    manager.selection.clear_targets()
+    assert all(item.scene() is None for item in overlay_items)
+    manager.select_elements(texts[:2], primary=texts[1])
+    assert len(manager.selection.targets_rects) == 4
+    assert manager.selection._batched_selection_overlay_items == []
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_draw_invalidation_releases_externally_removed_artist_rosters() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    rectangle = ax.add_patch(Rectangle((0.2, 0.25), 0.3, 0.35))
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    rectangle_id = id(rectangle)
+    reference = weakref.ref(rectangle)
+    bounds = artist_visible_extent(rectangle)
+    event = MouseEvent(
+        "button_press_event",
+        fig.canvas,
+        (bounds[0] + bounds[2]) / 2,
+        (bounds[1] + bounds[3]) / 2,
+        button=1,
+    )
+    assert rectangle in manager.get_hit_stack(event).artists
+    assert rectangle in manager._selectable_roster_snapshot().artists
+    assert rectangle_id in manager.editor_scene._known_artists
+
+    rectangle.remove()
+    manager.invalidate_geometry_cache()
+
+    assert rectangle not in manager._interaction_artists
+    assert rectangle not in manager._selectable_artists
+    assert rectangle not in manager._interaction_roster_snapshot()[0].artists
+    assert rectangle not in manager._selectable_roster_snapshot().artists
+    assert rectangle_id not in manager.editor_scene._known_artists
+    assert rectangle_id not in manager._selection_parent_by_id
+    assert manager._display_geometry_cache.roster is None
+
+    del rectangle
+    gc.collect()
+    assert reference() is None
+    plt.close(fig)
+    assert app is not None
+
+
+def test_delaxes_prunes_axes_descendants_and_releases_strong_references() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, axes = plt.subplots(figsize=(4, 3), dpi=100)
+    (line,) = axes.plot([0.2, 0.8], [0.3, 0.7])
+    text = axes.text(0.5, 0.5, "detached")
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    references = tuple(weakref.ref(artist) for artist in (axes, line, text))
+    detached_ids = {id(axes), id(line), id(text)}
+
+    assert all(manager._is_artist_attached(artist) for artist in (axes, line, text))
+    fig.delaxes(axes)
+    assert axes.figure is fig
+    assert line.figure is fig
+    assert not manager._is_artist_attached(axes)
+    assert not manager._is_artist_attached(line)
+    assert not manager._is_artist_attached(text)
+
+    manager.invalidate_geometry_cache()
+
+    assert detached_ids.isdisjoint(manager._interaction_artist_ids)
+    assert detached_ids.isdisjoint(manager._selectable_artist_ids)
+    assert detached_ids.isdisjoint(manager.editor_scene._known_artists)
+    assert detached_ids.isdisjoint(manager._selection_parent_by_id)
+    event = MouseEvent("button_press_event", fig.canvas, 200, 150, button=1)
+    assert not detached_ids.intersection(
+        id(artist) for artist in manager.get_hit_stack(event).artists
+    )
+
+    del axes, line, text
+    gc.collect()
+    assert all(reference() is None for reference in references)
+    plt.close(fig)
+    assert app is not None
+
+
+def test_child_and_subfigure_axes_follow_their_live_owner_inventory() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig = plt.figure(figsize=(6, 3), dpi=100)
+    left, _right = fig.subfigures(1, 2)
+    axes = left.subplots()
+    child = axes.inset_axes([0.2, 0.2, 0.4, 0.4])
+    child_text = child.text(0.5, 0.5, "inset")
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+
+    assert axes.figure is left
+    assert axes in left.axes
+    assert child not in fig.axes
+    assert child in axes.child_axes
+    assert manager._is_artist_attached(axes)
+    assert manager._is_artist_attached(child)
+    assert manager._is_artist_attached(child_text)
+    manager.invalidate_geometry_cache()
+    assert axes in manager._selectable_artists
+    assert child in manager._selectable_artists
+
+    left.delaxes(axes)
+    assert axes.figure is left
+    assert child.figure is left
+    assert child in axes.child_axes
+    assert not manager._is_artist_attached(axes)
+    assert not manager._is_artist_attached(child)
+    assert not manager._is_artist_attached(child_text)
+    manager.invalidate_geometry_cache()
+    assert axes not in manager._interaction_artists
+    assert child not in manager._interaction_artists
+    assert child_text not in manager._interaction_artists
+    plt.close(fig)
+    assert app is not None
+
+
+def test_undoable_hidden_axes_remain_attached_and_in_rosters() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, axes = plt.subplots(figsize=(4, 3), dpi=100)
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_element(axes)
+
+    assert manager.set_selection_visible(False)
+    undo = fig.change_tracker.edit[0]
+    manager.invalidate_geometry_cache()
+
+    assert axes in fig.axes
+    assert manager._is_artist_attached(axes)
+    assert axes in manager._interaction_artists
+    assert axes in manager._selectable_artists
+    assert not axes.get_visible()
+
+    undo()
+    manager.invalidate_geometry_cache()
+    assert axes.get_visible()
+    assert manager._is_artist_attached(axes)
+    assert axes in manager._selectable_roster_snapshot().artists
     manager.selection.clear_targets()
     plt.close(fig)
     assert app is not None

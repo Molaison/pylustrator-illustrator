@@ -42,12 +42,37 @@ Third-party Matplotlib artists can opt in without modifying Pylustrator:
         def _apply_native_control_points(self, points):
             self.target.position = points[0]
 
+Registrations match only the exact Artist type by default.  This prevents a
+semantic subclass (for example a 3D Artist inheriting a 2D Matplotlib class)
+from reusing incompatible mutation code.  When an extension owns an entire
+class hierarchy and has validated that every descendant preserves the same
+geometry, snapshot, and replay contracts, it can explicitly opt in:
+
+.. code-block:: python
+
+    from pylustrator import AdapterInheritancePolicy
+
+    @register_artist_adapter(
+        MyArtist,
+        inheritance_policy=AdapterInheritancePolicy.VALIDATED,
+    )
+    class MyArtistHierarchyAdapter(ArtistAdapter):
+        ...
+
+Known Matplotlib semantic subclasses are registered individually after their
+contracts are verified.  For example, Arc, Circle, and CirclePolygon expose
+translation-only adapters that preserve their center/radius semantics instead
+of inheriting every Ellipse or RegularPolygon mutation.
+
 Adapters that support saving should also set ``can_serialize=True`` and return
 ``ChangeRecord`` objects from ``serialize_changes``.  Resize capability should
 only be enabled when the committed native state can exactly reproduce the
 display-space preview.
 
 .. autoclass:: pylustrator.ArtistCapabilities
+   :members:
+
+.. autoclass:: pylustrator.AdapterInheritancePolicy
    :members:
 
 .. autoclass:: pylustrator.ArtistAdapter
@@ -89,6 +114,11 @@ Semantic transforms and replay
 ``OperationSupport`` distinguishes geometry resize from appearance scaling,
 layout reflow, rotation, and point editing.  ``TransformPlan`` preflights every
 target before mutation and rolls back earlier targets if an adapter fails.
+Translation, resize, and native rotation use immutable
+``GeometryTransformPlan``/``NativeRotationPlan`` destinations. Commit
+revalidates source geometry, storage identity, group membership, transforms,
+viewports, clipping, and layout before taking a rollback snapshot; a changed
+source raises ``StaleTransformPlanError`` without mutating an Artist or history.
 Appearance scaling uses a frozen ``AppearanceScalePlan`` and an independent
 appearance state/restore path; it does not enlarge geometry snapshots or emit
 geometry serialization records.
@@ -119,6 +149,15 @@ accepted during replay and rewritten through the public migration helpers.
    :members:
 
 .. autoclass:: pylustrator.TransformPlan
+   :members:
+
+.. autoclass:: pylustrator.GeometryTransformPlan
+   :members:
+
+.. autoclass:: pylustrator.NativeRotationPlan
+   :members:
+
+.. autoclass:: pylustrator.StaleTransformPlanError
    :members:
 
 .. autoclass:: pylustrator.RigidRotationPlan

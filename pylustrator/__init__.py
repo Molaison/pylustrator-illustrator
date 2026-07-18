@@ -40,6 +40,7 @@ from .QtGui import initialize as StartColorChooser
 from .lab_colormap import LabColormap
 from .helper_functions import loadFigureFromFile as load
 from .artist_adapters import (
+    AdapterInheritancePolicy,
     AppearanceScalePlan,
     ArtistAdapter,
     ArtistAdapterRegistry,
@@ -50,7 +51,13 @@ from .artist_adapters import (
     get_artist_adapter,
     register_artist_adapter,
 )
-from .interaction import HitCandidate, HitStack, SelectionKernel, SelectionMode
+from .interaction import (
+    HitCandidate,
+    HitResolution,
+    HitStack,
+    SelectionKernel,
+    SelectionMode,
+)
 from .legend_replay import UnsupportedLegendEntry, register_legend_entry_serializer
 from .legend_layout import (
     LegendLayoutError,
@@ -62,7 +69,13 @@ from .legend_layout import (
 )
 from .editor_model import EditorGroup, EditorScene
 from .operations import OperationSupport, TransformIntent, TransformOperation
-from .transform_engine import TransformPlan, TransformPreflightError
+from .transform_engine import (
+    GeometryTransformPlan,
+    NativeRotationPlan,
+    StaleTransformPlanError,
+    TransformPlan,
+    TransformPreflightError,
+)
 from .commands import (
     GENERATED_STATE_VERSION,
     ObjectLocator,
@@ -97,6 +110,7 @@ __all__ = [
     "LabColormap",
     "load",
     "AppearanceScalePlan",
+    "AdapterInheritancePolicy",
     "ArtistAdapter",
     "ArtistAdapterRegistry",
     "ArtistCapabilities",
@@ -114,6 +128,7 @@ __all__ = [
     "plan_legend_layout",
     "reflow_legend_layout",
     "HitCandidate",
+    "HitResolution",
     "HitStack",
     "SelectionKernel",
     "SelectionMode",
@@ -122,6 +137,9 @@ __all__ = [
     "OperationSupport",
     "TransformIntent",
     "TransformOperation",
+    "GeometryTransformPlan",
+    "NativeRotationPlan",
+    "StaleTransformPlanError",
     "TransformPlan",
     "TransformPreflightError",
     "GENERATED_STATE_VERSION",

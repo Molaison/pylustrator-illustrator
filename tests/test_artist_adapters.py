@@ -18,6 +18,7 @@ from matplotlib.text import Annotation, Text
 from matplotlib.transforms import Bbox, IdentityTransform
 
 from pylustrator.artist_adapters import (
+    AdapterInheritancePolicy,
     AnnotationAdapter,
     AppearanceScalePlan,
     ArtistAdapter,
@@ -29,6 +30,7 @@ from pylustrator.artist_adapters import (
     RectangleAdapter,
     TextAdapter,
     UnsupportedArtistError,
+    UnsupportedSubclassAdapter,
     artist_adapter_registry,
     get_artist_adapter,
     register_artist_adapter,
@@ -59,6 +61,7 @@ def test_extension_contract_is_available_from_the_public_package() -> None:
     import pylustrator
 
     assert pylustrator.ArtistAdapter is ArtistAdapter
+    assert pylustrator.AdapterInheritancePolicy is AdapterInheritancePolicy
     assert pylustrator.AppearanceScalePlan is AppearanceScalePlan
     assert pylustrator.ArtistAdapterRegistry is ArtistAdapterRegistry
     assert pylustrator.ArtistCapabilities is ArtistCapabilities
@@ -81,7 +84,7 @@ def test_registry_resolves_matplotlib_subclasses_by_mro_specificity() -> None:
     )
 
 
-def test_registry_cache_is_invalidated_when_a_more_specific_adapter_is_added() -> None:
+def test_registry_blocks_unvalidated_subclasses_and_invalidates_cached_result() -> None:
     class CustomArtist(Artist):
         pass
 
@@ -98,9 +101,54 @@ def test_registry_cache_is_invalidated_when_a_more_specific_adapter_is_added() -
     registry.register(Artist, ArtistAdapter)
     registry.register(CustomArtist, CustomAdapter)
 
-    assert registry.resolve_type(CustomChild) is CustomAdapter
+    assert registry.resolve_type(CustomArtist) is CustomAdapter
+    assert registry.resolve_type(CustomChild) is UnsupportedSubclassAdapter
+    blocked = registry.create(CustomChild())
+    support = blocked.operation_support(TransformOperation.TRANSLATE)
+    assert not support.supported
+    assert "CustomAdapter is exact-only" in support.reason
     registry.register(CustomChild, ChildAdapter)
     assert registry.resolve_type(CustomChild) is ChildAdapter
+
+
+def test_registry_allows_only_explicitly_validated_adapter_inheritance() -> None:
+    class CustomArtist(Artist):
+        pass
+
+    class CustomChild(CustomArtist):
+        pass
+
+    class CustomAdapter(ArtistAdapter):
+        pass
+
+    registry = ArtistAdapterRegistry()
+    registry.register(
+        CustomArtist,
+        CustomAdapter,
+        inheritance_policy=AdapterInheritancePolicy.VALIDATED,
+    )
+
+    assert registry.resolve_type(CustomChild) is CustomAdapter
+    assert type(registry.create(CustomChild())) is CustomAdapter
+
+
+def test_registry_rejects_unknown_inheritance_policy_without_changing_cache() -> None:
+    class CustomArtist(Artist):
+        pass
+
+    class CustomAdapter(ArtistAdapter):
+        pass
+
+    registry = ArtistAdapterRegistry()
+    registry.register(CustomArtist, CustomAdapter)
+
+    with pytest.raises(ValueError, match="inheritance_policy"):
+        registry.register(
+            Artist,
+            ArtistAdapter,
+            inheritance_policy="unchecked",
+        )
+    assert registry.resolve_type(CustomArtist) is CustomAdapter
 
 
 def test_third_party_adapter_registration_extends_target_wrapper() -> None:
@@ -140,6 +188,45 @@ def test_third_party_adapter_registration_extends_target_wrapper() -> None:
         assert np.allclose(artist.position, (27, 26))
     finally:
         artist_adapter_registry.unregister(OffsetArtist, OffsetAdapter)
+        plt.close(fig)
+
+
+def test_select_only_adapter_is_admitted_without_becoming_draggable() -> None:
+    class PropertyOnlyArtist(Artist):
+        def __init__(self, position):
+            super().__init__()
+            self.position = np.asarray(position, dtype=float)
+
+        def get_window_extent(self, renderer=None):
+            return Bbox.from_bounds(*self.position, 8.0, 6.0)
+
+    @register_artist_adapter(PropertyOnlyArtist)
+    class PropertyOnlyAdapter(ArtistAdapter):
+        default_capabilities = ArtistCapabilities(can_select=True)
+
+    fig = plt.figure(figsize=(2, 2), dpi=100)
+    target = PropertyOnlyArtist((20.0, 30.0))
+    fig.add_artist(target)
+    fig.canvas.draw()
+    before = target.position.copy()
+
+    try:
+        wrapper = TargetWrapper(target)
+        assert not wrapper.capabilities.editable
+        assert wrapper.supported
+        assert TargetWrapper.supports_target(target)
+        assert wrapper.operation_support(TransformOperation.SELECT).supported
+        translation = wrapper.operation_support(TransformOperation.TRANSLATE)
+        assert not translation.supported
+        assert "no lossless translate adapter" in translation.reason
+        np.testing.assert_allclose(
+            wrapper.get_selection_points(), [[20.0, 30.0], [28.0, 36.0]]
+        )
+        with pytest.raises(UnsupportedArtistError, match="translate"):
+            wrapper.translate((5.0, -3.0))
+        np.testing.assert_array_equal(target.position, before)
+    finally:
+        artist_adapter_registry.unregister(PropertyOnlyArtist, PropertyOnlyAdapter)
         plt.close(fig)
 
 
