@@ -1346,8 +1346,9 @@ class GrabbableRectangleSelection(GrabFunctions):
                         for target in self.targets
                     )
                 for target, plan in zip(self.targets, plans):
-                    target.apply_rigid_rotation_plan(
-                        plan, record_changes=False
+                    target._apply_prevalidated_rigid_rotation_plan(
+                        plan,
+                        record_changes=False,
                     )
                 self.rotation_drag_plans = plans
                 self.rotation_drag_preview_delta = delta
@@ -1410,10 +1411,15 @@ class GrabbableRectangleSelection(GrabFunctions):
                     )
                 else:
                     self._restore_move_start()
-                    for target, plan in zip(
-                        self.targets, self.rotation_drag_plans
-                    ):
-                        target.apply_rigid_rotation_plan(plan)
+                    with selection_geometry_snapshot():
+                        prepared_plans = tuple(
+                            target.revalidate_rigid_rotation_plan(plan)
+                            for target, plan in zip(
+                                self.targets, self.rotation_drag_plans
+                            )
+                        )
+                    for target, plan in zip(self.targets, prepared_plans):
+                        target._apply_prevalidated_rigid_rotation_plan(plan)
                 self.update_extent()
                 self.has_moved = True
             else:
@@ -1486,8 +1492,13 @@ class GrabbableRectangleSelection(GrabFunctions):
                 target = self.targets[0]
                 target.set_rotation(target.get_rotation() + angle_degrees)
             else:
-                for target, plan in zip(self.targets, plans):
-                    target.apply_rigid_rotation_plan(plan)
+                with selection_geometry_snapshot():
+                    prepared_plans = tuple(
+                        target.revalidate_rigid_rotation_plan(plan)
+                        for target, plan in zip(self.targets, plans)
+                    )
+                for target, plan in zip(self.targets, prepared_plans):
+                    target._apply_prevalidated_rigid_rotation_plan(plan)
             self.update_extent()
             self.has_moved = True
             self.end_move("Rotate")

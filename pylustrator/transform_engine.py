@@ -720,6 +720,54 @@ class TransformPlan:
         return tuple(changed)
 
     @selection_geometry_snapshot()
+    def _prepare_rigid_rotation_plans(self) -> tuple[RigidRotationPlan, ...]:
+        """Validate every frozen rigid destination before mutating any target."""
+
+        if len(self.rigid_rotation_plans) != len(self.adapters):
+            raise StaleTransformPlanError(
+                [
+                    (
+                        adapter.target,
+                        OperationSupport.denied(
+                            TransformOperation.RIGID_ROTATE,
+                            "Frozen rigid-rotation membership no longer matches "
+                            "the target selection",
+                        ),
+                    )
+                    for adapter in self.adapters
+                ]
+            )
+        failures = []
+        prepared = []
+        for adapter, plan in zip(self.adapters, self.rigid_rotation_plans):
+            try:
+                prepared.append(adapter.revalidate_rigid_rotation_plan(plan))
+            except (
+                AttributeError,
+                IndexError,
+                OverflowError,
+                TypeError,
+                ValueError,
+                NotImplementedError,
+                RuntimeError,
+                ZeroDivisionError,
+                np.linalg.LinAlgError,
+            ) as error:
+                failures.append(
+                    (
+                        adapter.target,
+                        OperationSupport.denied(
+                            TransformOperation.RIGID_ROTATE,
+                            "Rigid-rotation plan is stale: its source or frozen "
+                            f"display destination changed after preflight ({error})",
+                        ),
+                    )
+                )
+        if failures:
+            raise StaleTransformPlanError(failures)
+        return tuple(prepared)
+
+    @selection_geometry_snapshot()
     def _revalidate_native_rotation_sources(self) -> tuple[bool, ...]:
         if len(self.native_rotation_plans) != len(self.adapters):
             raise StaleTransformPlanError(
@@ -863,6 +911,22 @@ class TransformPlan:
         )
         if native_rotation_only and not any(native_rotation_changed):
             return
+        rigid_rotation_only = (
+            self.intent.operation is TransformOperation.RIGID_ROTATE
+        )
+        prepared_rigid_rotation_plans = (
+            self._prepare_rigid_rotation_plans()
+            if rigid_rotation_only
+            else ()
+        )
+        rigid_rotation_changed = tuple(
+            adapter.rigid_rotation_plan_changes(plan)
+            for adapter, plan in zip(
+                self.adapters, prepared_rigid_rotation_plans
+            )
+        )
+        if rigid_rotation_only and not any(rigid_rotation_changed):
+            return
         appearance_only = (
             self.intent.operation is TransformOperation.SCALE_APPEARANCE
         )
@@ -907,9 +971,10 @@ class TransformPlan:
                             self.native_rotation_plans[index].destination_value
                         )
                 elif self.intent.operation is TransformOperation.RIGID_ROTATE:
-                    adapter.apply_rigid_rotation_plan(
-                        self.rigid_rotation_plans[index]
-                    )
+                    if rigid_rotation_changed[index]:
+                        adapter._apply_prevalidated_rigid_rotation_plan(
+                            prepared_rigid_rotation_plans[index]
+                        )
                 elif self.intent.operation is TransformOperation.SCALE_APPEARANCE:
                     adapter._apply_preflighted_appearance_scale_plan(
                         self.appearance_scale_plans[index]

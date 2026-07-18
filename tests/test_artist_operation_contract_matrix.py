@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import FrozenInstanceError, dataclass, fields
+from dataclasses import FrozenInstanceError, dataclass, fields, replace
 import gc
 import time
 import tracemalloc
@@ -39,7 +39,7 @@ from matplotlib.patches import (
     Wedge,
 )
 from matplotlib.text import Annotation, Text
-from matplotlib.transforms import Affine2D, IdentityTransform, Transform
+from matplotlib.transforms import Affine2D, Bbox, IdentityTransform, Transform
 
 from pylustrator.artist_adapters import (
     AnnotationAdapter,
@@ -3153,6 +3153,342 @@ def test_line_rigid_plan_rejects_stale_marker_and_display_context(
         assert semantic_equal(before, adapter.snapshot())
         assert tracker.capture_recording_state() == tracker_before
     finally:
+        plt.close(fig)
+
+
+@pytest.mark.parametrize(
+    "stale_kind",
+    ["markersize", "markeredgewidth", "clip_on", "clip_path"],
+)
+def test_line_rigid_plan_rejects_stale_marker_appearance_and_clip_atomically(
+    stale_kind,
+) -> None:
+    fig, ax = plt.subplots(figsize=(5.3, 3.7), dpi=113)
+    tracker = RecordingChangeTracker()
+    fig.change_tracker = tracker
+    target = Line2D(
+        [160.0, 260.0],
+        [140.0, 180.0],
+        linestyle="none",
+        marker="o",
+        markersize=12.0,
+        markeredgewidth=2.0,
+        transform=IdentityTransform(),
+        clip_on=False,
+    )
+    ax.add_line(target)
+    # Keep a dormant rectangular clip outside the cheap fingerprint.  Turning
+    # clip_on on after planning must make destination revalidation observe the
+    # partially clipped envelope.
+    target.set_clip_box(Bbox.from_extents(180.0, 120.0, 240.0, 210.0))
+    fig.canvas.draw()
+    adapter = get_artist_adapter(target)
+    plan = adapter.plan_rigid_rotation(33.0, (210.0, 160.0))
+
+    if stale_kind == "markersize":
+        target.set_markersize(21.0)
+    elif stale_kind == "markeredgewidth":
+        target.set_markeredgewidth(5.0)
+    elif stale_kind == "clip_on":
+        target.set_clip_on(True)
+    else:
+        target.set_clip_on(True)
+        target.set_clip_path(
+            Circle((210.0, 160.0), 110.0, transform=IdentityTransform())
+        )
+
+    before = adapter.snapshot()
+    xdata_before = target.get_xdata(orig=True)
+    ydata_before = target.get_ydata(orig=True)
+    xvalues_before = np.asarray(xdata_before).copy()
+    yvalues_before = np.asarray(ydata_before).copy()
+    appearance_before = (
+        target.get_markersize(),
+        target.get_markeredgewidth(),
+        target.get_markerfacecolor(),
+        target.get_markeredgecolor(),
+        target.get_fillstyle(),
+    )
+    clip_on_before = target.get_clip_on()
+    clip_box_before = target.get_clip_box()
+    clip_box_points_before = (
+        None
+        if clip_box_before is None
+        else np.asarray(clip_box_before.get_points(), dtype=float).copy()
+    )
+    clip_path_before = target.get_clip_path()
+    if clip_path_before is None:
+        clip_path_state_before = None
+    else:
+        clip_path, clip_affine = (
+            clip_path_before.get_transformed_path_and_affine()
+        )
+        clip_path_state_before = (
+            np.asarray(clip_path.vertices, dtype=float).copy(),
+            None
+            if clip_path.codes is None
+            else np.asarray(clip_path.codes).copy(),
+            np.asarray(clip_affine.get_matrix(), dtype=float).copy(),
+        )
+    stale_before = (target.stale, ax.stale, fig.stale)
+    recording_before = tracker.capture_recording_state()
+
+    try:
+        with pytest.raises(UnsupportedArtistError, match="changed after|clip"):
+            adapter.apply_rigid_rotation_plan(plan)
+
+        # Appearance and clipping are deliberately not an ever-growing list
+        # in the cheap source fingerprint.  The unified destination
+        # recomputation must detect their effect on the frozen visible plan.
+        assert plan.source_fingerprint == adapter.rigid_rotation_source_fingerprint()
+        assert target.get_xdata(orig=True) is xdata_before
+        assert target.get_ydata(orig=True) is ydata_before
+        assert np.array_equal(np.asarray(xdata_before), xvalues_before)
+        assert np.array_equal(np.asarray(ydata_before), yvalues_before)
+        assert semantic_equal(before, adapter.snapshot())
+        assert appearance_before == (
+            target.get_markersize(),
+            target.get_markeredgewidth(),
+            target.get_markerfacecolor(),
+            target.get_markeredgecolor(),
+            target.get_fillstyle(),
+        )
+        assert target.get_clip_on() is clip_on_before
+        assert target.get_clip_box() is clip_box_before
+        if clip_box_before is not None:
+            assert np.array_equal(
+                clip_box_before.get_points(), clip_box_points_before
+            )
+        assert target.get_clip_path() is clip_path_before
+        if clip_path_before is not None:
+            clip_path, clip_affine = (
+                clip_path_before.get_transformed_path_and_affine()
+            )
+            vertices, codes, matrix = clip_path_state_before
+            assert np.array_equal(clip_path.vertices, vertices)
+            if codes is None:
+                assert clip_path.codes is None
+            else:
+                assert np.array_equal(clip_path.codes, codes)
+            assert np.array_equal(clip_affine.get_matrix(), matrix)
+        assert (target.stale, ax.stale, fig.stale) == stale_before
+        assert tracker.capture_recording_state() == recording_before
+    finally:
+        plt.close(fig)
+
+
+def test_generic_rigid_plan_rejects_same_size_rectangle_source_move_atomically(
+) -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    tracker = RecordingChangeTracker()
+    fig.change_tracker = tracker
+    target = Rectangle(
+        (100.0, 100.0),
+        40.0,
+        20.0,
+        transform=IdentityTransform(),
+        clip_on=False,
+    )
+    ax.add_patch(target)
+    fig.canvas.draw()
+    adapter = get_artist_adapter(target)
+    plan = adapter.plan_rigid_rotation(20.0, (150.0, 150.0))
+
+    target.set_xy((200.0, 210.0))
+    before = adapter.snapshot()
+    controls_before = np.asarray(adapter.control_points(), dtype=float).copy()
+    tracker_before = tracker.capture_recording_state()
+
+    try:
+        # Generic geometry is deliberately not byte-hashed. Rectangle retains
+        # only its stable native-angle token, which is unchanged by set_xy;
+        # the live candidate destination must detect the stale move.
+        assert (
+            plan.source_fingerprint
+            == adapter.rigid_rotation_source_fingerprint()
+        )
+        assert not isinstance(plan.source_fingerprint, bytes)
+        with pytest.raises(
+            UnsupportedArtistError,
+            match="native/display mapping changed after",
+        ):
+            adapter.apply_rigid_rotation_plan(plan)
+        np.testing.assert_array_equal(
+            adapter.control_points(), controls_before
+        )
+        assert semantic_equal(adapter.snapshot(), before)
+        assert tracker.capture_recording_state() == tracker_before
+    finally:
+        plt.close(fig)
+
+
+def test_rigid_transform_plan_prepares_all_targets_before_first_mutation(
+    monkeypatch,
+) -> None:
+    fig = plt.figure(figsize=(5, 4), dpi=100)
+    tracker = RecordingChangeTracker()
+    fig.change_tracker = tracker
+    targets = [
+        Rectangle(
+            (80.0, 90.0),
+            35.0,
+            24.0,
+            transform=IdentityTransform(),
+            clip_on=False,
+        ),
+        Rectangle(
+            (190.0, 145.0),
+            42.0,
+            27.0,
+            transform=IdentityTransform(),
+            clip_on=False,
+        ),
+    ]
+    for target in targets:
+        fig.add_artist(target)
+    fig.canvas.draw()
+    adapters = [get_artist_adapter(target) for target in targets]
+    plan = TransformPlan.preflight(
+        targets,
+        TransformIntent.rigid_rotate(21.0, (150.0, 120.0)),
+    )
+
+    targets[1].set_xy((260.0, 230.0))
+    before = [adapter.snapshot() for adapter in adapters]
+    tracker_before = tracker.capture_recording_state()
+    first_setter_calls = []
+    original_setter = adapters[0]._apply_native_control_points
+
+    def capture_first_setter(points):
+        first_setter_calls.append(np.asarray(points, dtype=float).copy())
+        return original_setter(points)
+
+    monkeypatch.setattr(
+        adapters[0], "_apply_native_control_points", capture_first_setter
+    )
+
+    try:
+        with pytest.raises(
+            StaleTransformPlanError,
+            match="display destination changed after preflight",
+        ):
+            plan.commit()
+        assert first_setter_calls == []
+        assert all(
+            semantic_equal(adapter.snapshot(), state)
+            for adapter, state in zip(adapters, before)
+        )
+        assert tracker.capture_recording_state() == tracker_before
+    finally:
+        plt.close(fig)
+
+
+def test_rigid_plan_change_detection_is_absolute_at_large_coordinates() -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    target = Rectangle(
+        (1_000_000.0, 1_000_000.0),
+        40.0,
+        20.0,
+        transform=IdentityTransform(),
+        clip_on=False,
+    )
+    ax.add_patch(target)
+    fig.canvas.draw()
+    adapter = get_artist_adapter(target)
+    source = np.asarray(adapter.control_points(), dtype=float)
+    plan = adapter.plan_rigid_rotation(0.0, (1_000_000.0, 1_000_000.0))
+    half_pixel_plan = replace(
+        plan,
+        control_points=plan.control_array() + np.array([0.5, 0.0]),
+    )
+
+    try:
+        # NumPy's default relative tolerance treats this visible displacement
+        # as equal at a 1e6 coordinate scale. Change detection must not.
+        assert np.allclose(source, half_pixel_plan.control_array())
+        assert not np.array_equal(source, half_pixel_plan.control_array())
+        assert adapter.rigid_rotation_plan_changes(half_pixel_plan)
+    finally:
+        plt.close(fig)
+
+
+def test_rigid_revalidation_returns_current_affine_native_candidate() -> None:
+    class MutableAffineArtist(Artist):
+        def __init__(self, transform) -> None:
+            super().__init__()
+            self.position = np.array([10.0, 20.0], dtype=float)
+            self.context_transform = transform
+
+        def get_window_extent(self, renderer=None):
+            point = self.context_transform.transform(self.position)
+            return Bbox.from_bounds(
+                float(point[0]) - 2.0,
+                float(point[1]) - 2.0,
+                4.0,
+                4.0,
+            )
+
+    @register_artist_adapter(MutableAffineArtist)
+    class MutableAffineAdapter(ArtistAdapter):
+        default_capabilities = ArtistCapabilities(
+            can_select=True,
+            can_translate=True,
+            can_snapshot=True,
+            can_rigid_rotate=True,
+        )
+
+        def get_transform(self):
+            return self.target.context_transform
+
+        def native_control_points(self):
+            return [self.target.position.copy()]
+
+        def _apply_native_control_points(self, points) -> None:
+            self.target.position = np.asarray(points[0], dtype=float).copy()
+
+    fig = plt.figure(figsize=(3, 3), dpi=100)
+    transform = Affine2D().translate(100.0, 50.0)
+    target = MutableAffineArtist(transform)
+    fig.add_artist(target)
+    fig.canvas.draw()
+    adapter = get_artist_adapter(target)
+    source_display = np.asarray(adapter.control_points(), dtype=float)
+    plan = adapter.plan_rigid_rotation(37.0, (100.0, 50.0))
+    frozen_control = plan.control_array().copy()
+    frozen_native = plan.native_array().copy()
+    frozen_selection = plan.selection_array().copy()
+
+    try:
+        # Change native coordinates and the affine context together while
+        # preserving the exact live source in display space.
+        transform.clear().translate(130.0, 40.0)
+        target.position = np.asarray(
+            transform.inverted().transform(source_display[0]), dtype=float
+        )
+        assert plan.source_fingerprint == adapter.rigid_rotation_source_fingerprint()
+
+        candidate = adapter.revalidate_rigid_rotation_plan(plan)
+        expected_native = transform.inverted().transform(frozen_control)
+
+        assert candidate is not plan
+        np.testing.assert_array_equal(candidate.control_array(), frozen_control)
+        np.testing.assert_array_equal(candidate.selection_array(), frozen_selection)
+        np.testing.assert_array_equal(candidate.native_array(), expected_native)
+        assert not np.array_equal(candidate.native_array(), frozen_native)
+        assert not np.allclose(
+            transform.transform(frozen_native),
+            frozen_control,
+            atol=PIXEL_TOLERANCE,
+            rtol=0.0,
+        )
+        # Revalidation must not mutate the immutable frozen plan.
+        np.testing.assert_array_equal(plan.control_array(), frozen_control)
+        np.testing.assert_array_equal(plan.native_array(), frozen_native)
+        np.testing.assert_array_equal(plan.selection_array(), frozen_selection)
+    finally:
+        artist_adapter_registry.unregister(
+            MutableAffineArtist, MutableAffineAdapter
+        )
         plt.close(fig)
 
 

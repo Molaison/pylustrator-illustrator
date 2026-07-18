@@ -221,8 +221,21 @@ class TargetWrapper:
         self, plan: RigidRotationPlan, *, record_changes: bool = True
     ) -> None:
         self.adapter.apply_rigid_rotation_plan(
+            plan,
+            record_changes=record_changes,
+        )
+
+    def _apply_prevalidated_rigid_rotation_plan(
+        self, plan: RigidRotationPlan, *, record_changes: bool = True
+    ) -> None:
+        self.adapter._apply_prevalidated_rigid_rotation_plan(
             plan, record_changes=record_changes
         )
+
+    def revalidate_rigid_rotation_plan(
+        self, plan: RigidRotationPlan
+    ) -> RigidRotationPlan:
+        return self.adapter.revalidate_rigid_rotation_plan(plan)
 
     def get_restore_state(self):
         return self.adapter.snapshot()
