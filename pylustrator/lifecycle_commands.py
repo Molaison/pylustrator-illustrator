@@ -8,6 +8,7 @@ selection delete is one reversible user action.
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -102,7 +103,8 @@ def delete_selection(manager, targets: Iterable[Artist]) -> bool:
     because no creation command remains.
     """
 
-    artists = _unique_lifecycle_targets(targets)
+    requested_targets = tuple(targets)
+    artists = _unique_lifecycle_targets(requested_targets)
     if not artists:
         return False
     figure = manager.figure
@@ -155,7 +157,7 @@ def delete_selection(manager, targets: Iterable[Artist]) -> bool:
         # Deleting an active isolation root must not strand the editor inside an
         # invisible scope. Other isolation scopes remain unchanged.
         kernel = manager._ensure_selection_kernel()
-        if any(scope.root in artists for scope in kernel.scopes):
+        if any(scope.root in requested_targets for scope in kernel.scopes):
             kernel.clear_isolation()
         manager.select_element(None)
         interaction_after = manager.capture_interaction_state()
@@ -193,9 +195,16 @@ def delete_selection(manager, targets: Iterable[Artist]) -> bool:
             manager.restore_interaction_state(interaction_before)
         except Exception as rollback_error:
             rollback_failures.append((manager, rollback_error))
-        active_error = __import__("sys").exc_info()[1]
+        active_error = sys.exc_info()[1]
         if rollback_failures and active_error is not None:
             active_error.pylustrator_rollback_failures = tuple(rollback_failures)
+            add_note = getattr(active_error, "add_note", None)
+            if callable(add_note):
+                details = "; ".join(
+                    f"{type(target).__name__}: {error}"
+                    for target, error in rollback_failures
+                )
+                add_note(f"Pylustrator delete rollback failures: {details}")
         raise
     return True
 
