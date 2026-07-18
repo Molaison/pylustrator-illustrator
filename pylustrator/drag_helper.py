@@ -69,6 +69,7 @@ from .smart_guide_ui import (
 from .transform_engine import TransformPlan
 from .property_adapters import axis_tick_label_reference
 from .commands import InteractionState, ObjectLocator, semantic_equal
+from .lifecycle_commands import delete_selection
 from pylustrator.change_tracker import UndoRedo
 
 DIR_X0 = 1
@@ -1375,12 +1376,10 @@ class GrabbableRectangleSelection(GrabFunctions):
         return True
 
     def delete_targets(self):
-        """Delete all selected targets."""
-        if len(self.targets) == 0:
-            return
-        for target in self.targets[::-1]:
-            self.figure.change_tracker.removeElement(target.target)
-        self.figure.canvas.draw()
+        """Delete all selected targets as one atomic lifecycle command."""
+        targets = [target.target for target in self.targets]
+        if delete_selection(self.figure.figure_dragger, targets):
+            self.figure.canvas.draw()
 
     def update_selection_rectangles(
         self, use_previous_offset=False, target_indices: Iterable[int] = None
