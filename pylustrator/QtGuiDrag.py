@@ -446,7 +446,7 @@ class PlotWindow(QtWidgets.QWidget):
 
         self.redo_act = QAction("Redo", self)
         self.redo_act.triggered.connect(self.redo)
-        self.redo_act.setShortcut("Ctrl+Y")
+        self.redo_act.setShortcuts(["Ctrl+Y", "Ctrl+Shift+Z"])
         file_menu.addAction(self.redo_act)
 
         delete_act = QAction("Delete", self)

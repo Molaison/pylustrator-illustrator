@@ -54,7 +54,7 @@ from .snap import (
     checkSnapsActive,
     SnapBase,
 )
-from .change_tracker import ChangeTracker, add_text_default
+from .change_tracker import ChangeTracker, add_text_default, getReference
 from .components.plot_layout import scene_point_to_canvas_pixels
 from .editor_model import EditorGroup, EditorScene
 from .interaction import HitCandidate, HitStack, SelectionKernel, SelectionMode
@@ -68,6 +68,7 @@ from .smart_guide_ui import (
 )
 from .transform_engine import TransformPlan
 from .property_adapters import axis_tick_label_reference
+from .property_transactions import PropertyOperation, PropertyPlan
 from .commands import InteractionState, ObjectLocator, semantic_equal
 from .lifecycle_commands import delete_selection
 from pylustrator.change_tracker import UndoRedo
@@ -2500,9 +2501,15 @@ class GrabbableRectangleSelection(GrabFunctions):
         #    return
         # move last axis in z order
         if event.key == "pagedown":
-            self.figure.figure_dragger.change_selection_zorder("backward")
+            try:
+                self.figure.figure_dragger.change_selection_zorder("backward")
+            except ValueError:
+                return
         if event.key == "pageup":
-            self.figure.figure_dragger.change_selection_zorder("forward")
+            try:
+                self.figure.figure_dragger.change_selection_zorder("forward")
+            except ValueError:
+                return
         if event.key in {"left", "right", "down", "up"} and not self.operation_support(
             TransformOperation.TRANSLATE
         ).supported:
@@ -3403,6 +3410,210 @@ class DragManager:
             add(artist)
         return leaves
 
+    def _zorder_paint_siblings(
+        self, parent: Artist, selected: Sequence[Artist]
+    ) -> tuple[list[Artist], dict[int, int]]:
+        """Return visible editor siblings in authoritative child-list order.
+
+        Matplotlib paints Figure/SubFigure/Axes children by a stable z-order
+        sort.  Registration order is not a substitute for the stable portion
+        of that sort, and managed descendants such as tick labels are not
+        direct paint siblings even when the editor exposes them beneath an
+        Axes.  Restricting this inventory to actual children prevents a local
+        arrange command from pretending that unrelated containers share a
+        global layer stack.
+        """
+
+        if not isinstance(parent, (Figure, SubFigure, Axes)):
+            raise ValueError(
+                f"{type(parent).__name__} does not expose a sortable paint stack"
+            )
+        children = get_artist_children(parent)
+        child_order = {id(child): index for index, child in enumerate(children)}
+        interaction_ids = set(getattr(self, "_interaction_artist_ids", ()))
+        interaction_ids.update(id(artist) for artist in selected)
+        siblings = []
+        seen = set()
+        for child in children:
+            key = id(child)
+            if key in seen or key not in interaction_ids:
+                continue
+            seen.add(key)
+            if self._draw_parent(child) is not parent or not child.get_visible():
+                continue
+            if isinstance(child, Text) and child.get_text() == "":
+                continue
+            siblings.append(child)
+
+        sibling_ids = {id(artist) for artist in siblings}
+        missing = [
+            artist for artist in selected if id(artist) not in sibling_ids
+        ]
+        if missing:
+            names = ", ".join(type(artist).__name__ for artist in missing)
+            raise ValueError(
+                f"Selected {names} is not a visible direct paint sibling"
+            )
+        siblings.sort(
+            key=lambda artist: (
+                float(artist.get_zorder()),
+                child_order[id(artist)],
+            )
+        )
+        return siblings, child_order
+
+    @staticmethod
+    def _reorder_siblings(
+        siblings: Sequence[Artist], selected_ids: set[int], mode: str
+    ) -> list[Artist]:
+        """Apply Illustrator-style stable arrange semantics to one stack."""
+
+        result = list(siblings)
+        if mode == "forward":
+            for index in range(len(result) - 2, -1, -1):
+                if (
+                    id(result[index]) in selected_ids
+                    and id(result[index + 1]) not in selected_ids
+                ):
+                    result[index], result[index + 1] = (
+                        result[index + 1],
+                        result[index],
+                    )
+        elif mode == "backward":
+            for index in range(1, len(result)):
+                if (
+                    id(result[index]) in selected_ids
+                    and id(result[index - 1]) not in selected_ids
+                ):
+                    result[index], result[index - 1] = (
+                        result[index - 1],
+                        result[index],
+                    )
+        elif mode == "front":
+            result = [
+                artist for artist in result if id(artist) not in selected_ids
+            ] + [artist for artist in result if id(artist) in selected_ids]
+        else:
+            result = [
+                artist for artist in result if id(artist) in selected_ids
+            ] + [artist for artist in result if id(artist) not in selected_ids]
+        return result
+
+    @staticmethod
+    def _zorder_run_levels(
+        base: float,
+        count: int,
+        direction: float,
+        bound: float | None,
+    ) -> list[float]:
+        levels = []
+        current = float(base)
+        destination = np.inf if direction > 0 else -np.inf
+        for _index in range(count):
+            current = float(np.nextafter(current, destination))
+            if not np.isfinite(current) or (
+                bound is not None
+                and (
+                    (direction > 0 and current >= bound)
+                    or (direction < 0 and current <= bound)
+                )
+            ):
+                raise ValueError(
+                    "The local z-order values are too dense to preserve paint order"
+                )
+            levels.append(current)
+        if direction < 0:
+            levels.reverse()
+        return levels
+
+    @classmethod
+    def _zorder_values_for_order(
+        cls,
+        current: Sequence[Artist],
+        destination: Sequence[Artist],
+        child_order: dict[int, int],
+        selected_ids: set[int],
+    ) -> dict[int, float]:
+        """Relabel one stable sort so it exactly realizes *destination*.
+
+        Existing z-order levels are permuted first.  Equal-level inversions
+        are split into the minimum number of adjacent floating-point levels;
+        the longest child-order run remains unchanged.  This preserves the
+        normal semantic bands (patch/line/text) while still handling a stack
+        whose siblings all share exactly the same zorder.
+        """
+
+        levels = sorted(float(artist.get_zorder()) for artist in current)
+        if not all(np.isfinite(level) for level in levels):
+            raise ValueError("Stacking order requires finite z-order values")
+        assigned: dict[int, float] = {}
+        start = 0
+        while start < len(destination):
+            base = levels[start]
+            stop = start + 1
+            while stop < len(destination) and levels[stop] == base:
+                stop += 1
+            group = list(destination[start:stop])
+
+            runs: list[list[Artist]] = []
+            for artist in group:
+                if (
+                    not runs
+                    or child_order[id(artist)]
+                    <= child_order[id(runs[-1][-1])]
+                ):
+                    runs.append([])
+                runs[-1].append(artist)
+
+            anchors = sorted(
+                range(len(runs)),
+                key=lambda index: (
+                    len(runs[index]),
+                    sum(
+                        id(artist) not in selected_ids
+                        for artist in runs[index]
+                    ),
+                    -index,
+                ),
+                reverse=True,
+            )
+            lower = levels[start - 1] if start else None
+            upper = levels[stop] if stop < len(levels) else None
+            for anchor in anchors:
+                try:
+                    before_levels = cls._zorder_run_levels(
+                        base, anchor, -1.0, lower
+                    )
+                    after_levels = cls._zorder_run_levels(
+                        base, len(runs) - anchor - 1, 1.0, upper
+                    )
+                except ValueError:
+                    continue
+                break
+            else:
+                raise ValueError(
+                    "The local z-order values are too dense to preserve paint order"
+                )
+            run_levels = [*before_levels, base, *after_levels]
+            for run, level in zip(runs, run_levels):
+                for artist in run:
+                    assigned[id(artist)] = level
+            start = stop
+
+        resolved = sorted(
+            current,
+            key=lambda artist: (
+                assigned[id(artist)],
+                child_order[id(artist)],
+            ),
+        )
+        if any(
+            actual is not expected
+            for actual, expected in zip(resolved, destination)
+        ):
+            raise ValueError("Could not represent the requested paint order")
+        return assigned
+
     def change_selection_zorder(self, mode: str) -> bool:
         leaves = self._zorder_leaves(self._selected_artists())
         if not leaves:
@@ -3410,43 +3621,43 @@ class DragManager:
         modes = {"forward", "backward", "front", "back"}
         if mode not in modes:
             raise ValueError(f"Unknown z-order action: {mode}")
-        old_values = [(artist, float(artist.get_zorder())) for artist in leaves]
         selected_ids = {id(artist) for artist in leaves}
-        others = [
-            artist
-            for artist in getattr(self, "_selectable_artists", [])
-            if id(artist) not in selected_ids and artist.get_visible()
+        parents = {id(parent): parent for parent in map(self._draw_parent, leaves)}
+        if None in parents.values() or len(parents) != 1:
+            raise ValueError(
+                "Arrange requires selected objects in one paint container"
+            )
+        parent = next(iter(parents.values()))
+        siblings, child_order = self._zorder_paint_siblings(parent, leaves)
+        destination = self._reorder_siblings(siblings, selected_ids, mode)
+        if all(before is after for before, after in zip(siblings, destination)):
+            return False
+        values = self._zorder_values_for_order(
+            siblings, destination, child_order, selected_ids
+        )
+        operations = [
+            PropertyOperation.for_setter(
+                artist,
+                artist,
+                "zorder",
+                values[id(artist)],
+            )
+            for artist in siblings
+            if float(artist.get_zorder()) != values[id(artist)]
         ]
-        if mode == "forward":
-            delta = 1.0
-        elif mode == "backward":
-            delta = -1.0
-        elif mode == "front":
-            target = max((float(artist.get_zorder()) for artist in others), default=0.0) + 1
-            delta = target - max(value for _artist, value in old_values)
-        else:
-            target = min((float(artist.get_zorder()) for artist in others), default=0.0) - 1
-            delta = target - min(value for _artist, value in old_values)
-        new_values = [(artist, value + delta) for artist, value in old_values]
-
-        def apply(values):
-            for artist, value in values:
-                artist.set_zorder(value)
-                self.figure.change_tracker.addChange(
-                    artist, f".set_zorder({value!r})"
-                )
-            self.invalidate_geometry_cache()
-            self.figure.canvas.draw_idle()
-
-        def undo():
-            apply(old_values)
-
-        def redo():
-            apply(new_values)
-
-        redo()
-        self.figure.change_tracker.addEdit([undo, redo, "Change stacking order"])
-        return True
+        if not operations:
+            return False
+        for operation in operations:
+            try:
+                getReference(operation.target)
+            except (AttributeError, IndexError, TypeError, ValueError) as error:
+                raise ValueError(
+                    f"Cannot replay stacking order for "
+                    f"{type(operation.target).__name__}"
+                ) from error
+        return PropertyPlan(self.figure, operations).commit(
+            "Change stacking order"
+        )
 
     def invalidate_geometry_cache(self, _event=None):
         """Drop visible-bound caches after any render/transform change."""
