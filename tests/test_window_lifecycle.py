@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import weakref
 
 import matplotlib
@@ -11,15 +12,16 @@ import numpy as np
 from matplotlib import _pylab_helpers
 from matplotlib.backend_bases import KeyEvent
 from matplotlib.backends.qt_compat import QtCore, QtWidgets
-from matplotlib.patches import Rectangle
+from matplotlib.patches import Polygon, Rectangle
 
 from pylustrator import QtGuiDrag
 from pylustrator.change_tracker import init_figure
-from pylustrator.drag_helper import DragManager
+from pylustrator.drag_helper import DragManager, GrabbableRectangleSelection
 from pylustrator.components.matplotlibwidget import EmbeddedFigureManager
 from pylustrator.interaction import SelectionMode
 from pylustrator.QtGuiDrag import PlotWindow
 from pylustrator.snap import TargetWrapper
+from test_selection_indicator import attach_drag_manager, make_selection_scene
 
 
 def _callback_count(canvas, owner) -> int:
@@ -234,6 +236,136 @@ def test_drag_manager_activate_deactivate_is_idempotent() -> None:
         _flush_deferred_deletes(app)
         plt.close(fig)
         QtGuiDrag.no_save_allowed = original_no_save
+    assert app is not None
+
+
+def test_permanent_manager_dispose_releases_selection_scene_tree_and_backrefs() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    polygon = ax.add_patch(
+        Polygon([(0.2, 0.2), (0.8, 0.2), (0.5, 0.75)], closed=True)
+    )
+    manager = attach_drag_manager(fig)
+    try:
+        manager.activate()
+        fig.canvas.draw()
+        manager.set_selection_mode(SelectionMode.DIRECT)
+        manager.select_element(polygon)
+
+        selection = manager.selection
+        scene = fig._pyl_scene_scene
+        figure_scene_root = fig._pyl_scene
+        resize_grabbers = tuple(selection.grabbers)
+        rotation = selection.rotation_grabber
+        direct_editor = selection.direct_point_editor
+        handle_items = tuple(grabber.ellipse for grabber in resize_grabbers) + (
+            rotation.line,
+            rotation.pivot_marker,
+            rotation.handle,
+        )
+        overlay_items = tuple(selection._direct_point_overlay_items)
+        selection_roots = (
+            selection.graphics_scene_myparent,
+            selection.graphics_scene_snapparent,
+        )
+        old_scene_items = tuple(
+            item for item in scene.items() if item is not figure_scene_root
+        )
+        manager_ref = weakref.ref(manager)
+        selection_ref = weakref.ref(selection)
+        controller_refs = tuple(
+            weakref.ref(controller)
+            for controller in (*resize_grabbers, rotation, direct_editor)
+        )
+        item_refs = tuple(weakref.ref(item) for item in old_scene_items)
+
+        assert len(scene.items()) > 1
+        assert len(overlay_items) == 3
+        scene.grabber_pressed = handle_items[0]
+        assert manager.dispose(redraw=False) is True
+
+        assert len(scene.items()) == 1
+        assert scene.items()[0] is figure_scene_root
+        assert scene.grabber_pressed is None
+        assert fig.figure_dragger is None
+        assert fig.selection is None
+        assert manager.selection is None
+        assert selection.grabbers == []
+        assert selection.rotation_grabber is None
+        assert selection.direct_point_editor is None
+        assert selection.parent is None
+        assert selection.figure is None
+        for grabber in resize_grabbers:
+            assert grabber.ellipse is None
+            assert grabber.parent is None
+            assert grabber.figure is None
+        assert rotation.line is None
+        assert rotation.pivot_marker is None
+        assert rotation.handle is None
+        assert rotation.parent is None
+        assert rotation.figure is None
+        assert direct_editor.parent is None
+        assert direct_editor.figure is None
+        for item in handle_items:
+            assert getattr(item, "grabber", None) is None
+            assert getattr(item, "view", None) is None
+            assert item.scene() is None
+        for item in overlay_items:
+            assert item.scene() is None
+        for root in selection_roots:
+            assert root.scene() is None
+
+        del grabber, item, root
+        manager = None
+        selection = None
+        resize_grabbers = None
+        rotation = None
+        direct_editor = None
+        handle_items = None
+        overlay_items = None
+        selection_roots = None
+        old_scene_items = None
+        for _ in range(3):
+            gc.collect()
+            _flush_deferred_deletes(app)
+
+        assert manager_ref() is None
+        assert selection_ref() is None
+        assert all(reference() is None for reference in controller_refs)
+        assert all(reference() is None for reference in item_refs)
+    finally:
+        current = getattr(fig, "figure_dragger", None)
+        if current is not None:
+            current.dispose(redraw=False)
+        plt.close(fig)
+    assert app is not None
+
+
+def test_selection_dispose_directly_disconnects_its_key_callback() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig = plt.figure(figsize=(4, 3), dpi=100)
+    scene, origin = make_selection_scene()
+    fig._pyl_scene_scene = scene
+    fig._pyl_scene = origin
+    selection = GrabbableRectangleSelection(fig, origin)
+    selection_ref = weakref.ref(selection)
+
+    try:
+        assert _callback_count(fig.canvas, selection) == 1
+        assert selection.dispose() is True
+        assert _callback_count(fig.canvas, selection) == 0
+        assert len(scene.items()) == 1
+        assert scene.items()[0] is origin
+
+        selection = None
+        for _ in range(3):
+            gc.collect()
+            _flush_deferred_deletes(app)
+        assert selection_ref() is None
+    finally:
+        if selection is not None:
+            selection.dispose()
+        plt.close(fig)
     assert app is not None
 
 

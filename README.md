@@ -62,6 +62,16 @@ the user-facing interaction rules shared.
   item. Failed or cancelled gestures restore artist geometry, generated-change
   bookkeeping, selection state, and interaction scope; semantic and
   floating-point no-ops are dropped.
+- **Adapter-owned Direct Selection.** `A` exposes batched path anchors without
+  turning them into synthetic Matplotlib Artists. Polygon vertices, linear
+  PathPatch anchors, Line2D endpoints, and Annotation text/data anchors share
+  one preview/preflight/commit contract; unsupported curves, layout-owned
+  leaves, and unrepresentable storage fail with a typed reason before mutation.
+- **Semantic inline text editing.** Enter or double-click opens a draft overlay
+  for ordinary Text, Annotation, axis labels, tick labels, and Legend text.
+  Matplotlib is untouched until Ctrl/Cmd+Enter or focus commit; Escape cancels,
+  and formatter-owned tick text commits through its Axis rather than a
+  transient Text setter.
 
 ### Interaction and Geometry Improvements
 
@@ -132,6 +142,12 @@ the user-facing interaction rules shared.
   per vertex. Interaction-scoped geometry and legend discovery caches reduce
   repeated renderer work, while source-only saves avoid replaying unrelated
   figure exports.
+- Line2D endpoint edits persist as compact endpoint deltas that compose after
+  any existing full-data command. Sparse Undo state preserves ndarray and
+  MaskedArray dtype, shape, masks, fill values, and hidden payloads without
+  constructing multi-megabyte generated commands on the interaction thread.
+  Replay is bound lazily to the exact Line2D instance, so it does not mutate
+  Matplotlib's process-wide Line2D class or scan unrelated lines at attach time.
 - Rigid-rotation commits rebuild a live candidate from the same planner used by
   preview, verify its native/display and paint/clip destination, and prepare
   every selected object before the first mutation. Pointer previews use the
@@ -155,7 +171,7 @@ and the extension API is introduced in the [API documentation](docs/api.rst).
 
 At the current fork milestone on 2026-07-18:
 
-- the full test suite passed with **1,299 passed and 178 skipped**;
+- the full test suite passed with **1,378 passed and 178 skipped**;
 - Ruff and Ty completed successfully, with an explicit incremental type-check
   baseline for the dynamic Matplotlib/Qt interaction modules; and
 - the real multi-panel Fig2 workflow was used to validate selection, movement,

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Iterable, Sequence
 
 import numpy as np
 from matplotlib.artist import Artist
@@ -13,6 +13,7 @@ from .artist_adapters import (
     AppearanceScalePlan,
     ArtistAdapter,
     ChangeRecord,
+    PointHandleModel,
     RigidRotationPlan,
     UnsupportedArtistError,
     get_artist_adapter,
@@ -122,6 +123,181 @@ class NativeRotationPlan:
         return self.selection_points
 
 
+@dataclass(frozen=True)
+class _OwnedPointPreview:
+    """Capability token for an internally exclusive point buffer."""
+
+    values: np.ndarray
+
+
+def _owned_point_preview(points: np.ndarray) -> _OwnedPointPreview:
+    """Transfer one compatible internal buffer without copying it."""
+
+    if not isinstance(points, np.ndarray):
+        raise TypeError("Owned point preview must be an ndarray")
+    if points.dtype != np.dtype(float):
+        raise ValueError("Owned point preview must use the platform float dtype")
+    if points.ndim != 2 or points.shape[1] != 2:
+        raise ValueError("Owned point preview must have shape (N, 2)")
+    if not points.flags.c_contiguous:
+        raise ValueError("Owned point preview must be C-contiguous")
+    return _OwnedPointPreview(points)
+
+
+def _readonly_point_preview(points) -> np.ndarray:
+    """Freeze points, copying unless the caller transfers internal ownership."""
+
+    if isinstance(points, _OwnedPointPreview):
+        values = points.values
+    else:
+        values = np.asarray(points, dtype=float)
+        if values.size == 0:
+            values = np.empty((0, 2), dtype=float)
+        if values.ndim != 2 or values.shape[1] != 2:
+            raise ValueError("Point preview must have shape (N, 2)")
+        # PointEditSource and PointEditPlan are public constructors.  Their
+        # inputs may therefore retain a writable alias outside pylustrator;
+        # only the private ownership token is allowed to skip this copy.
+        values = np.array(values, dtype=float, order="C", copy=True)
+    values.setflags(write=False)
+    readonly = memoryview(values).toreadonly()
+    return np.frombuffer(readonly, dtype=float).reshape(values.shape)
+
+
+@dataclass(frozen=True)
+class PointEditSource:
+    """Immutable gesture-start truth for one parent Artist's anchor model."""
+
+    target: Artist
+    handle_model: PointHandleModel
+    source_fingerprint: object
+    topology_token: object
+    control_points: np.ndarray
+    selection_points: np.ndarray
+    preview_context: object = None
+
+    def __post_init__(self) -> None:
+        if self.handle_model.target is not self.target:
+            raise ValueError("Point-handle model belongs to another Artist")
+        object.__setattr__(
+            self,
+            "control_points",
+            _readonly_point_preview(self.control_points),
+        )
+        object.__setattr__(
+            self,
+            "selection_points",
+            GeometryTransformPlan._immutable_points(self.selection_points),
+        )
+
+    @classmethod
+    def capture(
+        cls,
+        target: Artist,
+        *,
+        handle_model: PointHandleModel | None = None,
+    ) -> "PointEditSource":
+        return _capture_point_edit_source(target, handle_model=handle_model)
+
+    def control_array(self) -> np.ndarray:
+        return self.control_points
+
+    def selection_array(self) -> np.ndarray:
+        return self.selection_points
+
+
+@dataclass(frozen=True)
+class PreparedPointEditPlan:
+    """Release-time candidate whose full native payload is safe to apply."""
+
+    frozen: "PointEditPlan"
+    control_points: np.ndarray
+    native_control_points: np.ndarray
+    selection_points: np.ndarray
+    is_noop: bool = False
+
+    def __post_init__(self) -> None:
+        for name in (
+            "control_points",
+            "native_control_points",
+            "selection_points",
+        ):
+            object.__setattr__(
+                self,
+                name,
+                GeometryTransformPlan._immutable_points(getattr(self, name)),
+            )
+
+    def native_array(self) -> np.ndarray:
+        return self.native_control_points
+
+
+@dataclass(frozen=True)
+class PointEditPlan:
+    """Frozen Direct Selection preview for one or more stable anchors."""
+
+    source: PointEditSource
+    point_keys: tuple[int, ...]
+    destination_positions: np.ndarray
+    is_noop: bool
+    control_points: np.ndarray
+    selection_points: np.ndarray
+
+    def __post_init__(self) -> None:
+        keys = tuple(int(key) for key in self.point_keys)
+        destinations = GeometryTransformPlan._immutable_points(
+            self.destination_positions
+        )
+        if not keys or len(keys) != len(destinations) or len(set(keys)) != len(keys):
+            raise ValueError("Point edit needs one destination per unique key")
+        object.__setattr__(self, "point_keys", keys)
+        object.__setattr__(self, "destination_positions", destinations)
+        object.__setattr__(
+            self,
+            "control_points",
+            _readonly_point_preview(self.control_points),
+        )
+        object.__setattr__(
+            self,
+            "selection_points",
+            GeometryTransformPlan._immutable_points(self.selection_points),
+        )
+
+    @classmethod
+    def preview(
+        cls,
+        source: PointEditSource,
+        point_keys: int | Sequence[int],
+        destination_positions,
+    ) -> "PointEditPlan":
+        keys = (
+            (int(point_keys),)
+            if isinstance(point_keys, (int, np.integer))
+            else tuple(int(key) for key in point_keys)
+        )
+        destinations = np.asarray(destination_positions, dtype=float)
+        if destinations.shape == (2,) and len(keys) == 1:
+            destinations = destinations.reshape(1, 2)
+        return _preview_point_edit(source, keys, destinations)
+
+    def control_array(self) -> np.ndarray:
+        return self.control_points
+
+    def selection_array(self) -> np.ndarray:
+        return self.selection_points
+
+    def destination_array(self) -> np.ndarray:
+        return self.destination_positions
+
+    def prepare(self) -> PreparedPointEditPlan:
+        return _prepare_point_edit_plan(self)
+
+    def commit(self) -> bool:
+        """Revalidate and atomically apply without installing UI history."""
+
+        return _commit_point_edit_plan(self)
+
+
 def _array_digest(points) -> tuple[tuple[int, ...], str, bytes]:
     values = np.ascontiguousarray(np.asarray(points, dtype=float))
     hasher = hashlib.sha256()
@@ -173,14 +349,24 @@ def _geometry_context_fingerprint(adapter: ArtistAdapter) -> tuple:
         affine_matrix = ()
         transform_flags = ()
 
-    axes = target if hasattr(target, "get_xlim") and hasattr(target, "get_ylim") else (
-        getattr(target, "axes", None)
+    axes = (
+        target
+        if hasattr(target, "get_xlim") and hasattr(target, "get_ylim")
+        else (getattr(target, "axes", None))
     )
     if axes is None:
         axes_state = ()
     else:
         try:
-            position = axes.get_position().bounds
+            # ``Axes.get_position()`` calls ``apply_aspect()`` and can mark a
+            # fully drawn Axes/Figure stale.  A source fingerprint is a query,
+            # so read Matplotlib's already-finalized active position directly.
+            active_position = getattr(axes, "_position", None)
+            position = (
+                active_position.bounds
+                if active_position is not None
+                else axes.get_position().bounds
+            )
         except (AttributeError, TypeError, ValueError, RuntimeError):
             position = ()
         axes_state = (
@@ -293,6 +479,355 @@ def _validate_display_round_trip(expected, actual, *, operation: str) -> None:
         )
 
 
+def _point_edit_fingerprint(
+    adapter: ArtistAdapter,
+    control_points,
+    selection_points,
+) -> tuple:
+    return (
+        _geometry_source_fingerprint(
+            adapter,
+            control_points,
+            selection_points,
+        ),
+        adapter.point_edit_topology_token(),
+    )
+
+
+@selection_geometry_snapshot()
+def _capture_point_edit_source(
+    target: Artist,
+    *,
+    handle_model: PointHandleModel | None = None,
+) -> PointEditSource:
+    adapter = get_artist_adapter(target)
+    support = adapter.operation_support(TransformOperation.EDIT_POINTS)
+    if not support.supported:
+        raise TransformPreflightError([(target, support)])
+    model = adapter.point_handle_model() if handle_model is None else handle_model
+    if model.target is not target:
+        raise ValueError("Point-handle model belongs to another Artist")
+    topology = adapter.point_edit_topology_token()
+    if model.topology_token != topology:
+        raise StaleTransformPlanError(
+            [
+                (
+                    target,
+                    OperationSupport.denied(
+                        TransformOperation.EDIT_POINTS,
+                        "Point topology changed before the gesture source was captured",
+                    ),
+                )
+            ]
+        )
+    control = adapter.point_array(adapter.control_points())
+    selection = adapter.point_array(adapter.selection_points())
+    keys = np.asarray(model.keys, dtype=int)
+    if (
+        np.any(keys < 0)
+        or np.any(keys >= len(control))
+        or len(model.positions_array()) != len(keys)
+    ):
+        raise UnsupportedArtistError(
+            "Point-handle keys do not match the Artist control inventory"
+        )
+    _validate_display_round_trip(
+        model.positions_array(),
+        control[keys],
+        operation=f"{type(target).__name__} point-handle model",
+    )
+    return PointEditSource(
+        target=target,
+        handle_model=model,
+        source_fingerprint=_point_edit_fingerprint(adapter, control, selection),
+        topology_token=topology,
+        control_points=_owned_point_preview(control),
+        selection_points=selection,
+        preview_context=adapter.point_edit_preview_context(
+            source_control_points=control,
+            source_selection_points=selection,
+            handle_model=model,
+        ),
+    )
+
+
+def _preview_point_edit(
+    source: PointEditSource,
+    point_keys: tuple[int, ...],
+    destination_positions: np.ndarray,
+) -> PointEditPlan:
+    target = source.target
+    adapter = get_artist_adapter(target)
+    if destination_positions.shape != (len(point_keys), 2) or not np.all(
+        np.isfinite(destination_positions)
+    ):
+        raise ValueError("Point destinations must be finite N-by-2 display positions")
+    model = source.handle_model
+    if any(key not in model.keys for key in point_keys):
+        raise UnsupportedArtistError(
+            "Point key is outside the frozen Direct Selection model"
+        )
+
+    requested = source.control_array().copy()
+    for key, destination in zip(point_keys, destination_positions):
+        aliases = model.aliases_for(key)
+        if any(index < 0 or index >= len(requested) for index in aliases):
+            raise UnsupportedArtistError(
+                "Point aliases no longer fit the frozen control inventory"
+            )
+        requested[np.asarray(aliases, dtype=int)] = destination
+
+    planned_raw = adapter.preview_point_edit_control_points(
+        requested,
+        point_keys=point_keys,
+    )
+    planned = np.asarray(planned_raw, dtype=float)
+    if planned.ndim != 2 or planned.shape[1:] != (2,):
+        raise UnsupportedArtistError(
+            "Point preview must preserve an N-by-2 control array"
+        )
+    if planned is not requested:
+        _validate_display_round_trip(
+            requested,
+            planned,
+            operation=f"{type(target).__name__} point preview",
+        )
+    selection = adapter.point_array(
+        adapter.preview_point_edit_selection_points(
+            planned,
+            source_control_points=source.control_array(),
+            source_selection_points=source.selection_array(),
+            point_keys=point_keys,
+            preview_context=source.preview_context,
+        )
+    )
+    if not len(adapter.finite_points(selection)):
+        raise UnsupportedArtistError(
+            f"{type(target).__name__} point edit would leave no visible geometry"
+        )
+    _validate_display_round_trip(
+        destination_positions,
+        planned[np.asarray(point_keys, dtype=int)],
+        operation=f"{type(target).__name__} point handles",
+    )
+    source_positions = source.control_array()[np.asarray(point_keys, dtype=int)]
+    is_noop = bool(
+        np.array_equal(source_positions, destination_positions, equal_nan=True)
+    )
+    if is_noop:
+        planned = source.control_array()
+        selection = source.selection_array()
+    return PointEditPlan(
+        source=source,
+        point_keys=point_keys,
+        destination_positions=destination_positions,
+        is_noop=is_noop,
+        control_points=_owned_point_preview(planned),
+        selection_points=selection,
+    )
+
+
+@selection_geometry_snapshot()
+def _prepare_point_edit_plan(plan: PointEditPlan) -> PreparedPointEditPlan:
+    source = plan.source
+    target = source.target
+    adapter = get_artist_adapter(target)
+    support = adapter.operation_support(TransformOperation.EDIT_POINTS)
+    failures = []
+    if not support.supported:
+        failures.append(
+            (
+                target,
+                OperationSupport.denied(
+                    TransformOperation.EDIT_POINTS,
+                    f"Point-edit plan became stale after preflight: {support.reason}",
+                ),
+            )
+        )
+    try:
+        model = adapter.point_handle_model()
+        current_control = adapter.point_array(adapter.control_points())
+        current_selection = adapter.point_array(adapter.selection_points())
+        fingerprint = _point_edit_fingerprint(
+            adapter, current_control, current_selection
+        )
+    except (
+        AttributeError,
+        TypeError,
+        ValueError,
+        RuntimeError,
+        np.linalg.LinAlgError,
+    ) as error:
+        failures.append(
+            (
+                target,
+                OperationSupport.denied(
+                    TransformOperation.EDIT_POINTS,
+                    "Point-edit source cannot be revalidated: " + str(error),
+                ),
+            )
+        )
+        model = None
+        current_control = np.empty((0, 2), dtype=float)
+        current_selection = np.empty((0, 2), dtype=float)
+        fingerprint = None
+    if fingerprint != source.source_fingerprint:
+        failures.append(
+            (
+                target,
+                OperationSupport.denied(
+                    TransformOperation.EDIT_POINTS,
+                    "Point-edit plan is stale: source geometry, transform, "
+                    "viewport, clip, or topology changed after pointer press",
+                ),
+            )
+        )
+    if model is not None and (
+        model.topology_token != source.topology_token
+        or model.keys != source.handle_model.keys
+        or model.alias_groups != source.handle_model.alias_groups
+    ):
+        failures.append(
+            (
+                target,
+                OperationSupport.denied(
+                    TransformOperation.EDIT_POINTS,
+                    "Point-edit topology or stable handle identity changed",
+                ),
+            )
+        )
+    if failures:
+        raise StaleTransformPlanError(failures)
+
+    requested = current_control.copy()
+    for key, destination in zip(plan.point_keys, plan.destination_array()):
+        aliases = model.aliases_for(key)
+        requested[np.asarray(aliases, dtype=int)] = destination
+    try:
+        converted_native = adapter.point_array(adapter.display_to_native(requested))
+        native = adapter.point_array(adapter.native_control_points()).copy()
+        edited_indices = np.unique(
+            np.concatenate(
+                [
+                    np.asarray(model.aliases_for(key), dtype=int)
+                    for key in plan.point_keys
+                ]
+            )
+        )
+        source_native_values = native[edited_indices].copy()
+        if native.shape != converted_native.shape:
+            raise UnsupportedArtistError(
+                "Point-edit preparation changed the native control inventory"
+            )
+        for key in plan.point_keys:
+            aliases = np.asarray(model.aliases_for(key), dtype=int)
+            native[aliases] = converted_native[aliases]
+        native = adapter.point_array(adapter.canonicalize_native_control_points(native))
+        prepared_is_noop = bool(
+            np.array_equal(
+                source_native_values,
+                native[edited_indices],
+                equal_nan=True,
+            )
+        )
+        adapter.validate_native_control_points(native)
+        representable = adapter.point_array(adapter.native_to_display(native))
+        _validate_display_round_trip(
+            requested,
+            representable,
+            operation=f"{type(target).__name__} prepared point edit",
+        )
+        selection = adapter.point_array(
+            adapter.preview_point_edit_selection_points(
+                representable,
+                source_control_points=current_control,
+                source_selection_points=current_selection,
+                point_keys=plan.point_keys,
+                preview_context=None,
+            )
+        )
+        _validate_display_round_trip(
+            plan.control_array(),
+            representable,
+            operation=f"{type(target).__name__} frozen point preview",
+        )
+        _validate_display_round_trip(
+            plan.selection_array(),
+            selection,
+            operation=f"{type(target).__name__} frozen point selection",
+        )
+        _validate_display_round_trip(
+            plan.destination_array(),
+            representable[np.asarray(plan.point_keys, dtype=int)],
+            operation=f"{type(target).__name__} frozen point handles",
+        )
+    except UnsupportedArtistError:
+        raise
+    except (
+        AttributeError,
+        IndexError,
+        TypeError,
+        ValueError,
+        NotImplementedError,
+        RuntimeError,
+        np.linalg.LinAlgError,
+    ) as error:
+        raise StaleTransformPlanError(
+            [
+                (
+                    target,
+                    OperationSupport.denied(
+                        TransformOperation.EDIT_POINTS,
+                        "Point-edit native destination cannot be prepared: "
+                        + str(error),
+                    ),
+                )
+            ]
+        ) from error
+    return PreparedPointEditPlan(
+        frozen=plan,
+        control_points=representable,
+        native_control_points=native,
+        selection_points=selection,
+        is_noop=prepared_is_noop,
+    )
+
+
+@legend_owner_snapshot()
+def _commit_point_edit_plan(plan: PointEditPlan) -> bool:
+    if plan.is_noop:
+        return False
+    prepared = _prepare_point_edit_plan(plan)
+    if prepared.is_noop:
+        return False
+    adapter = get_artist_adapter(plan.source.target)
+    snapshot = adapter.point_edit_history_snapshot(plan.point_keys)
+    try:
+        tracker = adapter.change_tracker()
+    except AttributeError:
+        tracker = None
+    capture = getattr(tracker, "capture_recording_state", None)
+    recording_state = capture() if callable(capture) else None
+    try:
+        adapter.apply_native_point_edit(prepared.native_array())
+    except Exception as error:
+        rollback_failures = []
+        with suspend_change_recording():
+            try:
+                adapter.restore_point_edit_history_state(snapshot)
+            except Exception as rollback_error:
+                rollback_failures.append((adapter.target, rollback_error))
+        restore = getattr(tracker, "restore_recording_state", None)
+        if recording_state is not None and callable(restore):
+            try:
+                restore(recording_state)
+            except Exception as rollback_error:
+                rollback_failures.append((tracker, rollback_error))
+        ArtistAdapter.annotate_rollback_failures(error, rollback_failures)
+        raise
+    return True
+
+
 def _plan_geometry_transform(
     adapter: ArtistAdapter, intent: TransformIntent
 ) -> GeometryTransformPlan:
@@ -306,9 +841,7 @@ def _plan_geometry_transform(
         delta = np.asarray(intent.delta, dtype=float)
         is_noop = bool(np.array_equal(delta, np.zeros(2, dtype=float)))
         requested_control = source_control + delta
-        destination_selection = adapter.clip_selection_points(
-            source_selection + delta
-        )
+        destination_selection = adapter.clip_selection_points(source_selection + delta)
         adapter.preflight_translation(
             delta,
             control_points=source_control,
@@ -333,9 +866,7 @@ def _plan_geometry_transform(
 
     try:
         native = adapter.point_array(adapter.display_to_native(requested_control))
-        native = adapter.point_array(
-            adapter.canonicalize_native_control_points(native)
-        )
+        native = adapter.point_array(adapter.canonicalize_native_control_points(native))
         representable = adapter.point_array(adapter.native_to_display(native))
     except UnsupportedArtistError:
         raise
@@ -468,13 +999,9 @@ class TransformPlan:
                     TransformOperation.TRANSLATE,
                     TransformOperation.RESIZE_GEOMETRY,
                 }:
-                    geometry_plans.append(
-                        _plan_geometry_transform(adapter, intent)
-                    )
+                    geometry_plans.append(_plan_geometry_transform(adapter, intent))
                 elif intent.operation is TransformOperation.ROTATE:
-                    native_rotation_plans.append(
-                        _plan_native_rotation(adapter, intent)
-                    )
+                    native_rotation_plans.append(_plan_native_rotation(adapter, intent))
                 elif intent.operation is TransformOperation.RIGID_ROTATE:
                     rigid_rotation_plans.append(
                         adapter.plan_rigid_rotation(
@@ -483,9 +1010,7 @@ class TransformPlan:
                     )
                 elif intent.operation is TransformOperation.SCALE_APPEARANCE:
                     appearance_scale_plans.append(
-                        adapter._plan_preflighted_appearance_scale(
-                            float(intent.factor)
-                        )
+                        adapter._plan_preflighted_appearance_scale(float(intent.factor))
                     )
                 elif intent.operation is TransformOperation.REFLOW_LAYOUT:
                     legend_layout_plans.append(
@@ -521,13 +1046,9 @@ class TransformPlan:
         }:
             return tuple(plan.control_array() for plan in self.geometry_plans)
         if operation is TransformOperation.ROTATE:
-            return tuple(
-                plan.control_array() for plan in self.native_rotation_plans
-            )
+            return tuple(plan.control_array() for plan in self.native_rotation_plans)
         if operation is TransformOperation.RIGID_ROTATE:
-            return tuple(
-                plan.control_array() for plan in self.rigid_rotation_plans
-            )
+            return tuple(plan.control_array() for plan in self.rigid_rotation_plans)
         if operation is TransformOperation.REFLOW_LAYOUT:
             raise ValueError(
                 "Legend layout has no geometry control-point preview; commit and draw"
@@ -547,17 +1068,11 @@ class TransformPlan:
         }:
             return tuple(plan.selection_array() for plan in self.geometry_plans)
         if operation is TransformOperation.ROTATE:
-            return tuple(
-                plan.selection_array() for plan in self.native_rotation_plans
-            )
+            return tuple(plan.selection_array() for plan in self.native_rotation_plans)
         if operation is TransformOperation.RIGID_ROTATE:
-            return tuple(
-                plan.selection_array() for plan in self.rigid_rotation_plans
-            )
+            return tuple(plan.selection_array() for plan in self.rigid_rotation_plans)
         if operation is TransformOperation.SCALE_APPEARANCE:
-            return tuple(
-                plan.selection_array() for plan in self.appearance_scale_plans
-            )
+            return tuple(plan.selection_array() for plan in self.appearance_scale_plans)
         if operation is TransformOperation.REFLOW_LAYOUT:
             raise ValueError(
                 "Legend layout bounds are finalized by Matplotlib after commit and draw"
@@ -618,9 +1133,7 @@ class TransformPlan:
                 continue
             try:
                 current_control = adapter.point_array(adapter.control_points())
-                current_selection = adapter.point_array(
-                    adapter.selection_points()
-                )
+                current_selection = adapter.point_array(adapter.selection_points())
                 fingerprint = _geometry_source_fingerprint(
                     adapter, current_control, current_selection
                 )
@@ -710,9 +1223,7 @@ class TransformPlan:
                 if plan.is_noop
                 else not (
                     current_control.shape == destination.shape
-                    and np.array_equal(
-                        current_control, destination, equal_nan=True
-                    )
+                    and np.array_equal(current_control, destination, equal_nan=True)
                 )
             )
         if failures:
@@ -807,9 +1318,7 @@ class TransformPlan:
                 continue
             try:
                 current_control = adapter.point_array(adapter.control_points())
-                current_selection = adapter.point_array(
-                    adapter.selection_points()
-                )
+                current_selection = adapter.point_array(adapter.selection_points())
                 current_value = float(adapter.rotation())
                 fingerprint = _geometry_source_fingerprint(
                     adapter, current_control, current_selection
@@ -851,10 +1360,8 @@ class TransformPlan:
                 changed.append(False)
                 continue
             try:
-                live_destination = (
-                    adapter.preview_native_rotation_selection_points(
-                        plan.destination_value
-                    )
+                live_destination = adapter.preview_native_rotation_selection_points(
+                    plan.destination_value
                 )
                 _validate_display_round_trip(
                     plan.selection_array(),
@@ -885,9 +1392,7 @@ class TransformPlan:
                 )
                 changed.append(False)
                 continue
-            changed.append(
-                not plan.is_noop and current_value != plan.destination_value
-            )
+            changed.append(not plan.is_noop and current_value != plan.destination_value)
         if failures:
             raise StaleTransformPlanError(failures)
         return tuple(changed)
@@ -898,48 +1403,32 @@ class TransformPlan:
             TransformOperation.TRANSLATE,
             TransformOperation.RESIZE_GEOMETRY,
         }
-        geometry_changed = (
-            self._revalidate_geometry_sources() if geometry_only else ()
-        )
+        geometry_changed = self._revalidate_geometry_sources() if geometry_only else ()
         if geometry_only and not any(geometry_changed):
             return
         native_rotation_only = self.intent.operation is TransformOperation.ROTATE
         native_rotation_changed = (
-            self._revalidate_native_rotation_sources()
-            if native_rotation_only
-            else ()
+            self._revalidate_native_rotation_sources() if native_rotation_only else ()
         )
         if native_rotation_only and not any(native_rotation_changed):
             return
-        rigid_rotation_only = (
-            self.intent.operation is TransformOperation.RIGID_ROTATE
-        )
+        rigid_rotation_only = self.intent.operation is TransformOperation.RIGID_ROTATE
         prepared_rigid_rotation_plans = (
-            self._prepare_rigid_rotation_plans()
-            if rigid_rotation_only
-            else ()
+            self._prepare_rigid_rotation_plans() if rigid_rotation_only else ()
         )
         rigid_rotation_changed = tuple(
             adapter.rigid_rotation_plan_changes(plan)
-            for adapter, plan in zip(
-                self.adapters, prepared_rigid_rotation_plans
-            )
+            for adapter, plan in zip(self.adapters, prepared_rigid_rotation_plans)
         )
         if rigid_rotation_only and not any(rigid_rotation_changed):
             return
-        appearance_only = (
-            self.intent.operation is TransformOperation.SCALE_APPEARANCE
-        )
+        appearance_only = self.intent.operation is TransformOperation.SCALE_APPEARANCE
         layout_only = self.intent.operation is TransformOperation.REFLOW_LAYOUT
         snapshots = [
             (
                 adapter.appearance_state()
                 if appearance_only
-                else (
-                    adapter.layout_state()
-                    if layout_only
-                    else adapter.snapshot()
-                )
+                else (adapter.layout_state() if layout_only else adapter.snapshot())
             )
             for adapter in self.adapters
         ]
@@ -1015,26 +1504,20 @@ class TransformPlan:
         except Exception as error:
             rollback_failures = []
             with suspend_change_recording():
-                for adapter, state in zip(
-                    reversed(self.adapters), reversed(snapshots)
-                ):
+                for adapter, state in zip(reversed(self.adapters), reversed(snapshots)):
                     try:
                         if appearance_only:
                             adapter.restore_appearance_state(
                                 state, record_changes=False
                             )
                         elif layout_only:
-                            adapter.restore_layout_state(
-                                state, record_changes=False
-                            )
+                            adapter.restore_layout_state(state, record_changes=False)
                         else:
                             adapter.restore(state)
                     except Exception as rollback_error:
                         # Continue restoring earlier targets even when the adapter
                         # that failed the commit also cannot restore itself.
-                        rollback_failures.append(
-                            (adapter.target, rollback_error)
-                        )
+                        rollback_failures.append((adapter.target, rollback_error))
             for tracker, state in tracker_states:
                 try:
                     tracker.restore_recording_state(state)
@@ -1047,6 +1530,9 @@ class TransformPlan:
 __all__ = [
     "GeometryTransformPlan",
     "NativeRotationPlan",
+    "PointEditPlan",
+    "PointEditSource",
+    "PreparedPointEditPlan",
     "StaleTransformPlanError",
     "TransformPlan",
     "TransformPreflightError",

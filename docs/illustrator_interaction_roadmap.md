@@ -24,7 +24,7 @@ Implementation order follows architectural dependencies.
 
 Status (2026-07-18): implemented on
 ``codex/p0-correctness-performance``. The current implementation is covered by
-1,299 passing tests, 178 explicit skips, no strict xfails, Ruff, the full Fig2
+1,378 passing tests, 178 explicit skips, no strict xfails, Ruff, the full Fig2
 interaction probe, and a read-only smoke replay of the unmodified formal Fig2.
 The formal file retained SHA-256
 ``aba67bbd663fd16da535aa30d43f607c7205d096455f44544e518607cdce2dbb``.
@@ -552,7 +552,7 @@ target, raw leaf, and blocked state. Cold median/p95 fell from
 from a fail-open unmeasured tail whose foreground hit is late in paint order;
 no renderer measurement or object is dropped to avoid it.
 
-The combined repository suite now passes 1,299 tests with 178 explicit skips.
+The combined repository suite now passes 1,378 tests with 178 explicit skips.
 Matplotlib 3.8.4 / NumPy 1.23.5 passes the 87 new and directly related tests.
 A read-only real-Fig2 fork produced edge/center hits, one atomic history item,
 ``2.27e-13 px`` preview/commit error, and zero Undo/Redo error. The formal Fig2
@@ -610,18 +610,67 @@ draw contracts, and over-budget rasters remain conservative. Capture success,
 failure, and denial leave the Artist, clip dependency, Legend/Axes/Figure
 owners, callbacks, and derived draw state unchanged.
 
-The combined suite passes 1,299 tests with 178 explicit skips and Ruff. The
+The combined suite passes 1,378 tests with 178 explicit skips and Ruff. The
 read-only Fig2 fork retains identical accepted preview/commit/Undo geometry,
 and the formal file remains byte-identical at SHA-256
 ``aba67bbd663fd16da535aa30d43f607c7205d096455f44544e518607cdce2dbb``.
 
+The Direct Selection and inline-text milestone is now complete on
+``codex/p2-direct-selection-editing``. Point handles remain adapter-owned
+secondary state below one selected Artist; they never enter the Artist hit
+stack, logical scene, or ownership graph. Polygon vertices, linear PathPatch
+anchors, the two finite Line2D endpoints, and Annotation text/data anchors use
+one immutable preview and release-time revalidated transaction. Shift builds a
+multi-anchor selection, Escape cancels without clearing it, and Undo/Redo
+restores it even when production geometry waits for the next draw. Late
+history/signal/UI failures restore geometry, generated-change bookkeeping,
+history, previews, and pointer state atomically.
+
+The real Fig2 fork exposes 216 supported Artists and 502 handles; all 502 pass
+the inward preview/prepare oracle with at most ``2.27e-13 px`` error and zero
+preview mutation. Four zero-length markerless lines are now typed-denied before
+gesture start, as are Legend/layout-owned lines. For a synthetic 100k-point
+Line2D, first-frame p95 is ``12.18 ms``, warm p95 ``0.318 ms``, and point-plan
+release p95 ``26.99 ms``. The overlay always uses three Qt items; unchanged
+1024-anchor draws skip path reconstruction. Endpoint persistence is a compact
+delta that composes after an existing full-data command, and sparse history
+restores ndarray/MaskedArray storage and numeric promotion without building a
+multi-megabyte command on the UI thread.
+
+Final hardening keeps those contracts local and disposable. Permanent window
+close removes all selection handles and callback back-references; failures in
+the first save-point, recording capture, or history snapshot clean the gesture
+without invoking document rollback. Public frozen point sources copy external
+buffers, while internal owned buffers retain the zero-extra-copy 100k path.
+Sparse Line2D replay is attached only to the exact target instance and fails
+closed on third-party name collisions instead of patching the global Line2D
+class. On the minimum Matplotlib 3.8 stack, an exact isolated Annotation arrow
+clip proxy reduced warm preview CPU time by about half while matching live
+arrow path vertices and codes exactly across modern and legacy connection
+styles.
+
+Inline editing is draft-only until commit. Enter or double-click opens one
+overlay; Enter inserts a newline, Ctrl/Cmd+Enter commits, Escape cancels, and an
+external click commits before continuing. Ordinary Text, Annotation, axis
+labels, tick labels, and current/non-current Legend text use typed semantic
+plans; formatter-owned tick labels commit through their Axis. Reentrant focus
+or canvas callbacks cannot enter the same commit twice. In the Fig2 audit all
+232 selectable Text objects are supported except the 26 deliberately denied
+Axis offset Text objects; eight representative semantic workflows pass exact
+identity, draw, Undo/Redo, and replay checks.
+
+Curved PathPatch remains an explicit next-stage boundary. CURVE3/CURVE4 cannot
+be enabled safely by exposing their raw vertices: Illustrator semantics need
+distinct on-curve anchors, in/out Bézier handles, linked-handle modes, and
+anchor moves that carry their handles. The current linear-only denial remains
+fail-closed until that richer node model is designed.
+
 Next implementation sequence, with no interaction-latency regression allowed:
 
-1. Build Direct Selection path/endpoint editing and inline text editing on the
-   same plan/transaction boundary; do not mutate raw arrays directly from UI
-   code.
-2. Add semantic duplicate/copy/paste, Select Same, and style transfer using
+1. Add semantic duplicate/copy/paste, Select Same, and style transfer using
    stable locators rather than copying Matplotlib ownership links.
+2. Design the Bézier anchor/in-out-handle model before enabling curved
+   PathPatch Direct Selection.
 3. Extend content ghosts only through fixed scene-clip layers and closed visual
    state contracts for collections/images; do not broaden the current bitmap
    affine approximation.

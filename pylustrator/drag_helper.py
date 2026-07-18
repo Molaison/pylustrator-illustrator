@@ -30,6 +30,7 @@ from matplotlib.collections import Collection
 from matplotlib.image import AxesImage
 from matplotlib.legend import Legend
 from matplotlib.lines import Line2D
+from matplotlib.path import Path as MplPath
 from matplotlib.text import Annotation, Text
 from matplotlib.patches import Patch, Rectangle
 from matplotlib.backend_bases import MouseEvent, KeyEvent
@@ -39,6 +40,7 @@ from qtpy import QtCore, QtGui, QtWidgets
 from .artist_adapters import (
     ArtistAdapter,
     PatchAdapter,
+    PointHandleModel,
     UnsupportedArtistError,
     invalidate_legend_owner_inventory,
     iter_figure_legends,
@@ -73,8 +75,19 @@ from .smart_guide_ui import (
     invalidate_smart_guide_cache,
     schedule_smart_guide_warmup,
 )
-from .transform_engine import TransformPlan
-from .property_adapters import axis_tick_label_reference
+from .transform_engine import (
+    PointEditPlan,
+    PointEditSource,
+    StaleTransformPlanError,
+    TransformPlan,
+    TransformPreflightError,
+)
+from .property_adapters import (
+    StaleTextContentPlanError,
+    TextContentPlan,
+    TextContentPreflightError,
+    axis_tick_label_reference,
+)
 from .property_transactions import PropertyOperation, PropertyPlan
 from .commands import InteractionState, ObjectLocator, semantic_equal
 from .lifecycle_commands import delete_selection
@@ -118,9 +131,7 @@ _BOUNDED_NATIVE_CONTAINS = frozenset(
         EditorGroup.contains,
     }
 )
-_BOUNDED_ADAPTER_HIT_TESTS = frozenset(
-    {ArtistAdapter.hit_test, PatchAdapter.hit_test}
-)
+_BOUNDED_ADAPTER_HIT_TESTS = frozenset({ArtistAdapter.hit_test, PatchAdapter.hit_test})
 
 
 class InteractionRollbackError(RuntimeError):
@@ -129,8 +140,7 @@ class InteractionRollbackError(RuntimeError):
     def __init__(self, failures):
         self.failures = tuple(failures)
         details = "; ".join(
-            f"{type(target).__name__}: {error}"
-            for target, error in self.failures
+            f"{type(target).__name__}: {error}" for target, error in self.failures
         )
         super().__init__(f"Interaction rollback was incomplete: {details}")
 
@@ -187,9 +197,7 @@ def _container_keeps_children(artist: Artist) -> bool:
 def _event_has_modifier(event, modifier: str) -> bool:
     key = getattr(event, "key", None)
     return (
-        modifier in key.split("+")
-        if event is not None and key is not None
-        else False
+        modifier in key.split("+") if event is not None and key is not None else False
     )
 
 
@@ -284,9 +292,7 @@ class GrabFunctions(object):
             and self.dir & DIR_Y0
             and self.dir & DIR_Y1
         )
-        if whole_object and bool(
-            getattr(self.parent, "smart_guides_enabled", True)
-        ):
+        if whole_object and bool(getattr(self.parent, "smart_guides_enabled", True)):
             manager = getattr(self.figure, "figure_dragger", None)
             if manager is not None:
                 try:
@@ -427,6 +433,473 @@ class GrabFunctions(object):
                 self.figure.canvas.schedule_draw()
 
 
+class DirectPointEditor(GrabFunctions):
+    """Pointer controller for adapter-owned anchors below one selected Artist."""
+
+    def __init__(self, parent):
+        super().__init__(parent, DIR_X0 | DIR_X1 | DIR_Y0 | DIR_Y1)
+        self.active_key = None
+        self.selected_keys = ()
+        self.source = None
+        self.plan = None
+        self.last_error = None
+
+    def begin(self, key: int, event: MouseEvent) -> None:
+        if self.got_artist:
+            self.cancel_event()
+        key = int(key)
+        additive = _event_has_modifier(event, "shift")
+        if additive:
+            selected = tuple(dict.fromkeys((*self.selected_keys, key)))
+        elif key in self.selected_keys:
+            selected = self.selected_keys
+        else:
+            selected = (key,)
+        self.selected_keys = selected
+        self.active_key = key
+        self.parent.restore_direct_point_selection(selected, primary=key)
+        self.button_press_event(event)
+
+    def clickedEvent(self, event: MouseEvent) -> None:
+        model = self.parent.direct_point_model
+        if model is None or self.active_key not in model.keys:
+            raise UnsupportedArtistError(
+                "The selected point is no longer present on this Artist"
+            )
+        if any(key not in model.keys for key in self.selected_keys):
+            raise UnsupportedArtistError(
+                "The selected point set is no longer present on this Artist"
+            )
+        indices = [model.keys.index(key) for key in self.selected_keys]
+        self.start_positions = np.asarray(
+            model.positions_array()[indices], dtype=float
+        ).copy()
+        self.mouse_xy = np.asarray((event.x, event.y), dtype=float)
+        self.source = None
+        self.plan = None
+        self.last_error = None
+
+    def movedEvent(self, event: MouseEvent) -> None:
+        delta = np.asarray((event.x, event.y), dtype=float) - self.mouse_xy
+        if _event_has_modifier(event, "shift"):
+            delta = np.asarray(
+                _constrain_to_cardinal_direction(
+                    delta, DIR_X0 | DIR_X1 | DIR_Y0 | DIR_Y1
+                ),
+                dtype=float,
+            )
+        try:
+            if self.source is None:
+                target = self.parent.targets[0].target
+                self.source = PointEditSource.capture(
+                    target,
+                    handle_model=self.parent.direct_point_model,
+                )
+            destinations = self.start_positions + delta
+            plan = PointEditPlan.preview(
+                self.source,
+                self.selected_keys,
+                destinations,
+            )
+        except (
+            StaleTransformPlanError,
+            TransformPreflightError,
+            UnsupportedArtistError,
+            IndexError,
+            ValueError,
+        ) as error:
+            self.plan = None
+            self.last_error = error
+            self.parent.clear_direct_point_preview(refresh=True)
+            return
+        self.plan = plan
+        self.last_error = None
+        self.parent.update_direct_point_preview(plan)
+        self.moved = not plan.is_noop
+
+    def _reset_gesture(self) -> None:
+        self.source = None
+        self.plan = None
+        self.last_error = None
+        self.moved = False
+
+    def _restore_with_active_point(self, restore, keys: tuple[int, ...], primary: int):
+        def wrapped():
+            restore()
+            self.parent.restore_direct_point_selection(
+                keys,
+                primary=primary,
+                defer_if_unavailable=True,
+            )
+
+        return wrapped
+
+    def releasedEvent(self, event: MouseEvent) -> None:
+        plan = self.plan
+        selected_keys = tuple(self.selected_keys)
+        active_key = None if self.active_key is None else int(self.active_key)
+        target = None
+        tracker = None
+        store_start = None
+        recording_before = None
+        recording_captured = False
+        history_before = None
+        history_captured = False
+        commit_attempted = False
+        pending_error = None
+        try:
+            self.parent.clear_direct_point_preview(refresh=False)
+            if plan is None or plan.is_noop:
+                self.parent.update_extent()
+                self.parent.update_selection_rectangles()
+                return
+
+            if active_key is None or not selected_keys:
+                raise UnsupportedArtistError(
+                    "Point-edit release lost its selected anchor state"
+                )
+            target = self.parent.targets[0]
+            store_start = self._restore_with_active_point(
+                self.parent.get_save_point(
+                    [target], point_edit_keys=selected_keys
+                ),
+                selected_keys,
+                active_key,
+            )
+            tracker = self.figure.change_tracker
+            capture_recording = getattr(tracker, "capture_recording_state", None)
+            if callable(capture_recording):
+                recording_before = capture_recording()
+                recording_captured = True
+            if hasattr(tracker, "edits") and hasattr(tracker, "last_edit"):
+                history_before = (
+                    self.parent._copy_edit_history(tracker.edits),
+                    int(tracker.last_edit),
+                )
+                history_captured = True
+
+            commit_attempted = True
+            changed = plan.commit()
+            self.parent.update_extent()
+            self.parent.update_selection_rectangles()
+            if not changed:
+                return
+            store_end = self._restore_with_active_point(
+                self.parent.get_save_point(
+                    [target], point_edit_keys=selected_keys
+                ),
+                selected_keys,
+                active_key,
+            )
+            self.figure.signals.figure_selection_moved.emit()
+            tracker.addEdit([store_start, store_end, "Edit points"])
+            manager = getattr(self.figure, "figure_dragger", None)
+            invalidate = getattr(manager, "_invalidate_interaction_index", None)
+            if callable(invalidate):
+                invalidate()
+            canvas = self.figure.canvas
+            if hasattr(canvas, "schedule_draw"):
+                canvas.schedule_draw()
+            else:
+                canvas.draw_idle()
+        except Exception as error:
+            pending_error = error
+            rollback_failures = []
+            if commit_attempted and store_start is not None:
+                try:
+                    store_start()
+                except Exception as rollback_error:
+                    rollback_target = (
+                        target.target if target is not None else self.parent
+                    )
+                    rollback_failures.append((rollback_target, rollback_error))
+            restore_recording = getattr(tracker, "restore_recording_state", None)
+            if (
+                commit_attempted
+                and recording_captured
+                and callable(restore_recording)
+            ):
+                try:
+                    restore_recording(recording_before)
+                except Exception as rollback_error:
+                    rollback_failures.append((tracker, rollback_error))
+            if commit_attempted and history_captured:
+                try:
+                    edits, last_edit = history_before
+                    tracker.edits = self.parent._copy_edit_history(edits)
+                    tracker.last_edit = int(last_edit)
+                    refresh_history = getattr(tracker, "changeCountChanged", None)
+                    if callable(refresh_history):
+                        refresh_history()
+                except Exception as rollback_error:
+                    rollback_failures.append((tracker, rollback_error))
+            self.selected_keys = selected_keys
+            self.active_key = active_key
+            if active_key is not None and selected_keys:
+                try:
+                    self.parent.restore_direct_point_selection(
+                        selected_keys,
+                        primary=active_key,
+                        defer_if_unavailable=True,
+                    )
+                except Exception as rollback_error:
+                    rollback_failures.append((self.parent, rollback_error))
+            ArtistAdapter.annotate_rollback_failures(error, rollback_failures)
+            raise
+        finally:
+            cleanup_failures = []
+            try:
+                self.parent.clear_direct_point_preview(refresh=False)
+            except Exception as cleanup_error:
+                cleanup_failures.append((self.parent, cleanup_error))
+            try:
+                self._reset_gesture()
+            except Exception as cleanup_error:
+                cleanup_failures.append((self, cleanup_error))
+            try:
+                manager = getattr(self.figure, "figure_dragger", None)
+                if manager is not None and manager.grab_element is self:
+                    manager.grab_element = None
+            except Exception as cleanup_error:
+                cleanup_failures.append((self.figure, cleanup_error))
+            if cleanup_failures:
+                if pending_error is not None:
+                    ArtistAdapter.annotate_rollback_failures(
+                        pending_error, cleanup_failures
+                    )
+                else:
+                    cleanup_error = cleanup_failures[0][1]
+                    ArtistAdapter.annotate_rollback_failures(
+                        cleanup_error, cleanup_failures[1:]
+                    )
+                    raise cleanup_error
+
+    def button_release_event(self, event: MouseEvent) -> None:
+        if not self.got_artist:
+            return
+        self.got_artist = False
+        self.figure.canvas.mpl_disconnect(self._c1)
+        try:
+            self.releasedEvent(event)
+        except (
+            StaleTransformPlanError,
+            TransformPreflightError,
+            UnsupportedArtistError,
+        ) as error:
+            QtWidgets.QMessageBox.warning(None, "Pylustrator", str(error))
+            self.figure.canvas.draw_idle()
+
+    def cancel_event(self, *, refresh: bool = True) -> None:
+        if self.got_artist:
+            self.got_artist = False
+            connection = getattr(self, "_c1", None)
+            if connection is not None:
+                self.figure.canvas.mpl_disconnect(connection)
+        self.parent.clear_direct_point_preview(refresh=refresh)
+        self._reset_gesture()
+
+
+class InlineTextEdit(QtWidgets.QPlainTextEdit):
+    """One draft-only editor; Matplotlib changes only when it commits."""
+
+    def __init__(self, controller):
+        super().__init__()
+        self.controller = controller
+        self.setTabChangesFocus(False)
+
+    def keyPressEvent(self, event):
+        key = event.key()
+        modifiers = event.modifiers()
+        if key == QtCore.Qt.Key_Escape:
+            self.controller.suppress_forwarded_canvas_keys()
+            self.controller.cancel()
+            event.accept()
+            return
+        if key in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter) and bool(
+            modifiers & (QtCore.Qt.ControlModifier | QtCore.Qt.MetaModifier)
+        ):
+            self.controller.suppress_forwarded_canvas_keys()
+            self.controller.commit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def focusOutEvent(self, event):
+        super().focusOutEvent(event)
+        if (
+            self.controller.active
+            and not self.controller.closing
+            and not self.controller._committing
+        ):
+            self.controller.commit()
+
+
+class InlineTextEditor:
+    """Canvas overlay session backed by one semantic TextContentPlan."""
+
+    def __init__(self, manager):
+        self.manager = manager
+        self.target = None
+        self.plan = None
+        self.widget = None
+        self.proxy = None
+        self.closing = False
+        self._committing = False
+        self._suppress_canvas_keys_until = 0.0
+
+    @property
+    def active(self) -> bool:
+        return self.widget is not None and self.plan is not None
+
+    def suppress_forwarded_canvas_keys(self) -> None:
+        # MyView intentionally forwards Qt key events to the Matplotlib canvas.
+        # Both manager and selection callbacks must ignore the same event even
+        # when Escape/Ctrl+Enter already closed the widget.
+        self._suppress_canvas_keys_until = time.monotonic() + 0.25
+
+    def consumes_canvas_key(self) -> bool:
+        return bool(self.active or time.monotonic() < self._suppress_canvas_keys_until)
+
+    def _scene(self):
+        selection = self.manager.selection
+        return selection.graphics_scene.scene()
+
+    def _editor_scene_position(
+        self, target: Text
+    ) -> tuple[QtCore.QPointF, float, float]:
+        renderer = self.manager.figure.canvas.get_renderer()
+        try:
+            bounds = np.asarray(target.get_window_extent(renderer).extents, dtype=float)
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            bounds = np.asarray((np.nan, np.nan, np.nan, np.nan), dtype=float)
+        if bounds.shape != (4,) or not np.all(np.isfinite(bounds)):
+            position = np.asarray(
+                target.get_transform().transform(target.get_position()),
+                dtype=float,
+            )
+            bounds = np.array(
+                [position[0], position[1], position[0] + 120, position[1] + 24],
+                dtype=float,
+            )
+        width = max(float(bounds[2] - bounds[0]) + 24.0, 160.0)
+        height = max(float(bounds[3] - bounds[1]) + 24.0, 64.0)
+        parent = self.manager.selection.graphics_scene_myparent
+        top_left = parent.mapToScene(QtCore.QPointF(float(bounds[0]), float(bounds[3])))
+        return top_left, width, height
+
+    @staticmethod
+    def _apply_target_font(widget: QtWidgets.QPlainTextEdit, target: Text) -> None:
+        font = widget.font()
+        families = target.get_fontfamily()
+        if families:
+            font.setFamily(str(families[0]))
+        try:
+            font.setPointSizeF(max(float(target.get_fontsize()), 1.0))
+        except (TypeError, ValueError):
+            pass
+        font.setBold(str(target.get_fontweight()).lower() in {"bold", "heavy"})
+        font.setItalic(str(target.get_fontstyle()).lower() in {"italic", "oblique"})
+        widget.setFont(font)
+
+    def start(self, target: Text) -> bool:
+        if self.active:
+            if self.target is target:
+                self.widget.setFocus(QtCore.Qt.OtherFocusReason)
+                return True
+            if not self.commit():
+                return False
+        try:
+            plan = TextContentPlan.preflight(target)
+        except TextContentPreflightError as error:
+            QtWidgets.QToolTip.showText(QtGui.QCursor.pos(), str(error), None)
+            return False
+
+        widget = InlineTextEdit(self)
+        widget.setPlainText(plan.initial_text)
+        self._apply_target_font(widget, target)
+        widget.setStyleSheet(
+            "QPlainTextEdit { background: rgba(255,255,255,245); "
+            "border: 2px solid #1E88E5; padding: 3px; color: black; }"
+        )
+        top_left, width, height = self._editor_scene_position(target)
+        widget.resize(int(np.ceil(width)), int(np.ceil(height)))
+        proxy = self._scene().addWidget(widget)
+        proxy.setZValue(2000)
+        proxy.setPos(top_left)
+
+        self.target = target
+        self.plan = plan
+        self.widget = widget
+        self.proxy = proxy
+        widget.setFocus(QtCore.Qt.OtherFocusReason)
+        widget.selectAll()
+        return True
+
+    def _close(self) -> None:
+        if not self.active and self.widget is None:
+            return
+        self.closing = True
+        proxy = self.proxy
+        widget = self.widget
+        self.target = None
+        self.plan = None
+        self.proxy = None
+        self.widget = None
+        try:
+            if proxy is not None:
+                scene = proxy.scene()
+                if scene is not None:
+                    scene.removeItem(proxy)
+                proxy.setWidget(None)
+                proxy.deleteLater()
+            if widget is not None:
+                widget.deleteLater()
+        finally:
+            self.closing = False
+
+    def commit(self) -> bool:
+        if not self.active or self.closing:
+            return True
+        if self._committing:
+            return False
+        self._committing = True
+        widget = self.widget
+        plan = self.plan
+        try:
+            value = widget.toPlainText()
+            try:
+                plan.commit(value)
+            except (
+                StaleTextContentPlanError,
+                TextContentPreflightError,
+                RuntimeError,
+                ValueError,
+            ) as error:
+                # A failed semantic transaction keeps this exact draft/widget
+                # alive.  The local reference also makes the error path safe
+                # against focus callbacks attempting a nested commit.
+                widget.setStyleSheet(
+                    "QPlainTextEdit { background: rgba(255,245,245,250); "
+                    "border: 2px solid #C62828; padding: 3px; color: black; }"
+                )
+                widget.setToolTip(str(error))
+                widget.setFocus(QtCore.Qt.OtherFocusReason)
+                return False
+            self._close()
+            self.manager.refresh_selection_geometry(post_draw=False)
+            self.manager._invalidate_interaction_index()
+            self.manager._notify_selected_element_changed()
+            return True
+        finally:
+            self._committing = False
+
+    def cancel(self) -> bool:
+        if not self.active or self._committing:
+            return False
+        self._close()
+        return True
+
+
 class GrabbableRectangleSelection(GrabFunctions):
     grabbers = None
 
@@ -464,7 +937,10 @@ class GrabbableRectangleSelection(GrabFunctions):
         self.addGrabber(0, 0.5, DIR_X0, GrabberGenericRectangle)
         self.rotation_grabber = GrabberRotation(self, self.graphics_scene)
 
-        self.c4 = self.figure.canvas.mpl_connect("key_press_event", self.keyPressEvent)
+        self._key_callback_canvas = self.figure.canvas
+        self.c4 = self._key_callback_canvas.mpl_connect(
+            "key_press_event", self.keyPressEvent
+        )
 
         self.targets = []
         self.targets_rects = []
@@ -472,6 +948,12 @@ class GrabbableRectangleSelection(GrabFunctions):
         self.selection_overlay_batch_threshold = 128
         self._batched_selection_overlay = False
         self._batched_selection_overlay_items = []
+        self._direct_point_overlay_items = []
+        self._direct_point_overlay_visible = False
+        self.direct_point_model = None
+        self._pending_direct_point_selection = None
+        self.direct_point_hit_radius_px = 7.0
+        self.direct_point_editor = DirectPointEditor(self)
         self.lock_aspect_ratio = False
         self.reference_point = (0.5, 0.5)
         self._custom_rotation_pivot_inches = None
@@ -531,6 +1013,323 @@ class GrabbableRectangleSelection(GrabFunctions):
             if scene is not None:
                 scene.removeItem(item)
         self._batched_selection_overlay_items = []
+
+    def _ensure_direct_point_overlay(self):
+        items = self._direct_point_overlay_items
+        if items:
+            return items
+
+        centerline = QtWidgets.QGraphicsPathItem(self.graphics_scene_myparent)
+        centerline.setPen(QtGui.QPen(QtGui.QColor("#1E88E5"), 1))
+        centerline.setBrush(QtGui.QBrush(QtCore.Qt.NoBrush))
+        centerline.setZValue(930)
+
+        anchors = QtWidgets.QGraphicsPathItem(self.graphics_scene_myparent)
+        anchors.setPen(QtGui.QPen(QtGui.QColor("#1E88E5"), 1))
+        anchors.setBrush(QtGui.QBrush(QtGui.QColor("white")))
+        anchors.setZValue(940)
+
+        active = QtWidgets.QGraphicsPathItem(self.graphics_scene_myparent)
+        active.setPen(QtGui.QPen(QtGui.QColor("white"), 1))
+        active.setBrush(QtGui.QBrush(QtGui.QColor("#1E88E5")))
+        active.setZValue(941)
+
+        for item in (centerline, anchors, active):
+            item.setAcceptedMouseButtons(QtCore.Qt.NoButton)
+            item.setVisible(False)
+        self._direct_point_overlay_items = [centerline, anchors, active]
+        return self._direct_point_overlay_items
+
+    def _hide_direct_point_overlay(self, *, clear_active: bool = False) -> None:
+        for item in self._direct_point_overlay_items:
+            item.setVisible(False)
+            item.setPath(QtGui.QPainterPath())
+        self._direct_point_overlay_visible = False
+        self.direct_point_model = None
+        if clear_active:
+            self._pending_direct_point_selection = None
+            self.direct_point_editor.active_key = None
+            self.direct_point_editor.selected_keys = ()
+
+    @staticmethod
+    def _direct_point_path(vertices, codes=None) -> QtGui.QPainterPath:
+        vertices = np.asarray(vertices, dtype=float)
+        path = QtGui.QPainterPath()
+        if not len(vertices):
+            return path
+        if codes is None:
+            drawing = False
+            for point in vertices:
+                if not np.all(np.isfinite(point)):
+                    drawing = False
+                    continue
+                if not drawing:
+                    path.moveTo(float(point[0]), float(point[1]))
+                    drawing = True
+                else:
+                    path.lineTo(float(point[0]), float(point[1]))
+            return path
+        for point, code_value in zip(vertices, codes):
+            code = int(code_value)
+            if code == MplPath.CLOSEPOLY:
+                path.closeSubpath()
+                continue
+            if not np.all(np.isfinite(point)):
+                continue
+            if code == MplPath.MOVETO:
+                path.moveTo(float(point[0]), float(point[1]))
+            elif code == MplPath.LINETO:
+                path.lineTo(float(point[0]), float(point[1]))
+        return path
+
+    @staticmethod
+    def _direct_anchor_path(points) -> QtGui.QPainterPath:
+        path = QtGui.QPainterPath()
+        for point in np.asarray(points, dtype=float):
+            if np.all(np.isfinite(point)):
+                path.addRect(
+                    QtCore.QRectF(
+                        float(point[0]) - 3.5,
+                        float(point[1]) - 3.5,
+                        7.0,
+                        7.0,
+                    )
+                )
+        return path
+
+    def _render_direct_point_model(self) -> None:
+        model = self.direct_point_model
+        centerline, anchors, active = self._ensure_direct_point_overlay()
+        if model is None:
+            self._hide_direct_point_overlay()
+            return
+        centerline.setPath(
+            self._direct_point_path(model.path_array(), model.path_codes)
+        )
+        selected_keys = set(self.direct_point_editor.selected_keys)
+        passive_positions = []
+        active_positions = []
+        for key, position in zip(model.keys, model.positions_array()):
+            if key in selected_keys:
+                active_positions.append(position)
+            else:
+                passive_positions.append(position)
+        anchors.setPath(self._direct_anchor_path(passive_positions))
+        active.setPath(self._direct_anchor_path(active_positions))
+        centerline.setVisible(not centerline.path().isEmpty())
+        anchors.setVisible(not anchors.path().isEmpty())
+        active.setVisible(not active.path().isEmpty())
+        self._direct_point_overlay_visible = True
+
+    @staticmethod
+    def _direct_point_models_render_equal(
+        previous: PointHandleModel | None,
+        current: PointHandleModel,
+    ) -> bool:
+        """Compare only immutable state that changes the batched Qt overlay."""
+
+        if (
+            previous is None
+            or previous.target is not current.target
+            or previous.keys != current.keys
+            or previous.alias_groups != current.alias_groups
+            or previous.path_codes != current.path_codes
+        ):
+            return False
+        return bool(
+            np.array_equal(
+                previous.positions_array(),
+                current.positions_array(),
+                equal_nan=True,
+            )
+            and np.array_equal(
+                previous.path_array(),
+                current.path_array(),
+                equal_nan=True,
+            )
+        )
+
+    def refresh_direct_point_overlay(self, *, force: bool = False) -> bool:
+        editor = self.direct_point_editor
+        if editor.got_artist:
+            return self._direct_point_overlay_visible
+        manager = getattr(self.figure, "figure_dragger", None)
+        selection_mode = getattr(manager, "selection_mode", SelectionMode.OBJECT)
+        if (
+            manager is None
+            or selection_mode is not SelectionMode.DIRECT
+            or len(self.targets) != 1
+        ):
+            self._hide_direct_point_overlay(clear_active=True)
+            return False
+        target = self.targets[0]
+        previous_model = self.direct_point_model
+        previous_selection = (
+            tuple(editor.selected_keys),
+            editor.active_key,
+        )
+        try:
+            model = target.adapter.point_handle_model()
+        except (
+            UnsupportedArtistError,
+            AttributeError,
+            IndexError,
+            TypeError,
+            ValueError,
+            RuntimeError,
+            np.linalg.LinAlgError,
+        ):
+            self._hide_direct_point_overlay(clear_active=True)
+            return False
+        self.direct_point_model = model
+        pending = self._pending_direct_point_selection
+        self._pending_direct_point_selection = None
+        if pending is None:
+            retained = tuple(key for key in editor.selected_keys if key in model.keys)
+            primary = editor.active_key if editor.active_key in retained else None
+        else:
+            pending_keys, pending_primary = pending
+            retained = tuple(key for key in pending_keys if key in model.keys)
+            primary = pending_primary if pending_primary in retained else None
+        editor.selected_keys = retained
+        editor.active_key = primary if primary is not None else (
+            retained[-1] if retained else None
+        )
+        if editor.active_key not in model.keys:
+            editor.active_key = None
+        current_selection = (
+            tuple(editor.selected_keys),
+            editor.active_key,
+        )
+        if (
+            not self._direct_point_overlay_visible
+            or not self._direct_point_models_render_equal(previous_model, model)
+            or current_selection != previous_selection
+        ):
+            self._render_direct_point_model()
+        return True
+
+    def restore_direct_point_selection(
+        self,
+        keys: Sequence[int],
+        *,
+        primary: int | None = None,
+        defer_if_unavailable: bool = False,
+    ) -> None:
+        model = self.direct_point_model
+        keys = tuple(dict.fromkeys(int(key) for key in keys))
+        if not keys:
+            self._pending_direct_point_selection = None
+            self.direct_point_editor.selected_keys = ()
+            self.direct_point_editor.active_key = None
+            if model is not None:
+                self._render_direct_point_model()
+            return
+        if primary is None:
+            primary = keys[-1]
+        if primary is not None and int(primary) not in keys:
+            raise IndexError("Primary point must belong to the point selection")
+        if model is None and defer_if_unavailable:
+            self._pending_direct_point_selection = (
+                keys,
+                None if primary is None else int(primary),
+            )
+            self.direct_point_editor.selected_keys = keys
+            self.direct_point_editor.active_key = (
+                None if primary is None else int(primary)
+            )
+            return
+        if model is None or any(key not in model.keys for key in keys):
+            raise IndexError("Point key is outside the active handle model")
+        self._pending_direct_point_selection = None
+        self.direct_point_editor.selected_keys = keys
+        self.direct_point_editor.active_key = None if primary is None else int(primary)
+        if self.direct_point_model is not None:
+            self._render_direct_point_model()
+
+    def set_direct_point_active(self, key: int | None) -> None:
+        self.restore_direct_point_selection(
+            () if key is None else (int(key),), primary=key
+        )
+
+    def clear_direct_point_active(self) -> None:
+        if self.direct_point_editor.got_artist:
+            return
+        self.set_direct_point_active(None)
+
+    def hit_direct_point(self, event: MouseEvent) -> int | None:
+        if (
+            not self._direct_point_overlay_visible
+            or self.direct_point_model is None
+            or self.direct_point_editor.got_artist
+        ):
+            return None
+        point = np.asarray((event.x, event.y), dtype=float)
+        positions = self.direct_point_model.positions_array()
+        if not np.all(np.isfinite(point)) or not len(positions):
+            return None
+        distance_squared = np.sum((positions - point) ** 2, axis=1)
+        index = int(np.argmin(distance_squared))
+        if distance_squared[index] > float(self.direct_point_hit_radius_px) ** 2:
+            return None
+        return self.direct_point_model.keys[index]
+
+    def _preview_direct_centerline(self, plan: PointEditPlan) -> None:
+        model = self.direct_point_model
+        if model is None:
+            return
+        centerline = self._ensure_direct_point_overlay()[0]
+        controls = plan.control_array()
+        if len(model.path_array()) == len(controls):
+            centerline.setPath(self._direct_point_path(controls, model.path_codes))
+        else:
+            path = QtGui.QPainterPath()
+            for key in plan.point_keys:
+                for neighbour in (key - 1, key + 1):
+                    if neighbour < 0 or neighbour >= len(controls):
+                        continue
+                    segment = controls[[key, neighbour]]
+                    if not np.all(np.isfinite(segment)):
+                        continue
+                    path.moveTo(float(segment[0, 0]), float(segment[0, 1]))
+                    path.lineTo(float(segment[1, 0]), float(segment[1, 1]))
+            centerline.setPath(path)
+        centerline.setVisible(not centerline.path().isEmpty())
+
+    def update_direct_point_preview(self, plan: PointEditPlan) -> None:
+        if len(self.targets) != 1 or plan.source.target is not self.targets[0].target:
+            raise StaleTransformPlanError(
+                [
+                    (
+                        plan.source.target,
+                        OperationSupport.denied(
+                            TransformOperation.EDIT_POINTS,
+                            "Point preview no longer belongs to the selected Artist",
+                        ),
+                    )
+                ]
+            )
+        target = self.targets[0]
+        self._set_preview_positions(
+            target,
+            plan.control_array(),
+            plan.selection_array(),
+        )
+        self.update_selection_rectangles(target_indices=(0,))
+        self._apply_target_bounds(refresh_capabilities=False)
+        self._preview_direct_centerline(plan)
+        active_positions = plan.control_array()[np.asarray(plan.point_keys, dtype=int)]
+        self._ensure_direct_point_overlay()[2].setPath(
+            self._direct_anchor_path(active_positions)
+        )
+        self._ensure_direct_point_overlay()[2].setVisible(True)
+
+    def clear_direct_point_preview(self, *, refresh: bool = True) -> None:
+        if self.targets:
+            self._clear_preview(self.targets[0])
+        if refresh and self.targets:
+            self.update_extent()
+            self.update_selection_rectangles()
 
     def _update_batched_selection_overlay(self) -> None:
         if not getattr(self, "_batched_selection_overlay", False):
@@ -666,9 +1465,7 @@ class GrabbableRectangleSelection(GrabFunctions):
 
         self._apply_target_bounds(bounds, refresh_capabilities=True)
 
-    def _apply_target_bounds(
-        self, bounds=None, *, refresh_capabilities: bool
-    ) -> None:
+    def _apply_target_bounds(self, bounds=None, *, refresh_capabilities: bool) -> None:
         """Update the overall grabber from cached per-target display bounds."""
 
         if bounds is None:
@@ -750,9 +1547,7 @@ class GrabbableRectangleSelection(GrabFunctions):
             return OperationSupport.denied(operation, reason)
         constraints = tuple(
             dict.fromkeys(
-                constraint
-                for support in supports
-                for constraint in support.constraints
+                constraint for support in supports for constraint in support.constraints
             )
         )
         strategies = {support.preview_strategy for support in supports}
@@ -864,9 +1659,7 @@ class GrabbableRectangleSelection(GrabFunctions):
         key_wrapper = None
         if self.alignment_reference_mode == "key_object":
             if len(self.targets) < 2:
-                raise ValueError(
-                    "Select at least two objects for key-object alignment"
-                )
+                raise ValueError("Select at least two objects for key-object alignment")
             key_wrapper = self.alignment_key_wrapper()
 
         with selection_geometry_snapshot():
@@ -889,9 +1682,7 @@ class GrabbableRectangleSelection(GrabFunctions):
                         for index, (_measure, move) in enumerate(items)
                         if move.target is key_wrapper.target
                     )
-                    reference = self._bounds_from_points(
-                        [measure_points[key_index]]
-                    )
+                    reference = self._bounds_from_points([measure_points[key_index]])
                 else:
                     reference = self._bounds_from_points(measure_points)
                 current = [function(points[:, axis]) for points in measure_points]
@@ -931,8 +1722,7 @@ class GrabbableRectangleSelection(GrabFunctions):
                     key_rank = order.index(key_index)
                     if spacing is None:
                         current_gaps = [
-                            positions[right]
-                            - (positions[left] + sizes[left])
+                            positions[right] - (positions[left] + sizes[left])
                             for left, right in zip(order, order[1:])
                         ]
                         gap = float(np.mean(current_gaps))
@@ -958,18 +1748,14 @@ class GrabbableRectangleSelection(GrabFunctions):
                             # Two objects have no interior position to solve;
                             # preserve both exactly instead of inventing motion.
                             layout_low = positions[order[0]]
-                            layout_high = (
-                                positions[order[1]] + sizes[order[1]]
-                            )
+                            layout_high = positions[order[1]] + sizes[order[1]]
                         else:
-                            layout_bounds = self._bounds_from_points(
-                                measure_points
-                            )
+                            layout_bounds = self._bounds_from_points(measure_points)
                             layout_low = layout_bounds[axis]
                             layout_high = layout_bounds[axis + 2]
-                    gap = (
-                        layout_high - layout_low - float(np.sum(sizes))
-                    ) / (len(items) - 1)
+                    gap = (layout_high - layout_low - float(np.sum(sizes))) / (
+                        len(items) - 1
+                    )
                     cursor = layout_low
                     for index in order:
                         deltas[index] = cursor - positions[index]
@@ -980,8 +1766,7 @@ class GrabbableRectangleSelection(GrabFunctions):
             vectors = []
             for target, delta in plan:
                 if (
-                    key_wrapper is not None
-                    and target.target is key_wrapper.target
+                    key_wrapper is not None and target.target is key_wrapper.target
                 ) or np.isclose(delta, 0.0, atol=1e-12):
                     continue
                 display_delta = np.zeros(2, dtype=float)
@@ -1046,9 +1831,7 @@ class GrabbableRectangleSelection(GrabFunctions):
 
         planned: list[tuple[TargetWrapper, np.ndarray]] = []
         with selection_geometry_snapshot():
-            reference_points = np.array(
-                reference.get_selection_points(), dtype=float
-            )
+            reference_points = np.array(reference.get_selection_points(), dtype=float)
             reference_bounds = self._points_bounds(reference_points)
             reference_width = reference_bounds[2] - reference_bounds[0]
             reference_height = reference_bounds[3] - reference_bounds[1]
@@ -1067,12 +1850,8 @@ class GrabbableRectangleSelection(GrabFunctions):
                     raise ValueError("Selected object has no width.")
                 if match_height and current_height <= 0:
                     raise ValueError("Selected object has no height.")
-                scale_x = (
-                    reference_width / current_width if match_width else 1.0
-                )
-                scale_y = (
-                    reference_height / current_height if match_height else 1.0
-                )
+                scale_x = reference_width / current_width if match_width else 1.0
+                scale_y = reference_height / current_height if match_height else 1.0
                 if keep_aspect_ratio:
                     if match_width and match_height:
                         scale = min(scale_x, scale_y)
@@ -1167,9 +1946,7 @@ class GrabbableRectangleSelection(GrabFunctions):
             TransformIntent.scale_appearance(factor),
         )
         save_targets = self._unique_wrappers(self.targets)
-        store_start = self.get_save_point(
-            save_targets, appearance_only=True
-        )
+        store_start = self.get_save_point(save_targets, appearance_only=True)
         try:
             plan.commit()
             self.figure.canvas.draw()
@@ -1182,13 +1959,9 @@ class GrabbableRectangleSelection(GrabFunctions):
                 rollback_failures.append((self, rollback_error))
             ArtistAdapter.annotate_rollback_failures(error, rollback_failures)
             raise
-        store_end = self.get_save_point(
-            save_targets, appearance_only=True
-        )
+        store_end = self.get_save_point(save_targets, appearance_only=True)
         self.figure.signals.figure_selection_moved.emit()
-        self.figure.change_tracker.addEdit(
-            [store_start, store_end, "Scale appearance"]
-        )
+        self.figure.change_tracker.addEdit([store_start, store_end, "Scale appearance"])
         self.update_selection_rectangles()
         dragger = getattr(self.figure, "figure_dragger", None)
         notify = getattr(dragger, "_notify_selected_element_changed", None)
@@ -1325,9 +2098,7 @@ class GrabbableRectangleSelection(GrabFunctions):
                 with suspend_change_recording():
                     self.rotation_drag_target.set_rotation(value)
                 self.rotation_drag_preview_value = value
-                self.has_moved = not np.isclose(
-                    value, self.rotation_drag_start_value
-                )
+                self.has_moved = not np.isclose(value, self.rotation_drag_start_value)
                 result = value
             else:
                 self._restore_move_start()
@@ -1529,20 +2300,16 @@ class GrabbableRectangleSelection(GrabFunctions):
         indices = (
             range(len(self.targets))
             if target_indices is None
-            else (
-                index
-                for index in target_indices
-                if 0 <= index < len(self.targets)
-            )
+            else (index for index in target_indices if 0 <= index < len(self.targets))
         )
         if getattr(self, "_batched_selection_overlay", False):
             for index in indices:
                 target = self.targets[index]
                 new_points = None
                 if use_previous_offset:
-                    new_points = getattr(
-                        self, "move_current_selection_points", {}
-                    ).get(id(target.target))
+                    new_points = getattr(self, "move_current_selection_points", {}).get(
+                        id(target.target)
+                    )
                 if new_points is None:
                     new_points = np.asarray(target.get_selection_points())
                 if new_points.ndim != 2 or not len(new_points):
@@ -1581,9 +2348,7 @@ class GrabbableRectangleSelection(GrabFunctions):
                     np.max(new_points[:, 0]),
                     np.max(new_points[:, 1]),
                 )
-                self.target_bounds[index] = np.array(
-                    [x0, y0, x1, y1], dtype=float
-                )
+                self.target_bounds[index] = np.array([x0, y0, x1, y1], dtype=float)
                 w0, h0 = x1 - x0, y1 - y0
                 for i in range(2):
                     rect = self.targets_rects[index * 2 + i]
@@ -1647,6 +2412,7 @@ class GrabbableRectangleSelection(GrabFunctions):
         """update the position of the grabber elements"""
         self._grabber_scale_supported = self.do_target_scale()
         self._grabber_rotation_supported = self.rotation_handle_supported()
+        self.refresh_direct_point_overlay()
         if (
             self._custom_rotation_pivot_inches is not None
             and not self.custom_rotation_pivot_supported()
@@ -1659,6 +2425,10 @@ class GrabbableRectangleSelection(GrabFunctions):
 
     def _position_grabbers(self, can_scale: bool, can_rotate: bool) -> None:
         """Reposition handles without re-evaluating immutable capabilities."""
+
+        if self._direct_point_overlay_visible:
+            can_scale = False
+            can_rotate = False
 
         if can_scale:
             for grabber in self.grabbers:
@@ -1679,6 +2449,8 @@ class GrabbableRectangleSelection(GrabFunctions):
 
     def clear_targets(self, *, preserve_rotation_pivot: bool = False):
         """remove all elements from the selection"""
+        self.direct_point_editor.cancel_event(refresh=False)
+        self._hide_direct_point_overlay(clear_active=True)
         self.rotation_grabber.cancel_pivot_event(restore=True)
         self.clear_move_previews()
         manager = getattr(self.figure, "figure_dragger", None)
@@ -1697,6 +2469,113 @@ class GrabbableRectangleSelection(GrabFunctions):
             self._clear_custom_rotation_pivot()
 
         self.hide_grabber()
+
+    def dispose(self) -> bool:
+        """Permanently detach selection-owned Qt items from their scene."""
+
+        if bool(getattr(self, "_disposed", False)):
+            return False
+        self._disposed = True
+        key_connection = getattr(self, "c4", None)
+        key_canvas = getattr(self, "_key_callback_canvas", None)
+        if key_connection is not None and key_canvas is not None:
+            key_canvas.mpl_disconnect(key_connection)
+        self.c4 = None
+        self._key_callback_canvas = None
+        scene_root = getattr(self, "graphics_scene", None)
+        try:
+            qt_scene = None if scene_root is None else scene_root.scene()
+        except RuntimeError:
+            qt_scene = None
+        for owner in (scene_root, qt_scene):
+            if owner is not None and hasattr(owner, "grabber_pressed"):
+                owner.grabber_pressed = None
+        self.clear_targets()
+        self._remove_batched_selection_overlay()
+
+        # Resize and rotation handles predate the selection-owned overlay
+        # roots.  They are parented directly to ``figure._pyl_scene`` and each
+        # interactive item points back to a Grabber, which in turn points back
+        # to this selection.  Removing only the newer roots therefore leaves a
+        # complete old selection (and eleven hidden scene items) alive whenever
+        # a DragManager is permanently replaced.
+        def detach_item(item) -> None:
+            if item is None:
+                return
+            for attribute in ("grabber", "view"):
+                try:
+                    setattr(item, attribute, None)
+                except (AttributeError, RuntimeError):
+                    pass
+            try:
+                scene = item.scene()
+                item.setParentItem(None)
+                if scene is not None:
+                    scene.removeItem(item)
+            except RuntimeError:
+                # A detached Qt parent may already have deleted its children.
+                pass
+
+        for grabber in tuple(getattr(self, "grabbers", ())):
+            try:
+                grabber.cancel_event()
+            except (AttributeError, RuntimeError):
+                pass
+            detach_item(getattr(grabber, "ellipse", None))
+            grabber.ellipse = None
+            grabber.parent = None
+            grabber.figure = None
+
+        rotation = getattr(self, "rotation_grabber", None)
+        if rotation is not None:
+            try:
+                rotation.cancel_event()
+            except (AttributeError, RuntimeError):
+                pass
+            for attribute in ("line", "pivot_marker", "handle"):
+                detach_item(getattr(rotation, attribute, None))
+                setattr(rotation, attribute, None)
+            rotation.targets = []
+            rotation.parent = None
+            rotation.figure = None
+
+        point_editor = getattr(self, "direct_point_editor", None)
+        if point_editor is not None:
+            point_editor.parent = None
+            point_editor.figure = None
+
+        self._direct_point_overlay_items = []
+        self._direct_point_overlay_visible = False
+        self.direct_point_model = None
+        self._pending_direct_point_selection = None
+        roots = (
+            self.graphics_scene_myparent,
+            self.graphics_scene_snapparent,
+        )
+        for root in roots:
+            if root is None:
+                continue
+            try:
+                scene = root.scene()
+                root.setParentItem(None)
+                if scene is not None:
+                    scene.removeItem(root)
+            except RuntimeError:
+                pass
+        if (
+            getattr(self.figure, "_pyl_graphics_scene_snapparent", None)
+            is self.graphics_scene_snapparent
+        ):
+            self.figure._pyl_graphics_scene_snapparent = None
+        self.graphics_scene_myparent = None
+        self.graphics_scene_snapparent = None
+        self.graphics_scene = None
+        self.grabbers = []
+        self.rotation_grabber = None
+        self.direct_point_editor = None
+        self.parent = None
+        self.figure = None
+        return True
 
     def do_target_scale(self) -> bool:
         """Only expose resize handles when every selected artist can scale."""
@@ -1742,9 +2621,7 @@ class GrabbableRectangleSelection(GrabFunctions):
         if signal is not None:
             signal.emit()
 
-    def _restore_alignment_reference_state(
-        self, mode: str, key: Artist | None
-    ) -> None:
+    def _restore_alignment_reference_state(self, mode: str, key: Artist | None) -> None:
         """Restore reference UI state without creating a document edit."""
 
         if mode not in {"selection", "key_object", "artboard"}:
@@ -1759,16 +2636,13 @@ class GrabbableRectangleSelection(GrabFunctions):
         self.alignment_reference_mode = mode
         self.alignment_key = (
             key
-            if mode == "key_object"
-            and any(target is key for target in selected)
+            if mode == "key_object" and any(target is key for target in selected)
             else None
         )
         self._update_alignment_key_style()
         self._notify_alignment_state_changed()
 
-    def set_alignment_reference(
-        self, mode: str, *, key: Artist | None = None
-    ) -> str:
+    def set_alignment_reference(self, mode: str, *, key: Artist | None = None) -> str:
         """Choose selection, key-object, or artboard alignment semantics."""
 
         mode = str(mode).lower()
@@ -1899,8 +2773,7 @@ class GrabbableRectangleSelection(GrabFunctions):
             raise RuntimeError("Cannot move the pivot during a rotation gesture")
         if not self.custom_rotation_pivot_supported():
             raise UnsupportedArtistError(
-                "A custom rotation pivot requires a complete shared "
-                "rigid-rotation plan"
+                "A custom rotation pivot requires a complete shared rigid-rotation plan"
             )
         display_position = np.asarray(display_position, dtype=float)
         if display_position.shape != (2,) or not np.all(np.isfinite(display_position)):
@@ -1909,9 +2782,7 @@ class GrabbableRectangleSelection(GrabFunctions):
             self.figure.dpi_scale_trans.inverted().transform(display_position),
             dtype=float,
         )
-        self._set_custom_rotation_pivot_state(
-            physical_position, notify=notify
-        )
+        self._set_custom_rotation_pivot_state(physical_position, notify=notify)
         return tuple(float(value) for value in display_position)
 
     def reset_rotation_pivot(self) -> bool:
@@ -2025,9 +2896,7 @@ class GrabbableRectangleSelection(GrabFunctions):
             ]
         )
         planned_bounds = self._bounds_from_points(planned_selection)
-        if not np.allclose(
-            planned_bounds, expected_bounds, atol=0.25, rtol=0.0
-        ):
+        if not np.allclose(planned_bounds, expected_bounds, atol=0.25, rtol=0.0):
             raise UnsupportedArtistError(
                 "Numeric resize cannot reach the requested visible bounds because "
                 "an active clip would change the selection envelope"
@@ -2088,8 +2957,11 @@ class GrabbableRectangleSelection(GrabFunctions):
         targets: Iterable[TargetWrapper] = None,
         *,
         appearance_only: bool = False,
+        point_edit_keys: Sequence[int] | None = None,
     ) -> callable:
         """gather the current positions in a restore point for the undo function"""
+        if appearance_only and point_edit_keys is not None:
+            raise ValueError("A save point cannot mix appearance and point state")
         selected_targets = [target.target for target in self.targets]
         alignment_reference_mode = self.alignment_reference_mode
         alignment_key = self.alignment_key
@@ -2101,9 +2973,13 @@ class GrabbableRectangleSelection(GrabFunctions):
         restore_targets = [target.target for target in wrapped_targets]
         states = [
             (
-                target.get_appearance_state()
-                if appearance_only
-                else target.get_restore_state()
+                target.adapter.point_edit_history_snapshot(point_edit_keys)
+                if point_edit_keys is not None
+                else (
+                    target.get_appearance_state()
+                    if appearance_only
+                    else target.get_restore_state()
+                )
             )
             for target in wrapped_targets
         ]
@@ -2116,14 +2992,18 @@ class GrabbableRectangleSelection(GrabFunctions):
             self.clear_targets()
             for target, state in zip(restore_targets, states):
                 target = TargetWrapper(target)
-                if appearance_only:
+                if point_edit_keys is not None:
+                    if recording_state is None:
+                        target.adapter.restore_point_edit_history_state(state)
+                    else:
+                        with suspend_change_recording():
+                            target.adapter.restore_point_edit_history_state(state)
+                elif appearance_only:
                     target.restore_appearance_state(
                         state, record_changes=recording_state is None
                     )
                 else:
-                    target.restore_state(
-                        state, record_changes=recording_state is None
-                    )
+                    target.restore_state(state, record_changes=recording_state is None)
             restore_recording = getattr(tracker, "restore_recording_state", None)
             if recording_state is not None and restore_recording is not None:
                 restore_recording(recording_state)
@@ -2144,9 +3024,7 @@ class GrabbableRectangleSelection(GrabFunctions):
             )
             self.set_reference_point(reference_point)
             if custom_rotation_pivot is not None:
-                self._set_custom_rotation_pivot_state(
-                    custom_rotation_pivot
-                )
+                self._set_custom_rotation_pivot_state(custom_rotation_pivot)
 
         return undo
 
@@ -2259,8 +3137,14 @@ class GrabbableRectangleSelection(GrabFunctions):
                 continue
             translation_delta = None
             start = self.move_start_positions.get(id(target.target))
-            if start is not None and np.shape(start) == np.shape(points) and len(points):
-                deltas = np.asarray(points, dtype=float) - np.asarray(start, dtype=float)
+            if (
+                start is not None
+                and np.shape(start) == np.shape(points)
+                and len(points)
+            ):
+                deltas = np.asarray(points, dtype=float) - np.asarray(
+                    start, dtype=float
+                )
                 if np.allclose(deltas, deltas[0]):
                     translation_delta = deltas[0]
             pending.append(
@@ -2334,9 +3218,7 @@ class GrabbableRectangleSelection(GrabFunctions):
                     failures.append((target.target, error))
         tracker_state = getattr(self, "move_start_tracker_state", None)
         tracker = getattr(self.figure, "change_tracker", None)
-        edit_history_state = getattr(
-            self, "move_start_edit_history_state", None
-        )
+        edit_history_state = getattr(self, "move_start_edit_history_state", None)
         if edit_history_state is not None:
             try:
                 edits, last_edit = edit_history_state
@@ -2352,9 +3234,7 @@ class GrabbableRectangleSelection(GrabFunctions):
                 failures.append((tracker, error))
         if bool(getattr(self, "move_start_ui_state_captured", False)):
             self.reference_point = tuple(self.move_start_reference_point)
-            self._custom_rotation_pivot_inches = (
-                self.move_start_custom_rotation_pivot
-            )
+            self._custom_rotation_pivot_inches = self.move_start_custom_rotation_pivot
         try:
             self.clear_move_previews()
         except Exception as error:
@@ -2376,8 +3256,7 @@ class GrabbableRectangleSelection(GrabFunctions):
             add_note = getattr(active_error, "add_note", None)
             if callable(add_note):
                 details = "; ".join(
-                    f"{type(target).__name__}: {error}"
-                    for target, error in failures
+                    f"{type(target).__name__}: {error}" for target, error in failures
                 )
                 add_note(f"Pylustrator rollback failures: {details}")
         if failures and strict:
@@ -2659,6 +3538,13 @@ class GrabbableRectangleSelection(GrabFunctions):
 
     def keyPressEvent(self, event: KeyEvent):
         """when a key is pressed. Arrow keys move the selection, Pageup/down movein z"""
+        manager = getattr(self.figure, "figure_dragger", None)
+        inline_editor = getattr(manager, "inline_text_editor", None)
+        if inline_editor is not None and inline_editor.consumes_canvas_key():
+            return
+        if self.direct_point_editor.got_artist:
+            return
+
         def schedule_draw():
             canvas = self.figure.canvas
             if hasattr(canvas, "schedule_draw"):
@@ -2679,9 +3565,10 @@ class GrabbableRectangleSelection(GrabFunctions):
                 self.figure.figure_dragger.change_selection_zorder("forward")
             except ValueError:
                 return
-        if event.key in {"left", "right", "down", "up"} and not self.operation_support(
-            TransformOperation.TRANSLATE
-        ).supported:
+        if (
+            event.key in {"left", "right", "down", "up"}
+            and not self.operation_support(TransformOperation.TRANSLATE).supported
+        ):
             return
         if event.key == "left":
             self.start_move()
@@ -2716,6 +3603,13 @@ class DragManager:
 
     selected_element = None
     grab_element = None
+
+    def _ensure_inline_text_editor(self) -> InlineTextEditor:
+        editor = getattr(self, "inline_text_editor", None)
+        if editor is None:
+            editor = InlineTextEditor(self)
+            self.inline_text_editor = editor
+        return editor
 
     @staticmethod
     def _capture_figure_structure(figure: Figure) -> tuple[int, ...]:
@@ -2785,7 +3679,11 @@ class DragManager:
         self.figure = figure
         previous = getattr(figure, "figure_dragger", None)
         if previous is not None and previous is not self:
-            previous.deactivate(redraw=False)
+            dispose = getattr(previous, "dispose", None)
+            if callable(dispose):
+                dispose(redraw=False)
+            else:
+                previous.deactivate(redraw=False)
         self.figure.figure_dragger = self
         self._selectable_artists = []
         self._selectable_artist_ids = set()
@@ -2803,9 +3701,7 @@ class DragManager:
         self._marquee_roster_cache = None
         self._display_geometry_cache = DisplayGeometryCache()
         self._smart_guide_idle_warmup_enabled = True
-        self.editor_scene = EditorScene(
-            figure, ownership_parent=self._draw_parent
-        )
+        self.editor_scene = EditorScene(figure, ownership_parent=self._draw_parent)
         self.marquee_select_containers_only = False
         self.marquee_start = None
         self.marquee_rect = None
@@ -3209,30 +4105,23 @@ class DragManager:
 
     def activate(self):
         """activate the interaction callbacks from the figure"""
+        if bool(getattr(self, "_disposed", False)):
+            raise RuntimeError("Cannot reactivate a disposed DragManager")
         if getattr(self, "_interaction_active", False):
             return False
         canvas = self.figure.canvas
         self._callback_canvas = canvas
-        self.c3 = canvas.mpl_connect(
-            "button_release_event", self.button_release_event0
-        )
-        self.c2 = canvas.mpl_connect(
-            "button_press_event", self.button_press_event0
-        )
-        self.c4 = canvas.mpl_connect(
-            "key_press_event", self.key_press_event
-        )
-        self.c5 = canvas.mpl_connect(
-            "motion_notify_event", self.motion_notify_event0
-        )
-        self.c6 = canvas.mpl_connect(
-            "draw_event", self.invalidate_geometry_cache
-        )
+        self.c3 = canvas.mpl_connect("button_release_event", self.button_release_event0)
+        self.c2 = canvas.mpl_connect("button_press_event", self.button_press_event0)
+        self.c4 = canvas.mpl_connect("key_press_event", self.key_press_event)
+        self.c5 = canvas.mpl_connect("motion_notify_event", self.motion_notify_event0)
+        self.c6 = canvas.mpl_connect("draw_event", self.invalidate_geometry_cache)
         selection = getattr(self, "selection", None)
         if selection is not None and getattr(selection, "c4", None) is None:
             selection.c4 = canvas.mpl_connect(
                 "key_press_event", selection.keyPressEvent
             )
+            selection._key_callback_canvas = canvas
             self._selection_callback_canvas = canvas
         self._selection_refresh_on_draw = True
         self._interaction_active = True
@@ -3279,9 +4168,7 @@ class DragManager:
         if selection is None or not getattr(selection, "targets", None):
             return
         if post_draw:
-            selection.refresh_targets_after_draw(
-                self._post_draw_selection_indices()
-            )
+            selection.refresh_targets_after_draw(self._post_draw_selection_indices())
             return
         with selection_geometry_snapshot():
             selection.update_extent()
@@ -3311,9 +4198,7 @@ class DragManager:
         if registration_order is None:
             registration_order = {
                 id(item): index
-                for index, item in enumerate(
-                    getattr(self, "_interaction_artists", ())
-                )
+                for index, item in enumerate(getattr(self, "_interaction_artists", ()))
             }
         child_orders: dict[int, dict[int, int]] = getattr(
             self, "_draw_child_orders", {}
@@ -3343,9 +4228,7 @@ class DragManager:
             parent = self._draw_parent(current)
             default = registration_order.get(current_key, int(fallback))
             order = (
-                child_order(parent, current, default)
-                if parent is not None
-                else default
+                child_order(parent, current, default) if parent is not None else default
             )
             path.append((float(current.get_zorder()), order))
             current = parent
@@ -3465,6 +4348,8 @@ class DragManager:
             self._cancel_active_pointer_transform()
         result = self._ensure_selection_kernel().set_mode(mode)
         self._reconcile_selection_for_mode()
+        if hasattr(self, "selection"):
+            self.selection.update_grabber()
         self._selection_semantic_mode = result
         invalidate_smart_guide_cache(self)
         schedule_smart_guide_warmup(self)
@@ -3538,9 +4423,7 @@ class DragManager:
             alignment_reference_mode=self.selection.alignment_reference_mode,
             alignment_key=alignment_key,
             reference_point=tuple(self.selection.reference_point),
-            custom_rotation_pivot_inches=(
-                self.selection.custom_rotation_pivot_state()
-            ),
+            custom_rotation_pivot_inches=(self.selection.custom_rotation_pivot_state()),
         )
 
     def restore_interaction_state(self, state: InteractionState) -> None:
@@ -3655,7 +4538,9 @@ class DragManager:
             self._hide_preselection()
             return None
         try:
-            points = np.asarray(TargetWrapper(target).get_selection_points(), dtype=float)
+            points = np.asarray(
+                TargetWrapper(target).get_selection_points(), dtype=float
+            )
         except (AttributeError, TypeError, ValueError, RuntimeError):
             self._hide_preselection()
             return None
@@ -3705,7 +4590,9 @@ class DragManager:
 
     def ungroup_selection(self) -> list[Artist]:
         groups = [
-            artist for artist in self._selected_artists() if isinstance(artist, EditorGroup)
+            artist
+            for artist in self._selected_artists()
+            if isinstance(artist, EditorGroup)
         ]
         if not groups:
             raise ValueError("Select an editor group to ungroup.")
@@ -3755,9 +4642,7 @@ class DragManager:
             self._apply_editor_state(after)
             self.restore_interaction_state(interaction_after)
 
-        self.figure.change_tracker.addEdit(
-            [undo, redo, "Lock" if locked else "Unlock"]
-        )
+        self.figure.change_tracker.addEdit([undo, redo, "Lock" if locked else "Unlock"])
         self._notify_editor_scene_changed()
         return True
 
@@ -3811,9 +4696,7 @@ class DragManager:
             self._apply_editor_state(after)
             self.restore_interaction_state(interaction_after)
 
-        self.figure.change_tracker.addEdit(
-            [undo, redo, "Show" if visible else "Hide"]
-        )
+        self.figure.change_tracker.addEdit([undo, redo, "Show" if visible else "Hide"])
         self._notify_editor_scene_changed()
         return True
 
@@ -3897,14 +4780,10 @@ class DragManager:
             siblings.append(child)
 
         sibling_ids = {id(artist) for artist in siblings}
-        missing = [
-            artist for artist in selected if id(artist) not in sibling_ids
-        ]
+        missing = [artist for artist in selected if id(artist) not in sibling_ids]
         if missing:
             names = ", ".join(type(artist).__name__ for artist in missing)
-            raise ValueError(
-                f"Selected {names} is not a visible direct paint sibling"
-            )
+            raise ValueError(f"Selected {names} is not a visible direct paint sibling")
         siblings.sort(
             key=lambda artist: (
                 float(artist.get_zorder()),
@@ -3941,13 +4820,13 @@ class DragManager:
                         result[index],
                     )
         elif mode == "front":
-            result = [
-                artist for artist in result if id(artist) not in selected_ids
-            ] + [artist for artist in result if id(artist) in selected_ids]
-        else:
-            result = [
+            result = [artist for artist in result if id(artist) not in selected_ids] + [
                 artist for artist in result if id(artist) in selected_ids
-            ] + [artist for artist in result if id(artist) not in selected_ids]
+            ]
+        else:
+            result = [artist for artist in result if id(artist) in selected_ids] + [
+                artist for artist in result if id(artist) not in selected_ids
+            ]
         return result
 
     @staticmethod
@@ -4008,11 +4887,7 @@ class DragManager:
 
             runs: list[list[Artist]] = []
             for artist in group:
-                if (
-                    not runs
-                    or child_order[id(artist)]
-                    <= child_order[id(runs[-1][-1])]
-                ):
+                if not runs or child_order[id(artist)] <= child_order[id(runs[-1][-1])]:
                     runs.append([])
                 runs[-1].append(artist)
 
@@ -4020,10 +4895,7 @@ class DragManager:
                 range(len(runs)),
                 key=lambda index: (
                     len(runs[index]),
-                    sum(
-                        id(artist) not in selected_ids
-                        for artist in runs[index]
-                    ),
+                    sum(id(artist) not in selected_ids for artist in runs[index]),
                     -index,
                 ),
                 reverse=True,
@@ -4032,9 +4904,7 @@ class DragManager:
             upper = levels[stop] if stop < len(levels) else None
             for anchor in anchors:
                 try:
-                    before_levels = cls._zorder_run_levels(
-                        base, anchor, -1.0, lower
-                    )
+                    before_levels = cls._zorder_run_levels(base, anchor, -1.0, lower)
                     after_levels = cls._zorder_run_levels(
                         base, len(runs) - anchor - 1, 1.0, upper
                     )
@@ -4059,8 +4929,7 @@ class DragManager:
             ),
         )
         if any(
-            actual is not expected
-            for actual, expected in zip(resolved, destination)
+            actual is not expected for actual, expected in zip(resolved, destination)
         ):
             raise ValueError("Could not represent the requested paint order")
         return assigned
@@ -4075,9 +4944,7 @@ class DragManager:
         selected_ids = {id(artist) for artist in leaves}
         parents = {id(parent): parent for parent in map(self._draw_parent, leaves)}
         if None in parents.values() or len(parents) != 1:
-            raise ValueError(
-                "Arrange requires selected objects in one paint container"
-            )
+            raise ValueError("Arrange requires selected objects in one paint container")
         parent = next(iter(parents.values()))
         siblings, child_order = self._zorder_paint_siblings(parent, leaves)
         destination = self._reorder_siblings(siblings, selected_ids, mode)
@@ -4106,9 +4973,7 @@ class DragManager:
                     f"Cannot replay stacking order for "
                     f"{type(operation.target).__name__}"
                 ) from error
-        return PropertyPlan(self.figure, operations).commit(
-            "Change stacking order"
-        )
+        return PropertyPlan(self.figure, operations).commit("Change stacking order")
 
     def _prune_detached_interaction_artists(self) -> int:
         """Release externally removed Artists at the authoritative draw boundary.
@@ -4129,7 +4994,10 @@ class DragManager:
             current = parent_map.get(id(artist))
             seen = set()
             while current is not None and id(current) not in seen:
-                if id(current) in detached_ids or getattr(current, "figure", None) is None:
+                if (
+                    id(current) in detached_ids
+                    or getattr(current, "figure", None) is None
+                ):
                     detached_ids.add(id(artist))
                     break
                 seen.add(id(current))
@@ -4151,21 +5019,11 @@ class DragManager:
             return [item for item in items if id(item) not in detached_ids]
 
         self._interaction_artists = keep(interaction)
-        self._interaction_artist_ids = {
-            id(item) for item in self._interaction_artists
-        }
-        self._selectable_artists = keep(
-            list(getattr(self, "_selectable_artists", ()))
-        )
-        self._selectable_artist_ids = {
-            id(item) for item in self._selectable_artists
-        }
-        self._uneditable_artists = keep(
-            list(getattr(self, "_uneditable_artists", ()))
-        )
-        self._uneditable_artist_ids = {
-            id(item) for item in self._uneditable_artists
-        }
+        self._interaction_artist_ids = {id(item) for item in self._interaction_artists}
+        self._selectable_artists = keep(list(getattr(self, "_selectable_artists", ())))
+        self._selectable_artist_ids = {id(item) for item in self._selectable_artists}
+        self._uneditable_artists = keep(list(getattr(self, "_uneditable_artists", ())))
+        self._uneditable_artist_ids = {id(item) for item in self._uneditable_artists}
         self._selection_parent_by_id = {
             key: parent
             for key, parent in parent_map.items()
@@ -4211,6 +5069,9 @@ class DragManager:
         # Legend/text layout is finalized by Matplotlib during draw.  Overlay
         # geometry measured before that point is necessarily provisional.
         self.refresh_selection_geometry(post_draw=True)
+        selection = getattr(self, "selection", None)
+        if selection is not None:
+            selection.refresh_direct_point_overlay(force=True)
         schedule_smart_guide_warmup(self)
         schedule_content_preview_warmup(self)
 
@@ -4219,6 +5080,9 @@ class DragManager:
         if not getattr(self, "_interaction_active", False):
             return False
         self._cancel_active_pointer_transform()
+        inline_editor = getattr(self, "inline_text_editor", None)
+        if inline_editor is not None:
+            inline_editor.cancel()
         invalidate_smart_guide_cache(self)
         close_content_preview_cache(self)
         session = getattr(self, "_active_smart_guide_session", None)
@@ -4234,11 +5098,10 @@ class DragManager:
         if selection is not None:
             selection_connection = getattr(selection, "c4", None)
             if selection_connection is not None:
-                selection_canvas = getattr(
-                    self, "_selection_callback_canvas", canvas
-                )
+                selection_canvas = getattr(self, "_selection_callback_canvas", canvas)
                 selection_canvas.mpl_disconnect(selection_connection)
                 selection.c4 = None
+                selection._key_callback_canvas = None
         self._selection_refresh_on_draw = False
         self._interaction_active = False
         self._callback_canvas = None
@@ -4250,6 +5113,30 @@ class DragManager:
         self._notify_selected_element_changed()
         if redraw:
             self.figure.canvas.draw_idle()
+        return True
+
+    def dispose(self, *, redraw: bool = False) -> bool:
+        """Permanently release callbacks, caches, and selection scene items."""
+
+        if bool(getattr(self, "_disposed", False)):
+            return False
+        self.deactivate(redraw=redraw)
+        inline_editor = getattr(self, "inline_text_editor", None)
+        if inline_editor is not None and inline_editor.active:
+            inline_editor.cancel()
+        invalidate_smart_guide_cache(self)
+        close_content_preview_cache(self)
+        selection = getattr(self, "selection", None)
+        if selection is not None:
+            selection.dispose()
+        figure = getattr(self, "figure", None)
+        if figure is not None:
+            if getattr(figure, "figure_dragger", None) is self:
+                figure.figure_dragger = None
+            if getattr(figure, "selection", None) is selection:
+                figure.selection = None
+        self.selection = None
+        self._disposed = True
         return True
 
     def make_draggable(self, target: Artist, parent: Artist = None):
@@ -4530,7 +5417,10 @@ class DragManager:
 
         if getattr(artist, "figure", None) is None:
             return False
-        if isinstance(artist, EditorGroup) and artist not in self._ensure_editor_scene().groups.values():
+        if (
+            isinstance(artist, EditorGroup)
+            and artist not in self._ensure_editor_scene().groups.values()
+        ):
             return False
         current = artist
         seen = set()
@@ -4633,11 +5523,8 @@ class DragManager:
                 seen.add(current_id)
                 if current_id in unique_by_id:
                     if (
-                        _container_keeps_children(current)
-                        and not direct_selection
-                    ) or (
-                        prefer_containers and _container_yields_to_children(current)
-                    ):
+                        _container_keeps_children(current) and not direct_selection
+                    ) or (prefer_containers and _container_yields_to_children(current)):
                         remove_ids.add(id(descendant))
                     elif (
                         _container_keeps_children(current)
@@ -4660,16 +5547,15 @@ class DragManager:
             if self._interaction_parent(descendant) is not None:
                 continue
             for possible_parent in unique:
-                if possible_parent is descendant or not self._artist_contains_descendant(
-                    possible_parent, descendant
+                if (
+                    possible_parent is descendant
+                    or not self._artist_contains_descendant(possible_parent, descendant)
                 ):
                     continue
                 if (
-                    _container_keeps_children(possible_parent)
-                    and not direct_selection
+                    _container_keeps_children(possible_parent) and not direct_selection
                 ) or (
-                    prefer_containers
-                    and _container_yields_to_children(possible_parent)
+                    prefer_containers and _container_yields_to_children(possible_parent)
                 ):
                     remove_ids.add(id(descendant))
                 elif (
@@ -4680,16 +5566,12 @@ class DragManager:
                     remove_ids.add(id(possible_parent))
                 elif (
                     _container_yields_to_children(possible_parent)
-                    and not (
-                        preserve_axes and isinstance(possible_parent, Axes)
-                    )
+                    and not (preserve_axes and isinstance(possible_parent, Axes))
                     and not prefer_containers
                 ):
                     remove_ids.add(id(possible_parent))
 
-        normalized = [
-            element for element in unique if id(element) not in remove_ids
-        ]
+        normalized = [element for element in unique if id(element) not in remove_ids]
 
         if primary not in normalized:
             for element in normalized:
@@ -4715,9 +5597,7 @@ class DragManager:
     def _iter_hit_candidates(self, event: MouseEvent):
         """Yield actual hits front-to-back, allowing top-hit short circuiting."""
 
-        roster, editable_flags, registration_order = (
-            self._interaction_roster_snapshot()
-        )
+        roster, editable_flags, registration_order = self._interaction_roster_snapshot()
         artists = roster.artists
 
         def pick_order(index):
@@ -4932,7 +5812,9 @@ class DragManager:
         if self.marquee_start is not None:
             self._hide_preselection()
             self._update_marquee_rect(event)
-        elif not any(getattr(grabber, "got_artist", False) for grabber in self.selection.grabbers):
+        elif not self.selection.direct_point_editor.got_artist and not any(
+            getattr(grabber, "got_artist", False) for grabber in self.selection.grabbers
+        ):
             self.update_preselection(event)
 
     def _artist_intersects_bbox(
@@ -5060,14 +5942,14 @@ class DragManager:
         elements = [
             artist
             for artist in artists
-            if self._artist_intersects_bbox(
-                artist, x0, y0, x1, y1, geometry=geometry
-            )
+            if self._artist_intersects_bbox(artist, x0, y0, x1, y1, geometry=geometry)
         ]
         prefer_containers = bool(getattr(self, "marquee_select_containers_only", False))
         if prefer_containers:
             elements = [
-                element for element in elements if _container_yields_to_children(element)
+                element
+                for element in elements
+                if _container_yields_to_children(element)
             ]
         else:
             # Panel containers are never an implicit fallback for an otherwise
@@ -5129,14 +6011,22 @@ class DragManager:
             return
         # release the grabber
         if self.grab_element:
-            self.grab_element.button_release_event(event)
-            self.grab_element = None
+            grab_element = self.grab_element
+            try:
+                grab_element.button_release_event(event)
+            finally:
+                if self.grab_element is grab_element:
+                    self.grab_element = None
         # or notify the selected element
         elif len(self.selection.targets):
             self.selection.button_release_event(event)
 
     def button_press_event0(self, event: MouseEvent):
         """when the mouse button is pressed"""
+        inline_editor = getattr(self, "inline_text_editor", None)
+        if inline_editor is not None and inline_editor.active:
+            if event.button != 1 or not inline_editor.commit():
+                return
         if event.button == 3:
             self.show_hit_candidate_menu(event)
             return
@@ -5148,6 +6038,18 @@ class DragManager:
             ):
                 self._reconcile_selection_for_mode()
                 self._selection_semantic_mode = self.selection_mode
+            point_click_through = _event_has_modifier(
+                event, "alt"
+            ) or _event_has_modifier(event, "option")
+            point_key = (
+                None if point_click_through else self.selection.hit_direct_point(event)
+            )
+            if point_key is not None:
+                editor = self.selection.direct_point_editor
+                self.grab_element = editor
+                editor.begin(point_key, event)
+                return
+            self.selection.clear_direct_point_active()
             selected = [target.target for target in self.selection.targets]
             last = (
                 self.selected_element
@@ -5155,9 +6057,9 @@ class DragManager:
                 else (selected[-1] if selected else None)
             )
 
-            click_through = _event_has_modifier(
-                event, "alt"
-            ) or _event_has_modifier(event, "option")
+            click_through = _event_has_modifier(event, "alt") or _event_has_modifier(
+                event, "option"
+            )
             shift = _event_has_modifier(event, "shift")
             kernel = self._ensure_selection_kernel()
             hit_stack = None
@@ -5172,17 +6074,13 @@ class DragManager:
                 resolution = self._resolve_top_hit(event)
             picked_element = resolution.target
             self._last_pick_blocked = resolution.blocked
-            picked_is_selected = any(
-                target is picked_element for target in selected
-            )
+            picked_is_selected = any(target is picked_element for target in selected)
 
             if (
                 self.selection.alignment_reference_mode == "key_object"
                 and len(self.selection.targets) < 2
             ):
-                self.selection._restore_alignment_reference_state(
-                    "selection", None
-                )
+                self.selection._restore_alignment_reference_state("selection", None)
             if (
                 self.selection.alignment_reference_mode == "key_object"
                 and len(self.selection.targets) >= 2
@@ -5202,6 +6100,12 @@ class DragManager:
                         self._notify_selected_element_changed()
                     return
 
+            if event.dblclick and isinstance(picked_element, Text):
+                if not picked_is_selected:
+                    self.select_element(picked_element, event)
+                self._ensure_inline_text_editor().start(picked_element)
+                return
+
             # if the element is a grabber, store it
             if getattr(self, "_last_pick_blocked", False):
                 self._start_marquee_selection(event)
@@ -5214,9 +6118,7 @@ class DragManager:
                 ]
                 primary = (
                     self.selected_element
-                    if any(
-                        target is self.selected_element for target in remaining
-                    )
+                    if any(target is self.selected_element for target in remaining)
                     else (remaining[-1] if remaining else None)
                 )
                 self.select_elements(remaining, primary=primary)
@@ -5234,24 +6136,22 @@ class DragManager:
             # Keep a multi-selection only when the resolved target is one of
             # its members. An overlapped old selection cannot suppress the
             # visually foreground target.
-            elif (
-                not picked_is_selected
-                or event.dblclick
-                or click_through
-            ):
+            elif not picked_is_selected or event.dblclick or click_through:
                 self.select_element(picked_element, event)
                 picked_is_selected = any(
-                    target.target is picked_element
-                    for target in self.selection.targets
+                    target.target is picked_element for target in self.selection.targets
                 )
 
             # if we have a grabber, notify it
             if self.grab_element:
                 self.grab_element.button_press_event(event)
             # if not, notify the selected element
-            elif picked_is_selected and self.selection.operation_support(
-                TransformOperation.TRANSLATE
-            ).supported:
+            elif (
+                picked_is_selected
+                and self.selection.operation_support(
+                    TransformOperation.TRANSLATE
+                ).supported
+            ):
                 self.selection.button_press_event(event)
 
     def select_element(self, element: Artist, event: MouseEvent = None):
@@ -5298,9 +6198,7 @@ class DragManager:
         same_membership = len(current) == len(elements) and {
             id(element) for element in current
         } == {id(element) for element in elements}
-        self.selection.clear_targets(
-            preserve_rotation_pivot=same_membership
-        )
+        self.selection.clear_targets(preserve_rotation_pivot=same_membership)
         self.selection.configure_target_overlay(len(elements))
 
         self.selection._batch_add_targets = True
@@ -5322,11 +6220,7 @@ class DragManager:
             self.selection.update_extent()
         if self.selection.alignment_reference_mode == "key_object":
             retained_key = next(
-                (
-                    element
-                    for element in elements
-                    if element is previous_alignment_key
-                ),
+                (element for element in elements if element is previous_alignment_key),
                 None,
             )
             self.selection._restore_alignment_reference_state(
@@ -5387,6 +6281,20 @@ class DragManager:
     def _cancel_active_pointer_transform(self) -> bool:
         """Rollback an in-flight move/resize and keep the selection intact."""
 
+        point_editor = self.selection.direct_point_editor
+        if point_editor.got_artist:
+            point_editor.cancel_event(refresh=True)
+            self.grab_element = None
+            scene = getattr(self.figure, "_pyl_scene", None)
+            if scene is not None:
+                scene.grabber_pressed = None
+            canvas = self.figure.canvas
+            if hasattr(canvas, "schedule_draw"):
+                canvas.schedule_draw()
+            else:
+                canvas.draw_idle()
+            return True
+
         active = None
         grabber = self.grab_element
         if grabber is not None and bool(getattr(grabber, "got_artist", False)):
@@ -5415,6 +6323,33 @@ class DragManager:
 
     def key_press_event(self, event: KeyEvent):
         """when a key is pressed"""
+        inline_editor = getattr(self, "inline_text_editor", None)
+        if inline_editor is not None:
+            if inline_editor.active:
+                if event.key == "escape":
+                    inline_editor.suppress_forwarded_canvas_keys()
+                    inline_editor.cancel()
+                elif event.key in {
+                    "ctrl+enter",
+                    "control+enter",
+                    "cmd+enter",
+                    "meta+enter",
+                }:
+                    inline_editor.suppress_forwarded_canvas_keys()
+                    inline_editor.commit()
+                return
+            if inline_editor.consumes_canvas_key():
+                return
+        if event.key in {"enter", "return"}:
+            selected = [target.target for target in self.selection.targets]
+            target = (
+                self.selected_element
+                if self.selected_element in selected
+                else (selected[-1] if len(selected) == 1 else None)
+            )
+            if isinstance(target, Text) and len(selected) == 1:
+                self._ensure_inline_text_editor().start(target)
+            return
         if event.key == "v":
             self.set_selection_mode(SelectionMode.OBJECT)
             return
@@ -5438,9 +6373,7 @@ class DragManager:
                 )
             )
             if pivot_active:
-                self.selection.rotation_grabber.cancel_pivot_event(
-                    restore=True
-                )
+                self.selection.rotation_grabber.cancel_pivot_event(restore=True)
                 self.grab_element = None
                 scene = getattr(self.figure, "_pyl_scene", None)
                 if scene is not None:
@@ -5651,30 +6584,23 @@ class GrabberRotation(GrabFunctions):
         self.line.setLine(
             float(pivot[0]), float(pivot[1]), float(self.xy[0]), float(self.xy[1])
         )
-        self.pivot_marker.setRect(
-            float(pivot[0]) - 3, float(pivot[1]) - 3, 6, 6
-        )
+        self.pivot_marker.setRect(float(pivot[0]) - 3, float(pivot[1]) - 3, 6, 6)
 
     def on_pivot_motion(self, event: MouseEvent) -> None:
         if getattr(self, "pivot_got_artist", False):
-            self.parent.set_rotation_pivot(
-                (event.x, event.y), notify=False
-            )
+            self.parent.set_rotation_pivot((event.x, event.y), notify=False)
 
     def pivot_button_press_event(self, event: MouseEvent) -> None:
         if not self.parent.custom_rotation_pivot_supported():
             raise UnsupportedArtistError(
-                "A custom rotation pivot requires a complete shared "
-                "rigid-rotation plan"
+                "A custom rotation pivot requires a complete shared rigid-rotation plan"
             )
         self.pivot_drag_start_state = self.parent.custom_rotation_pivot_state()
         self.pivot_got_artist = True
         self._pivot_c1 = self.figure.canvas.mpl_connect(
             "motion_notify_event", self.on_pivot_motion
         )
-        self.parent.set_rotation_pivot(
-            (event.x, event.y), notify=False
-        )
+        self.parent.set_rotation_pivot((event.x, event.y), notify=False)
 
     def pivot_button_release_event(self, event: MouseEvent) -> None:
         if not getattr(self, "pivot_got_artist", False):

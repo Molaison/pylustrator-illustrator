@@ -24,7 +24,7 @@ from dataclasses import dataclass, field, replace
 from enum import Enum
 from numbers import Integral, Real
 from threading import RLock
-from typing import Iterable, Optional, Sequence
+from typing import Any, Iterable, Optional, Sequence
 
 import matplotlib as mpl
 import matplotlib.collections as mpl_collections
@@ -65,6 +65,10 @@ from matplotlib.transforms import (
 )
 from packaging import version
 
+from .commands import (
+    ensure_line_endpoint_replay_api,
+    line_endpoint_replay_conflict,
+)
 from .editor_model import EditorGroup
 from .legend_layout import (
     LegendLayoutError,
@@ -92,6 +96,7 @@ _LEGEND_OWNER_INVENTORY_ATTR = "_pylustrator_legend_owner_inventory"
 _ACTIVE_LAYOUT_OWNER_SNAPSHOT_KEY = object()
 _ACTIVE_LAYOUT_EXTRAS_SNAPSHOT_KEY = object()
 _CONTAINER_OWNER_SNAPSHOT_KEY = object()
+MAX_DIRECT_POINT_HANDLES = 1024
 
 
 @contextmanager
@@ -197,8 +202,10 @@ def _clip_polygon_to_bbox(vertices, bounds: np.ndarray) -> np.ndarray:
         result = []
 
         def inside(point) -> bool:
-            return bool(point[axis] >= limit) if keep_greater else bool(
-                point[axis] <= limit
+            return (
+                bool(point[axis] >= limit)
+                if keep_greater
+                else bool(point[axis] <= limit)
             )
 
         previous = points[-1]
@@ -595,9 +602,7 @@ def active_layout_owner_for_artist(target: Artist) -> Artist | None:
             # adapter is exact only while the Figure layout is inactive.
             return getattr(owner, "axes", None) or owner
 
-    if not target.get_visible() or not getattr(
-        target, "get_in_layout", lambda: True
-    )():
+    if not target.get_visible() or not getattr(target, "get_in_layout", lambda: True)():
         return None
 
     # Constrained layout rewrites the automatic coordinate of Figure and
@@ -644,9 +649,7 @@ def active_layout_owner_for_artist(target: Artist) -> Artist | None:
         except (AttributeError, TypeError, ValueError, RuntimeError):
             extras = None
         extras_inventory = (
-            None
-            if extras is None
-            else {id(artist): artist for artist in extras}
+            None if extras is None else {id(artist): artist for artist in extras}
         )
         if snapshot is not None:
             snapshot[extras_key] = (axes, extras, extras_inventory)
@@ -756,6 +759,7 @@ class ArtistCapabilities:
     fixed_aspect: bool = False
     can_rotate: bool = False
     can_rigid_rotate: bool = False
+    can_edit_points: bool = False
 
     @property
     def editable(self) -> bool:
@@ -780,9 +784,7 @@ class RigidRotationPlan:
     selection_points: np.ndarray = field(repr=False, compare=False)
     rotation_value: Optional[float] = None
     member_plans: tuple["RigidRotationPlan", ...] = ()
-    source_fingerprint: object | None = field(
-        default=None, repr=False, compare=False
-    )
+    source_fingerprint: object | None = field(default=None, repr=False, compare=False)
 
     @staticmethod
     def _immutable_points(points) -> np.ndarray:
@@ -820,6 +822,65 @@ class RigidRotationPlan:
 
 
 @dataclass(frozen=True)
+class PointHandleModel:
+    """Adapter-owned secondary selection model for editable path anchors.
+
+    Handles are stable indices into the parent Artist's native control array;
+    they are deliberately not synthetic Artists and never enter the ordinary
+    hit stack, editor scene, or TargetWrapper ownership model.  A single
+    batched overlay can therefore represent many anchors without allocating a
+    QGraphicsItem per point.
+    """
+
+    target: Artist
+    keys: tuple[int, ...]
+    display_positions: np.ndarray = field(repr=False, compare=False)
+    topology_token: object = field(default=None, repr=False, compare=False)
+    alias_groups: tuple[tuple[int, ...], ...] = field(
+        default=(), repr=False, compare=False
+    )
+    path_vertices: np.ndarray = field(
+        default_factory=lambda: np.empty((0, 2)), repr=False, compare=False
+    )
+    path_codes: tuple[int, ...] | None = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        keys = tuple(int(key) for key in self.keys)
+        positions = RigidRotationPlan._immutable_points(self.display_positions)
+        if len(keys) != len(positions) or len(set(keys)) != len(keys):
+            raise ValueError("Point handles need one unique key per display position")
+        aliases = self.alias_groups or tuple((key,) for key in keys)
+        aliases = tuple(tuple(int(index) for index in group) for group in aliases)
+        if len(aliases) != len(keys) or any(
+            not group or key not in group for key, group in zip(keys, aliases)
+        ):
+            raise ValueError("Point-handle aliases must contain their visible key")
+        path_vertices = RigidRotationPlan._immutable_points(self.path_vertices)
+        path_codes = self.path_codes
+        if path_codes is not None:
+            path_codes = tuple(int(code) for code in path_codes)
+            if len(path_codes) != len(path_vertices):
+                raise ValueError("Point-overlay path codes must match its vertices")
+        object.__setattr__(self, "keys", keys)
+        object.__setattr__(self, "display_positions", positions)
+        object.__setattr__(self, "alias_groups", aliases)
+        object.__setattr__(self, "path_vertices", path_vertices)
+        object.__setattr__(self, "path_codes", path_codes)
+
+    def positions_array(self) -> np.ndarray:
+        return self.display_positions
+
+    def path_array(self) -> np.ndarray:
+        return self.path_vertices
+
+    def aliases_for(self, key: int) -> tuple[int, ...]:
+        try:
+            return self.alias_groups[self.keys.index(int(key))]
+        except ValueError as error:
+            raise IndexError("Point key is outside this handle model") from error
+
+
+@dataclass(frozen=True)
 class TextAppearanceState:
     fontsize: float
 
@@ -850,6 +911,29 @@ class _Line2DRawWrite:
     native_points: np.ndarray = field(repr=False, compare=False)
     xdata: object | None = field(default=None, repr=False, compare=False)
     ydata: object | None = field(default=None, repr=False, compare=False)
+
+
+@dataclass(frozen=True)
+class _Line2DPointAxisHistory:
+    """Compact reconstruction recipe for one raw coordinate container."""
+
+    kind: str
+    shape: tuple[int, ...]
+    dtype: str
+    indices: tuple[int, ...]
+    values: tuple[object, ...]
+    fill_value: Any = None
+    hard_mask: bool = False
+    fallback: object = field(default=None, repr=False, compare=False)
+
+
+@dataclass(frozen=True)
+class Line2DPointHistoryState:
+    keys: tuple[int, ...]
+    processed_shape: tuple[int, ...]
+    topology_token: object
+    xaxis: _Line2DPointAxisHistory
+    yaxis: _Line2DPointAxisHistory
 
 
 @dataclass(frozen=True)
@@ -991,6 +1075,7 @@ class ArtistAdapter:
             TransformOperation.RESIZE_GEOMETRY,
             TransformOperation.ROTATE,
             TransformOperation.RIGID_ROTATE,
+            TransformOperation.EDIT_POINTS,
         }
         if operation in {
             TransformOperation.ROTATE,
@@ -1043,17 +1128,21 @@ class ArtistAdapter:
             TransformOperation.RESIZE_GEOMETRY: capabilities.can_resize,
             TransformOperation.ROTATE: capabilities.can_rotate,
             TransformOperation.RIGID_ROTATE: capabilities.can_rigid_rotate,
+            TransformOperation.EDIT_POINTS: capabilities.can_edit_points,
             TransformOperation.SNAPSHOT: capabilities.can_snapshot,
             TransformOperation.SERIALIZE: capabilities.can_serialize,
             TransformOperation.SCALE_APPEARANCE: False,
             TransformOperation.REFLOW_LAYOUT: False,
-            TransformOperation.EDIT_POINTS: False,
         }
         if legacy_support[operation]:
-            constraints = ("fixed_aspect",) if (
-                operation is TransformOperation.RESIZE_GEOMETRY
-                and capabilities.fixed_aspect
-            ) else ()
+            constraints = (
+                ("fixed_aspect",)
+                if (
+                    operation is TransformOperation.RESIZE_GEOMETRY
+                    and capabilities.fixed_aspect
+                )
+                else ()
+            )
             preview_strategy = (
                 "native_rotation"
                 if operation is TransformOperation.ROTATE
@@ -1118,7 +1207,8 @@ class ArtistAdapter:
     @classmethod
     def finite_points(cls, points) -> np.ndarray:
         points = cls.point_array(points)
-        return points[np.all(np.isfinite(points), axis=1)]
+        finite = np.all(np.isfinite(points), axis=1)
+        return points if np.all(finite) else points[finite]
 
     @classmethod
     def bounds_points(cls, points, padding: float = 0.0) -> np.ndarray:
@@ -1159,8 +1249,7 @@ class ArtistAdapter:
                     destination = points[-1] if len(points) else None
                     candidates = points
                 if current is not None and any(
-                    np.all(np.isfinite(point))
-                    and not np.array_equal(point, current)
+                    np.all(np.isfinite(point)) and not np.array_equal(point, current)
                     for point in candidates
                 ):
                     return True
@@ -1188,9 +1277,7 @@ class ArtistAdapter:
                 continue
             x = polygon[:, 0]
             y = polygon[:, 1]
-            area = 0.5 * abs(
-                float(np.dot(x, np.roll(y, 1)) - np.dot(y, np.roll(x, 1)))
-            )
+            area = 0.5 * abs(float(np.dot(x, np.roll(y, 1)) - np.dot(y, np.roll(x, 1))))
             if np.isfinite(area) and area > np.finfo(float).eps:
                 return True
         return False
@@ -1303,6 +1390,102 @@ class ArtistAdapter:
         """Writable points in the artist's own coordinate systems."""
         return []
 
+    def point_edit_topology_token(self):
+        """Return storage topology that gives point keys their identity."""
+
+        return None
+
+    def point_edit_aliases(self, key: int) -> tuple[int, ...]:
+        """Return native control indices written by one visible anchor."""
+
+        return (int(key),)
+
+    def point_handle_model(self) -> PointHandleModel:
+        """Return the Direct Selection anchors owned by this Artist.
+
+        The default is an explicit denial.  Generic control points often
+        represent bounding boxes, layout anchors, or semantic parameters and
+        must never be exposed as path nodes merely because they are writable.
+        """
+
+        support = self.operation_support(TransformOperation.EDIT_POINTS)
+        raise UnsupportedArtistError(support.reason)
+
+    def preview_point_edit_control_points(
+        self,
+        requested_display_points,
+        *,
+        point_keys: Sequence[int],
+    ) -> np.ndarray:
+        """Canonicalize a point preview without mutating the live Artist."""
+
+        requested = self.point_array(requested_display_points)
+        try:
+            converted = self.point_array(self.display_to_native(requested))
+            native = self.point_array(self.native_control_points()).copy()
+            if native.shape != converted.shape:
+                raise UnsupportedArtistError(
+                    "Point preview changed the native control inventory"
+                )
+            for key in point_keys:
+                aliases = np.asarray(self.point_edit_aliases(key), dtype=int)
+                native[aliases] = converted[aliases]
+            native = self.point_array(self.canonicalize_native_control_points(native))
+            return self.point_array(self.native_to_display(native))
+        except UnsupportedArtistError:
+            raise
+        except (
+            AttributeError,
+            TypeError,
+            ValueError,
+            NotImplementedError,
+            RuntimeError,
+            np.linalg.LinAlgError,
+        ) as error:
+            raise UnsupportedArtistError(
+                f"{type(self.target).__name__} point destination cannot be "
+                "converted through native coordinates"
+            ) from error
+
+    def preview_point_edit_selection_points(
+        self,
+        planned_control_points,
+        *,
+        source_control_points,
+        source_selection_points,
+        point_keys: Sequence[int] = (),
+        preview_context=None,
+    ) -> np.ndarray:
+        """Derive the visible envelope for a frozen point-edit preview."""
+
+        outsets = self.appearance_outsets(
+            control_points=source_control_points,
+            selection_points=source_selection_points,
+        )
+        geometry = self.geometry_bounds(planned_control_points)
+        if not len(geometry):
+            return np.empty((0, 2), dtype=float)
+        left, bottom, right, top = outsets
+        proposed = np.array(
+            [
+                [geometry[0, 0] - left, geometry[0, 1] - bottom],
+                [geometry[1, 0] + right, geometry[1, 1] + top],
+            ],
+            dtype=float,
+        )
+        return self.clip_selection_points(proposed)
+
+    def point_edit_preview_context(
+        self,
+        *,
+        source_control_points,
+        source_selection_points,
+        handle_model: PointHandleModel,
+    ):
+        """Build optional gesture-start data for sublinear warm previews."""
+
+        return None
+
     def control_points(self) -> list[np.ndarray]:
         """Writable points transformed to display coordinates."""
         preview = self._preview_points("_pylustrator_preview_positions")
@@ -1376,6 +1559,23 @@ class ArtistAdapter:
         self.record_changes()
         self.invalidate_geometry_cache()
 
+    def apply_native_point_edit(self, points) -> None:
+        """Apply one preflighted point destination through the point contract.
+
+        Point editing and whole-object translation may deliberately have
+        different ownership/capability rules.  Keeping their executors
+        separate prevents a point-only third-party adapter from being routed
+        through the legacy translation gate.
+        """
+
+        support = self.operation_support(TransformOperation.EDIT_POINTS)
+        if not support.supported:
+            raise UnsupportedArtistError(support.reason)
+        self.validate_native_control_points(points)
+        self._apply_native_control_points(points)
+        self.record_changes()
+        self.invalidate_geometry_cache()
+
     def validate_native_control_points(self, points) -> None:
         """Reject destination-specific geometry before mutating an artist."""
 
@@ -1417,15 +1617,13 @@ class ArtistAdapter:
         if not len(visible):
             return
         candidate = Bbox.from_extents(*visible[0], *visible[1])
-        visible_in_clip_box = clip_box is None or Bbox.from_extents(
-            *clip_box
-        ).overlaps(candidate)
+        visible_in_clip_box = clip_box is None or Bbox.from_extents(*clip_box).overlaps(
+            candidate
+        )
         visible_in_clip_path = True
         if clip_path is not None:
             try:
-                visible_in_clip_path = clip_path.intersects_bbox(
-                    candidate, filled=True
-                )
+                visible_in_clip_path = clip_path.intersects_bbox(candidate, filled=True)
             except (TypeError, ValueError, RuntimeError):
                 visible_in_clip_path = False
         if not visible_in_clip_box or not visible_in_clip_path:
@@ -1707,9 +1905,7 @@ class ArtistAdapter:
             raise UnsupportedArtistError(support.reason)
         return self._plan_preflighted_appearance_scale(factor)
 
-    def _plan_preflighted_appearance_scale(
-        self, factor: float
-    ) -> AppearanceScalePlan:
+    def _plan_preflighted_appearance_scale(self, factor: float) -> AppearanceScalePlan:
         """Build a plan after the outer selection capability preflight."""
 
         factor = self.validate_scale_factor(factor)
@@ -1802,9 +1998,7 @@ class ArtistAdapter:
         plan = self.plan_appearance_scale(factor)
         return self.apply_appearance_scale_plan(plan)
 
-    def restore_appearance_state(
-        self, state, *, record_changes: bool = True
-    ) -> None:
+    def restore_appearance_state(self, state, *, record_changes: bool = True) -> None:
         """Restore only paint/font state, independent of geometry snapshots."""
 
         before = self.appearance_state()
@@ -1884,9 +2078,9 @@ class ArtistAdapter:
         if not bool(getattr(transform, "is_affine", False)):
             return False
         try:
-            linear = np.asarray(
-                transform.get_affine().get_matrix(), dtype=float
-            )[:2, :2]
+            linear = np.asarray(transform.get_affine().get_matrix(), dtype=float)[
+                :2, :2
+            ]
         except (AttributeError, TypeError, ValueError, RuntimeError):
             return False
         gram = linear.T @ linear
@@ -1992,9 +2186,7 @@ class ArtistAdapter:
         support = self.operation_support(TransformOperation.RIGID_ROTATE)
         if not support.supported:
             raise UnsupportedArtistError(support.reason)
-        angle_degrees = (
-            float(angle_degrees) + 180.0
-        ) % 360.0 - 180.0
+        angle_degrees = (float(angle_degrees) + 180.0) % 360.0 - 180.0
         if np.isclose(angle_degrees, 0.0, atol=1e-12):
             angle_degrees = 0.0
         matrix = self.display_rotation_matrix(angle_degrees, pivot)
@@ -2010,9 +2202,7 @@ class ArtistAdapter:
             matrix, control_points=control_points
         )
         try:
-            planned_native = self.point_array(
-                self.display_to_native(planned_control)
-            )
+            planned_native = self.point_array(self.display_to_native(planned_control))
             planned_native = self.point_array(
                 self.canonicalize_native_control_points(planned_native)
             )
@@ -2041,8 +2231,12 @@ class ArtistAdapter:
             expected.shape == representable_control.shape
             and np.array_equal(expected_finite, actual_finite)
             and np.array_equal(np.isnan(expected), np.isnan(representable_control))
-            and np.array_equal(np.isposinf(expected), np.isposinf(representable_control))
-            and np.array_equal(np.isneginf(expected), np.isneginf(representable_control))
+            and np.array_equal(
+                np.isposinf(expected), np.isposinf(representable_control)
+            )
+            and np.array_equal(
+                np.isneginf(expected), np.isneginf(representable_control)
+            )
         )
         if expected.shape == representable_control.shape and np.any(expected_finite):
             round_trip_error = float(
@@ -2075,9 +2269,7 @@ class ArtistAdapter:
             planned_native_control_points=planned_native,
             rotation_value=rotation_value,
         )
-        self.preflight_rigid_rotation_clip(
-            selection_points, planned_selection
-        )
+        self.preflight_rigid_rotation_clip(selection_points, planned_selection)
         visible = _clip_selection_points(self.target, planned_selection)
         if not len(self.finite_points(visible)):
             raise UnsupportedArtistError(
@@ -2091,9 +2283,7 @@ class ArtistAdapter:
             control_points=planned_control,
             native_control_points=planned_native,
             selection_points=visible,
-            rotation_value=(
-                None if rotation_value is None else float(rotation_value)
-            ),
+            rotation_value=(None if rotation_value is None else float(rotation_value)),
             source_fingerprint=self.rigid_rotation_source_fingerprint(),
         )
 
@@ -2139,12 +2329,7 @@ class ArtistAdapter:
         )
         if expected.shape == actual.shape and np.any(expected_finite):
             error = float(
-                np.max(
-                    np.abs(
-                        expected[expected_finite]
-                        - actual[expected_finite]
-                    )
-                )
+                np.max(np.abs(expected[expected_finite] - actual[expected_finite]))
             )
         elif structure_matches:
             error = 0.0
@@ -2342,9 +2527,23 @@ class ArtistAdapter:
             state["rotation"] = self.rotation()
         return state
 
+    def point_edit_history_snapshot(self, point_keys: Sequence[int]):
+        """Capture one point-edit undo state.
+
+        The generic fallback is the complete adapter snapshot.  Large path
+        adapters may override this with a sparse, topology-bound codec.
+        """
+
+        return self.snapshot()
+
+    def restore_point_edit_history_state(self, state) -> None:
+        self.restore(state)
+
     def restore(self, state) -> None:
         if state.get("type") != "positions":
-            raise ValueError(f"Unsupported snapshot for {type(self).__name__}: {state!r}")
+            raise ValueError(
+                f"Unsupported snapshot for {type(self).__name__}: {state!r}"
+            )
         self._apply_native_control_points(state["positions"])
         include_rotation = "rotation" in state and not np.isclose(
             self.rotation(), float(state["rotation"])
@@ -2399,9 +2598,7 @@ class AdapterInheritancePolicy(str, Enum):
             return cls(str(value).lower())
         except ValueError as error:
             choices = ", ".join(policy.value for policy in cls)
-            raise ValueError(
-                f"inheritance_policy must be one of: {choices}"
-            ) from error
+            raise ValueError(f"inheritance_policy must be one of: {choices}") from error
 
 
 class UnsupportedSubclassAdapter(ArtistAdapter):
@@ -2435,6 +2632,7 @@ class UnsupportedSubclassAdapter(ArtistAdapter):
                 "inheritance"
             )
         return OperationSupport.denied(operation, reason)
+
 
 @dataclass(frozen=True)
 class AdapterRegistration:
@@ -2560,7 +2758,9 @@ class ArtistAdapterRegistry:
         return adapter_type
 
     def resolve_type(self, target_or_type) -> type[ArtistAdapter]:
-        concrete = target_or_type if isinstance(target_or_type, type) else type(target_or_type)
+        concrete = (
+            target_or_type if isinstance(target_or_type, type) else type(target_or_type)
+        )
         with self._lock:
             cached = self._cache.get(concrete)
             if cached is not None:
@@ -2614,6 +2814,7 @@ class PatchAdapter(ArtistAdapter):
             can_serialize=capabilities.can_serialize,
             fixed_aspect=capabilities.fixed_aspect,
             can_rotate=hasattr(target, "get_angle") and hasattr(target, "set_angle"),
+            can_edit_points=capabilities.can_edit_points,
         )
 
     def get_transform(self) -> Transform:
@@ -2631,9 +2832,7 @@ class PatchAdapter(ArtistAdapter):
                 f"{type(self.target).__name__} native angle is not a rigid "
                 "display rotation under its non-similarity transform",
             )
-        linear = np.asarray(
-            transform.get_affine().get_matrix(), dtype=float
-        )[:2, :2]
+        linear = np.asarray(transform.get_affine().get_matrix(), dtype=float)[:2, :2]
         if np.linalg.det(linear) <= 0:
             return OperationSupport.denied(
                 operation,
@@ -2659,7 +2858,9 @@ class PatchAdapter(ArtistAdapter):
         points = super().selection_points()
         if not len(points) or not self.colors_are_visible(self.target.get_edgecolor()):
             return points
-        padding = self.points_to_pixels(max(float(self.target.get_linewidth()), 0.0)) / 2
+        padding = (
+            self.points_to_pixels(max(float(self.target.get_linewidth()), 0.0)) / 2
+        )
         return self.bounds_points(points, padding=padding)
 
     @staticmethod
@@ -2697,7 +2898,9 @@ class PatchAdapter(ArtistAdapter):
                     current = vertex
                     start = vertex
                     continue
-                endpoint = start if code == Path.CLOSEPOLY and start is not None else vertex
+                endpoint = (
+                    start if code == Path.CLOSEPOLY and start is not None else vertex
+                )
                 if self._point_segment_distance(point, current, endpoint) <= tolerance:
                     return True
                 current = endpoint
@@ -2781,9 +2984,10 @@ class PatchAdapter(ArtistAdapter):
             target_second,
             scale,
         ):
-            if not np.isclose(scale, 0.0) and scale * (
-                target_second - target_first
-            ) >= 0:
+            if (
+                not np.isclose(scale, 0.0)
+                and scale * (target_second - target_first) >= 0
+            ):
                 return target_first, target_second
             desired_low = min(desired_first, desired_second)
             desired_high = max(desired_first, desired_second)
@@ -2792,9 +2996,7 @@ class PatchAdapter(ArtistAdapter):
             elif np.isclose(desired_high, original_high):
                 collapsed = desired_high - high_outset
             else:
-                collapsed = (
-                    desired_low + desired_high + low_outset - high_outset
-                ) / 2
+                collapsed = (desired_low + desired_high + low_outset - high_outset) / 2
             return collapsed, collapsed
 
         target_x0, target_x1 = clamp_collapsed_axis(
@@ -2833,14 +3035,12 @@ class PatchAdapter(ArtistAdapter):
                 [
                     (target_x1 - target_x0) / width,
                     0.0,
-                    target_x0
-                    - (target_x1 - target_x0) / width * geometry[0, 0],
+                    target_x0 - (target_x1 - target_x0) / width * geometry[0, 0],
                 ],
                 [
                     0.0,
                     (target_y1 - target_y0) / height,
-                    target_y0
-                    - (target_y1 - target_y0) / height * geometry[0, 1],
+                    target_y0 - (target_y1 - target_y0) / height * geometry[0, 1],
                 ],
                 [0.0, 0.0, 1.0],
             ],
@@ -2886,9 +3086,7 @@ class PatchAdapter(ArtistAdapter):
         )
 
     def rigid_rotation_uses_native_angle(self) -> bool:
-        return bool(
-            self.capabilities.can_rigid_rotate and self.capabilities.can_rotate
-        )
+        return bool(self.capabilities.can_rigid_rotate and self.capabilities.can_rotate)
 
     def rigid_rotation_angle_delta(self, angle_degrees: float) -> float:
         if not self.rigid_rotation_uses_native_angle():
@@ -3358,8 +3556,22 @@ class PolygonAdapter(PatchAdapter):
         if not len(cls.finite_points(target.get_xy())):
             return ArtistCapabilities()
         capabilities = super().capabilities_for(target)
+        points = np.asarray(target.get_xy(), dtype=float)
+        closed_duplicate = bool(
+            target.get_closed()
+            and len(points) > 1
+            and np.array_equal(points[0], points[-1])
+        )
+        handle_count = len(points) - int(closed_duplicate)
         return replace(
             capabilities,
+            can_edit_points=bool(
+                0 < handle_count <= MAX_DIRECT_POINT_HANDLES
+                and cls.transform_is_invertible_affine(target.get_data_transform())
+                and target.get_agg_filter() is None
+                and not target.get_path_effects()
+                and target.get_sketch_params() is None
+            ),
             can_rigid_rotate=bool(
                 legend_owner_for_artist(target) is None
                 and active_layout_owner_for_artist(target) is None
@@ -3371,7 +3583,64 @@ class PolygonAdapter(PatchAdapter):
         )
 
     def native_control_points(self):
-        return [np.asarray(point, dtype=float) for point in self.target.get_xy()]
+        return self.point_array(self.target.get_xy()).copy()
+
+    def native_to_display(self, points) -> np.ndarray:
+        points = self.point_array(points)
+        return self.point_array(self.target.get_data_transform().transform(points))
+
+    def display_to_native(self, points) -> np.ndarray:
+        points = self.point_array(points)
+        inverse = self.target.get_data_transform().inverted()
+        return self.point_array(inverse.transform(points))
+
+    def control_points(self) -> np.ndarray:
+        preview = self._preview_points("_pylustrator_preview_positions")
+        if preview is not None:
+            return self.point_array(preview).copy()
+        return self.native_to_display(self.native_control_points())
+
+    def _closed_duplicate(self) -> bool:
+        points = np.asarray(self.target.get_xy(), dtype=float)
+        return bool(
+            self.target.get_closed()
+            and len(points) > 1
+            and np.array_equal(points[0], points[-1])
+        )
+
+    def point_edit_topology_token(self):
+        points = np.asarray(self.target.get_xy(), dtype=float)
+        return (
+            "polygon",
+            bool(self.target.get_closed()),
+            len(points),
+            self._closed_duplicate(),
+        )
+
+    def point_edit_aliases(self, key: int) -> tuple[int, ...]:
+        key = int(key)
+        points = np.asarray(self.target.get_xy(), dtype=float)
+        if key < 0 or key >= len(points):
+            raise IndexError("Polygon point key is outside its vertex inventory")
+        if key == 0 and self._closed_duplicate():
+            return 0, len(points) - 1
+        return (key,)
+
+    def point_handle_model(self) -> PointHandleModel:
+        support = self.operation_support(TransformOperation.EDIT_POINTS)
+        if not support.supported:
+            raise UnsupportedArtistError(support.reason)
+        controls = self.point_array(self.control_points())
+        count = len(controls) - int(self._closed_duplicate())
+        keys = tuple(range(count))
+        return PointHandleModel(
+            target=self.target,
+            keys=keys,
+            display_positions=controls[:count],
+            topology_token=self.point_edit_topology_token(),
+            alias_groups=tuple(self.point_edit_aliases(key) for key in keys),
+            path_vertices=controls,
+        )
 
     def _apply_native_control_points(self, points) -> None:
         self.target.set_xy([[float(x), float(y)] for x, y in points])
@@ -3386,13 +3655,76 @@ class PolygonAdapter(PatchAdapter):
 
 
 class PathPatchAdapter(PatchAdapter):
+    @staticmethod
+    def _linear_point_topology(target: PathPatch):
+        path = target.get_path()
+        vertices = np.asarray(path.vertices, dtype=float)
+        if vertices.ndim != 2 or vertices.shape[1] < 2:
+            return None
+        codes = path.codes
+        if codes is None:
+            keys = list(range(len(vertices)))
+            aliases = {key: (key,) for key in keys}
+            return tuple(keys), aliases, None
+
+        codes = np.asarray(codes)
+        allowed = {Path.MOVETO, Path.LINETO, Path.CLOSEPOLY}
+        if any(int(code) not in allowed for code in codes):
+            return None
+        keys: list[int] = []
+        aliases: dict[int, tuple[int, ...]] = {}
+        subpath_start = None
+        subpath_keys: list[int] = []
+        for index, code_value in enumerate(codes):
+            code = int(code_value)
+            if code == Path.MOVETO:
+                subpath_start = index
+                subpath_keys = [index]
+                keys.append(index)
+                aliases[index] = (index,)
+            elif code == Path.LINETO:
+                if subpath_start is None:
+                    return None
+                subpath_keys.append(index)
+                keys.append(index)
+                aliases[index] = (index,)
+            else:
+                if subpath_start is None:
+                    return None
+                if (
+                    len(subpath_keys) > 1
+                    and np.all(
+                        np.isfinite(vertices[[subpath_start, subpath_keys[-1]], :2])
+                    )
+                    and np.array_equal(
+                        vertices[subpath_start, :2],
+                        vertices[subpath_keys[-1], :2],
+                    )
+                ):
+                    duplicate = subpath_keys[-1]
+                    keys.remove(duplicate)
+                    aliases.pop(duplicate)
+                    aliases[subpath_start] = (subpath_start, duplicate)
+                subpath_start = None
+                subpath_keys = []
+        return tuple(keys), aliases, tuple(int(code) for code in codes)
+
     @classmethod
     def capabilities_for(cls, target: PathPatch) -> ArtistCapabilities:
         if not len(cls.finite_points(target.get_path().vertices)):
             return ArtistCapabilities()
         capabilities = super().capabilities_for(target)
+        topology = cls._linear_point_topology(target)
+        handle_count = 0 if topology is None else len(topology[0])
         return replace(
             capabilities,
+            can_edit_points=bool(
+                0 < handle_count <= MAX_DIRECT_POINT_HANDLES
+                and cls.transform_is_invertible_affine(target.get_data_transform())
+                and target.get_agg_filter() is None
+                and not target.get_path_effects()
+                and target.get_sketch_params() is None
+            ),
             can_rigid_rotate=bool(
                 legend_owner_for_artist(target) is None
                 and active_layout_owner_for_artist(target) is None
@@ -3415,10 +3747,70 @@ class PathPatchAdapter(PatchAdapter):
         return bounds if np.all(np.isfinite(bounds)) else np.empty((0, 2), dtype=float)
 
     def native_control_points(self):
-        return [
-            np.asarray(point, dtype=float)
-            for point in self.target.get_path().vertices
-        ]
+        return self.point_array(self.target.get_path().vertices).copy()
+
+    def native_to_display(self, points) -> np.ndarray:
+        points = self.point_array(points)
+        return self.point_array(self.target.get_data_transform().transform(points))
+
+    def display_to_native(self, points) -> np.ndarray:
+        points = self.point_array(points)
+        inverse = self.target.get_data_transform().inverted()
+        return self.point_array(inverse.transform(points))
+
+    def control_points(self) -> np.ndarray:
+        preview = self._preview_points("_pylustrator_preview_positions")
+        if preview is not None:
+            return self.point_array(preview).copy()
+        return self.native_to_display(self.native_control_points())
+
+    def point_edit_topology_token(self):
+        topology = self._linear_point_topology(self.target)
+        if topology is None:
+            return ("pathpatch", "curved-or-invalid")
+        keys, aliases, codes = topology
+        return (
+            "pathpatch",
+            len(self.target.get_path().vertices),
+            keys,
+            tuple((key, aliases[key]) for key in keys),
+            codes,
+        )
+
+    def point_edit_aliases(self, key: int) -> tuple[int, ...]:
+        topology = self._linear_point_topology(self.target)
+        if topology is None:
+            raise UnsupportedArtistError(
+                "PathPatch point editing supports only linear path codes"
+            )
+        _keys, aliases, _codes = topology
+        try:
+            return aliases[int(key)]
+        except KeyError as error:
+            raise IndexError(
+                "PathPatch point key is outside its anchor inventory"
+            ) from error
+
+    def point_handle_model(self) -> PointHandleModel:
+        support = self.operation_support(TransformOperation.EDIT_POINTS)
+        if not support.supported:
+            raise UnsupportedArtistError(support.reason)
+        topology = self._linear_point_topology(self.target)
+        if topology is None:  # guarded by support; protects custom subclasses
+            raise UnsupportedArtistError(
+                "PathPatch point editing supports only MOVETO/LINETO/CLOSEPOLY"
+            )
+        keys, _aliases, codes = topology
+        controls = self.point_array(self.control_points())
+        return PointHandleModel(
+            target=self.target,
+            keys=keys,
+            display_positions=controls[np.asarray(keys, dtype=int)],
+            topology_token=self.point_edit_topology_token(),
+            alias_groups=tuple(self.point_edit_aliases(key) for key in keys),
+            path_vertices=controls,
+            path_codes=codes,
+        )
 
     def _apply_native_control_points(self, points) -> None:
         old_path = self.target.get_path()
@@ -3492,9 +3884,7 @@ class TextAdapter(ArtistAdapter):
             and not target.get_wrap()
             and not target.get_path_effects()
         )
-        return replace(
-            capabilities, can_rigid_rotate=can_rigid_rotate
-        )
+        return replace(capabilities, can_rigid_rotate=can_rigid_rotate)
 
     def native_rotation_handle_support(self) -> OperationSupport:
         operation = TransformOperation.ROTATE
@@ -3613,16 +4003,13 @@ class TextAdapter(ArtistAdapter):
                 constraints=("positive_uniform_factor",),
                 preview_strategy="redraw",
             )
-        if (
-            operation is TransformOperation.TRANSLATE
-            and (
-                getattr(
-                    self.target,
-                    "_pylustrator_formatter_owned_tick_label",
-                    False,
-                )
-                or axis_tick_label_reference(self.target) is not None
+        if operation is TransformOperation.TRANSLATE and (
+            getattr(
+                self.target,
+                "_pylustrator_formatter_owned_tick_label",
+                False,
             )
+            or axis_tick_label_reference(self.target) is not None
         ):
             return OperationSupport.denied(
                 operation,
@@ -3635,8 +4022,7 @@ class TextAdapter(ArtistAdapter):
                 legend_owner is not None
                 and self.target is legend_owner.get_title()
                 and (
-                    not self.target.get_visible()
-                    or not self.target.get_text().strip()
+                    not self.target.get_visible() or not self.target.get_text().strip()
                 )
             ):
                 return OperationSupport.denied(
@@ -3764,9 +4150,9 @@ class TextAdapter(ArtistAdapter):
                 self.target.update_bbox_position_size(self.renderer())
                 patch_bbox = bbox_patch.get_window_extent(self.renderer())
                 if edge_alpha > 0 and float(bbox_patch.get_linewidth()) > 0:
-                    padding = self.points_to_pixels(
-                        float(bbox_patch.get_linewidth())
-                    ) / 2
+                    padding = (
+                        self.points_to_pixels(float(bbox_patch.get_linewidth())) / 2
+                    )
                     patch_bbox = patch_bbox.padded(padding)
                 if bbox is None:
                     bbox = patch_bbox
@@ -3903,14 +4289,94 @@ class TextAdapter(ArtistAdapter):
         self.invalidate_geometry_cache()
 
 
+class _DisplayBboxContainsPatch(Rectangle):
+    """Minimal patchA contract for an isolated Annotation preview clone.
+
+    Matplotlib's automatically generated Annotation ``patchA`` is an
+    identity-transformed Rectangle whose only use while constructing a
+    FancyArrowPatch path is ``contains(event)``.  Keeping just that display
+    bbox predicate avoids repeatedly routing the Bezier clipper through the
+    substantially heavier generic Patch hit-test machinery.
+    """
+
+    __slots__ = ("_display_bounds",)
+
+    def __init__(self, bbox: Bbox):
+        bounds = np.asarray(bbox.extents, dtype=float)
+        self._display_bounds = tuple(float(value) for value in bounds)
+        super().__init__(
+            tuple(bounds[:2]),
+            bounds[2] - bounds[0],
+            bounds[3] - bounds[1],
+            transform=IdentityTransform(),
+            clip_on=False,
+        )
+
+    def set_display_bbox(self, bbox: Bbox) -> None:
+        x0, y0, x1, y1 = np.asarray(bbox.extents, dtype=float)
+        self._display_bounds = tuple(float(value) for value in (x0, y0, x1, y1))
+        self.set_bounds(x0, y0, x1 - x0, y1 - y0)
+
+    def contains(self, event, radius=None) -> tuple[bool, dict]:
+        if radius is not None:
+            return super().contains(event, radius=radius)
+        x0, y0, x1, y1 = self._display_bounds
+        inside_x = x0 <= event.x <= x1 or x0 >= event.x >= x1
+        inside_y = y0 <= event.y <= y1 or y0 >= event.y >= y1
+        return bool(inside_x and inside_y), {}
+
+
 class AnnotationAdapter(TextAdapter):
     def __init__(self, target: Annotation):
         ArtistAdapter.__init__(self, target)
+        self._point_preview_patch_a_proxy = None
+
+    @classmethod
+    def capabilities_for(cls, target: Annotation) -> ArtistCapabilities:
+        capabilities = TextAdapter.capabilities_for(target)
+        try:
+            adapter = cls(target)
+            points = adapter.point_array(adapter.control_points())
+            transforms_supported = bool(
+                len(points) == 2
+                and np.all(np.isfinite(points))
+                and cls.transform_is_invertible_affine(target.get_transform())
+                and cls.transform_is_invertible_affine(adapter._xy_transform())
+            )
+        except (
+            AttributeError,
+            TypeError,
+            ValueError,
+            RuntimeError,
+            np.linalg.LinAlgError,
+        ):
+            transforms_supported = False
+        arrow = target.arrow_patch
+        paint_supported = bool(
+            target.get_agg_filter() is None
+            and not target.get_path_effects()
+            and target.get_sketch_params() is None
+            and target.get_bbox_patch() is None
+            and (
+                arrow is None
+                or (
+                    arrow.get_agg_filter() is None
+                    and not arrow.get_path_effects()
+                    and arrow.get_sketch_params() is None
+                )
+            )
+        )
+        return replace(
+            capabilities,
+            can_edit_points=bool(transforms_supported and paint_supported),
+        )
 
     def _xy_transform(self):
         return self.target._get_xy_transform(self.renderer(), self.target.xycoords)
 
-    def operation_support(self, operation: TransformOperation | str) -> OperationSupport:
+    def operation_support(
+        self, operation: TransformOperation | str
+    ) -> OperationSupport:
         operation = TransformOperation.coerce(operation)
         if operation is TransformOperation.SCALE_APPEARANCE:
             return OperationSupport.denied(
@@ -3918,12 +4384,24 @@ class AnnotationAdapter(TextAdapter):
                 "Annotation appearance scaling must include its text and optional arrow",
             )
         support = super().operation_support(operation)
+        if support.supported and operation is TransformOperation.EDIT_POINTS:
+            return OperationSupport.allowed(
+                operation,
+                constraints=(
+                    "text_anchor_and_annotated_point",
+                    "mixed_coordinate_round_trip",
+                ),
+                preview_strategy="annotation_clone",
+            )
         if support.supported and operation is TransformOperation.TRANSLATE:
             clip = self.target.get_annotation_clip()
             if clip or (clip is None and self.target.xycoords == "data"):
                 return OperationSupport.allowed(
                     operation,
-                    constraints=(*support.constraints, "annotated_point_within_owning_axes"),
+                    constraints=(
+                        *support.constraints,
+                        "annotated_point_within_owning_axes",
+                    ),
                     preview_strategy=support.preview_strategy,
                 )
         return support
@@ -3953,11 +4431,76 @@ class AnnotationAdapter(TextAdapter):
         if arrow is not None:
             setattr(arrow, "_pylustrator_cached_get_extend", None)
 
+    def _install_isolated_auto_patch_a_proxy(self) -> None:
+        """Replace only Matplotlib's disposable automatic text Rectangle."""
+
+        if not bool(
+            getattr(self.target, "_pylustrator_isolated_annotation_clone", False)
+        ):
+            return
+        arrow = self.target.arrow_patch
+        arrowprops = self.target.arrowprops
+        if (
+            arrow is None
+            or arrowprops is None
+            or "patchA" in arrowprops
+            or self.target.get_bbox_patch() is not None
+            or self.target.get_text() == ""
+        ):
+            return
+        patch = getattr(arrow, "patchA", None)
+        if not isinstance(patch, Rectangle) or not isinstance(
+            patch.get_data_transform(), IdentityTransform
+        ):
+            return
+        bounds = np.asarray(patch.get_bbox().extents, dtype=float)
+        if bounds.shape != (4,) or not np.all(np.isfinite(bounds)):
+            return
+        bbox = Bbox.from_extents(*bounds)
+        proxy = self._point_preview_patch_a_proxy
+        if proxy is None:
+            proxy = _DisplayBboxContainsPatch(bbox)
+            self._point_preview_patch_a_proxy = proxy
+        else:
+            proxy.set_display_bbox(bbox)
+        arrow.set_patchA(proxy)
+
     def selection_points(self) -> np.ndarray:
         preview = self._preview_points("_pylustrator_preview_selection_points")
         if preview is not None:
             return preview
-        point_sets = [super().selection_points()]
+        if not bool(
+            getattr(self.target, "_pylustrator_isolated_annotation_clone", False)
+        ):
+            # Annotation.update_positions mutates the nested arrow patch and
+            # marks its live ownership chain stale.  Geometry queries must be
+            # observational, so perform that renderer update on the same
+            # bounded disposable clone used by point previews.
+            return self._point_edit_preview_adapter().selection_points()
+        point_sets = []
+        if self.target.get_bbox_patch() is not None:
+            # TextAdapter includes the bbox patch's face and edge stroke.  Keep
+            # that exact visual-envelope behavior for annotated text with a
+            # bbox, while retaining the cheaper Annotation path below for the
+            # overwhelmingly common bbox-free case.
+            fallback = super().selection_points()
+            if len(fallback):
+                point_sets.append(fallback)
+        else:
+            try:
+                renderer = self.renderer()
+                self.target.update_positions(renderer)
+                self._install_isolated_auto_patch_a_proxy()
+                text_bbox = Text.get_window_extent(self.target, renderer)
+                text_bounds = np.asarray(text_bbox.extents, dtype=float)
+                if text_bounds.shape == (4,) and np.all(np.isfinite(text_bounds)):
+                    point_sets.append(
+                        np.array([text_bounds[:2], text_bounds[2:]], dtype=float)
+                    )
+            except (AttributeError, TypeError, ValueError, RuntimeError):
+                fallback = super().selection_points()
+                if len(fallback):
+                    point_sets.append(fallback)
         arrow = self.target.arrow_patch
         if arrow is not None and arrow.get_visible():
             try:
@@ -3978,6 +4521,114 @@ class AnnotationAdapter(TextAdapter):
             np.asarray(self.target.xy, dtype=float),
         ]
 
+    @staticmethod
+    def _point_transform_token(transform) -> tuple:
+        try:
+            matrix = np.asarray(transform.get_affine().get_matrix(), dtype=float)
+            values = tuple(float(value) for value in matrix.ravel())
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            values = ()
+        return (
+            type(transform).__module__,
+            type(transform).__qualname__,
+            bool(getattr(transform, "is_affine", False)),
+            bool(getattr(transform, "has_inverse", True)),
+            values,
+        )
+
+    def point_edit_topology_token(self):
+        textcoords = getattr(self.target, "_textcoords", None)
+        return (
+            "annotation-anchors",
+            self._point_transform_token(self.target.get_transform()),
+            self._point_transform_token(self._xy_transform()),
+            type(self.target.xycoords).__module__,
+            type(self.target.xycoords).__qualname__,
+            type(textcoords).__module__,
+            type(textcoords).__qualname__,
+            self.target.arrow_patch is not None,
+        )
+
+    def point_handle_model(self) -> PointHandleModel:
+        support = self.operation_support(TransformOperation.EDIT_POINTS)
+        if not support.supported:
+            raise UnsupportedArtistError(support.reason)
+        controls = self.point_array(self.control_points())
+        if controls.shape != (2, 2) or not np.all(np.isfinite(controls)):
+            raise UnsupportedArtistError(
+                "Annotation anchors must have two finite display positions"
+            )
+        return PointHandleModel(
+            target=self.target,
+            keys=(0, 1),
+            display_positions=controls,
+            topology_token=self.point_edit_topology_token(),
+            path_vertices=controls,
+        )
+
+    def _point_edit_preview_adapter(self):
+        clone = copy(self.target)
+        clone.stale_callback = None
+        clone._remove_method = None
+        clone._pylustrator_isolated_annotation_clone = True
+        bbox_patch = self.target.get_bbox_patch()
+        if bbox_patch is not None:
+            clone._bbox_patch = copy(bbox_patch)
+            clone._bbox_patch.stale_callback = None
+            clone._bbox_patch._remove_method = None
+        if self.target.arrow_patch is not None:
+            clone.arrow_patch = copy(self.target.arrow_patch)
+            clone.arrow_patch.stale_callback = None
+            clone.arrow_patch._remove_method = None
+            positions = getattr(self.target.arrow_patch, "_posA_posB", None)
+            if positions is not None:
+                clone.arrow_patch._posA_posB = [
+                    np.asarray(position, dtype=float).copy()
+                    for position in positions
+                ]
+        for attribute in (
+            "_pylustrator_preview_positions",
+            "_pylustrator_preview_selection_points",
+            "_pylustrator_cached_get_extend",
+        ):
+            try:
+                delattr(clone, attribute)
+            except AttributeError:
+                pass
+        return type(self)(clone)
+
+    def point_edit_preview_context(
+        self,
+        *,
+        source_control_points,
+        source_selection_points,
+        handle_model: PointHandleModel,
+    ):
+        return self._point_edit_preview_adapter()
+
+    def preview_point_edit_selection_points(
+        self,
+        planned_control_points,
+        *,
+        source_control_points,
+        source_selection_points,
+        point_keys: Sequence[int] = (),
+        preview_context=None,
+    ) -> np.ndarray:
+        """Recompute Text and arrow paint on isolated shallow clones."""
+
+        planned = self.point_array(planned_control_points)
+        native = self.display_to_native(planned)
+        adapter = (
+            preview_context
+            if isinstance(preview_context, AnnotationAdapter)
+            else self._point_edit_preview_adapter()
+        )
+        with suspend_change_recording():
+            adapter._apply_native_control_points(native)
+        adapter.invalidate_geometry_cache()
+        return adapter.point_array(adapter.selection_points())
+
     def native_to_display(self, points):
         if len(points) == 0:
             return []
@@ -3985,7 +4636,9 @@ class AnnotationAdapter(TextAdapter):
             np.asarray(self.target.get_transform().transform(points[0]), dtype=float)
         ]
         if len(points) > 1:
-            result.append(np.asarray(self._xy_transform().transform(points[1]), dtype=float))
+            result.append(
+                np.asarray(self._xy_transform().transform(points[1]), dtype=float)
+            )
         return result
 
     def display_to_native(self, points):
@@ -3998,7 +4651,9 @@ class AnnotationAdapter(TextAdapter):
         ]
         if len(points) > 1:
             result.append(
-                np.asarray(self._xy_transform().inverted().transform(points[1]), dtype=float)
+                np.asarray(
+                    self._xy_transform().inverted().transform(points[1]), dtype=float
+                )
             )
         return result
 
@@ -4266,7 +4921,10 @@ class LegendAdapter(ArtistAdapter):
             + ")"
         )
         frame_record = ChangeRecord.command_change(self.target, frame_command)
-        if self.target.axes is not None and self.target.axes.get_legend() is self.target:
+        if (
+            self.target.axes is not None
+            and self.target.axes.get_legend() is self.target
+        ):
             frame_record = ChangeRecord.command_change(
                 self.target.axes,
                 ".get_legend()" + frame_command,
@@ -4401,12 +5059,8 @@ class LegendAdapter(ArtistAdapter):
         selected_artists: Iterable[Artist] = (),
         record_changes: bool = True,
     ) -> bool:
-        plan = self.plan_layout_reflow(
-            destination, selected_artists=selected_artists
-        )
-        return self.apply_layout_reflow_plan(
-            plan, record_changes=record_changes
-        )
+        plan = self.plan_layout_reflow(destination, selected_artists=selected_artists)
+        return self.apply_layout_reflow_plan(plan, record_changes=record_changes)
 
     def snapshot(self):
         bbox = self.target.get_bbox_to_anchor()
@@ -4447,7 +5101,9 @@ class EditorGroupAdapter(ArtistAdapter):
     def capabilities_for(cls, target: EditorGroup) -> ArtistCapabilities:
         if not target.members:
             return ArtistCapabilities()
-        capabilities = [get_artist_adapter(member).capabilities for member in target.members]
+        capabilities = [
+            get_artist_adapter(member).capabilities for member in target.members
+        ]
         return ArtistCapabilities(
             can_select=all(value.can_select for value in capabilities),
             can_translate=all(value.can_translate for value in capabilities),
@@ -4458,9 +5114,7 @@ class EditorGroupAdapter(ArtistAdapter):
             # Rotation of a group also changes member positions around one pivot;
             # native per-member rotation alone is not an equivalent operation.
             can_rotate=False,
-            can_rigid_rotate=all(
-                value.can_rigid_rotate for value in capabilities
-            ),
+            can_rigid_rotate=all(value.can_rigid_rotate for value in capabilities),
         )
 
     def operation_support(
@@ -4474,9 +5128,7 @@ class EditorGroupAdapter(ArtistAdapter):
             for adapter in self._member_adapters()
         ]
         failures = [
-            (target, support)
-            for target, support in supports
-            if not support.supported
+            (target, support) for target, support in supports if not support.supported
         ]
         if failures:
             reason = "; ".join(
@@ -4484,9 +5136,7 @@ class EditorGroupAdapter(ArtistAdapter):
                 for target, support in failures
             )
             return OperationSupport.denied(operation, reason)
-        return OperationSupport.allowed(
-            operation, preview_strategy="rigid_rotation"
-        )
+        return OperationSupport.allowed(operation, preview_strategy="rigid_rotation")
 
     def get_transform(self) -> Transform:
         return IdentityTransform()
@@ -4558,7 +5208,9 @@ class EditorGroupAdapter(ArtistAdapter):
                 )
             start += length
         if start != len(control_points):
-            raise ValueError("Editor-group control-point count changed during preflight")
+            raise ValueError(
+                "Editor-group control-point count changed during preflight"
+            )
         return self.bounds_points(planned)
 
     def preflight_rigid_visible_resize(self, matrix) -> np.ndarray:
@@ -4644,8 +5296,7 @@ class EditorGroupAdapter(ArtistAdapter):
         self.display_rotation_matrix(angle_degrees, pivot)
         adapters = self._member_adapters()
         member_plans = tuple(
-            adapter.plan_rigid_rotation(angle_degrees, pivot)
-            for adapter in adapters
+            adapter.plan_rigid_rotation(angle_degrees, pivot) for adapter in adapters
         )
         return self._compose_rigid_rotation_plan(
             angle_degrees, pivot, adapters, member_plans
@@ -4659,9 +5310,7 @@ class EditorGroupAdapter(ArtistAdapter):
         control = np.concatenate(
             [plan.control_array() for plan in member_plans], axis=0
         )
-        native = np.concatenate(
-            [plan.native_array() for plan in member_plans], axis=0
-        )
+        native = np.concatenate([plan.native_array() for plan in member_plans], axis=0)
         visible = [
             plan.selection_array()
             for adapter, plan in zip(adapters, member_plans)
@@ -4790,7 +5439,9 @@ class EditorGroupAdapter(ArtistAdapter):
                 adapter.apply_control_points(points[start : start + length])
                 start += length
         if start != len(points):
-            raise ValueError("Editor-group control-point count changed during transform")
+            raise ValueError(
+                "Editor-group control-point count changed during transform"
+            )
 
     def serialize_changes(self):
         records = []
@@ -4809,8 +5460,13 @@ class EditorGroupAdapter(ArtistAdapter):
         }
 
     def restore(self, state) -> None:
-        if state.get("type") != "editor_group" or state.get("id") != self.target.group_id:
-            raise ValueError(f"Snapshot does not belong to group {self.target.group_id!r}")
+        if (
+            state.get("type") != "editor_group"
+            or state.get("id") != self.target.group_id
+        ):
+            raise ValueError(
+                f"Snapshot does not belong to group {self.target.group_id!r}"
+            )
         for member, member_state in state["members"]:
             get_artist_adapter(member).restore(member_state)
         self.invalidate_geometry_cache()
@@ -4822,6 +5478,7 @@ class EditorGroupAdapter(ArtistAdapter):
 
 
 class Line2DAdapter(ArtistAdapter):
+    point_replay_command = "._pylustrator_set_line_endpoints"
     unsupported_operation_reasons = {
         TransformOperation.RESIZE_GEOMETRY: (
             "Line geometry resize requires an affine coordinate preflight"
@@ -4890,10 +5547,7 @@ class Line2DAdapter(ArtistAdapter):
                 f"{type(raw).__name__} storage"
             )
         if data.ndim not in (1, 2):
-            return (
-                f"Line2D raw {axis_name} coordinates must be one- or "
-                "two-dimensional"
-            )
+            return f"Line2D raw {axis_name} coordinates must be one- or two-dimensional"
         kind = data.dtype.kind
         if kind in "fiu":
             return None
@@ -4946,6 +5600,15 @@ class Line2DAdapter(ArtistAdapter):
         return replace(
             cls.default_capabilities,
             can_rigid_rotate=can_rigid_rotate,
+            can_edit_points=bool(
+                raw_reason is None
+                and cls.transform_is_invertible_affine(target.get_transform())
+                and target.get_drawstyle() == "default"
+                and (
+                    adapter._endpoint_line_paint_is_visible()
+                    or adapter._marker_paint_is_visible(resolve_positions=False)
+                )
+            ),
         )
 
     @classmethod
@@ -4963,8 +5626,7 @@ class Line2DAdapter(ArtistAdapter):
                 data = np.asarray(raw)
             except (TypeError, ValueError) as error:
                 raise UnsupportedArtistError(
-                    f"Line2D raw {axis_name} coordinates cannot be flattened "
-                    "losslessly"
+                    f"Line2D raw {axis_name} coordinates cannot be flattened losslessly"
                 ) from error
             fixed_dtype = type(raw) is np.ndarray
         if data.ndim not in (1, 2) or data.size not in (1, processed_length):
@@ -5063,8 +5725,7 @@ class Line2DAdapter(ArtistAdapter):
             else:
                 integers = np.asarray(spec.data).reshape(-1)
                 exactly_float64 = all(
-                    np.isfinite(float(value))
-                    and int(float(value)) == int(value)
+                    np.isfinite(float(value)) and int(float(value)) == int(value)
                     for value in integers
                 )
                 if np.ma.isMaskedArray(raw):
@@ -5114,9 +5775,7 @@ class Line2DAdapter(ArtistAdapter):
         nested = result.reshape(spec.shape).tolist()
         return cls._sequence_with_values(raw, nested)
 
-    def _prepare_raw_write(
-        self, points, *, materialize: bool
-    ) -> _Line2DRawWrite:
+    def _prepare_raw_write(self, points, *, materialize: bool) -> _Line2DRawWrite:
         processed = np.asarray(self.target.get_xydata(), dtype=float)
         destination = np.asarray(points, dtype=float)
         if (
@@ -5128,12 +5787,8 @@ class Line2DAdapter(ArtistAdapter):
                 "Line2D destination must match its processed Nx2 geometry"
             )
         length = len(processed)
-        xspec = self._raw_axis_spec(
-            self.target.get_xdata(orig=True), "x", length
-        )
-        yspec = self._raw_axis_spec(
-            self.target.get_ydata(orig=True), "y", length
-        )
+        xspec = self._raw_axis_spec(self.target.get_xdata(orig=True), "x", length)
+        yspec = self._raw_axis_spec(self.target.get_ydata(orig=True), "y", length)
         eligible = np.all(np.isfinite(processed), axis=1)
         if not np.any(eligible):
             raise UnsupportedArtistError(
@@ -5147,9 +5802,7 @@ class Line2DAdapter(ArtistAdapter):
             )
 
         encoded_axes = []
-        for axis, (axis_name, spec) in enumerate(
-            (("x", xspec), ("y", yspec))
-        ):
+        for axis, (axis_name, spec) in enumerate((("x", xspec), ("y", yspec))):
             encoded = self._cast_axis_destination(
                 spec, desired_visible[:, axis], axis_name
             )
@@ -5178,8 +5831,7 @@ class Line2DAdapter(ArtistAdapter):
             )
 
         exact_storage = bool(
-            stores_float64_exactly(xspec)
-            and stores_float64_exactly(yspec)
+            stores_float64_exactly(xspec) and stores_float64_exactly(yspec)
         )
         exact_destination = bool(
             exact_storage
@@ -5201,9 +5853,7 @@ class Line2DAdapter(ArtistAdapter):
                         dtype=float,
                     )
                     actual_display = np.asarray(
-                        self.target.get_transform().transform(
-                            representable[eligible]
-                        ),
+                        self.target.get_transform().transform(representable[eligible]),
                         dtype=float,
                     )
                 except (
@@ -5214,8 +5864,7 @@ class Line2DAdapter(ArtistAdapter):
                     np.linalg.LinAlgError,
                 ) as error:
                     raise UnsupportedArtistError(
-                        "Line2D encoded coordinates cannot be checked in display "
-                        "space"
+                        "Line2D encoded coordinates cannot be checked in display space"
                     ) from error
                 if (
                     desired_display.shape != actual_display.shape
@@ -5257,30 +5906,60 @@ class Line2DAdapter(ArtistAdapter):
             ),
         )
 
-    def _line_stroke_is_configured(self) -> bool:
+    def _line_style_is_visible(self) -> bool:
         linestyle = self.target.get_linestyle()
         if linestyle in (None, "", " ", "none", "None"):
             return False
         colors = []
         try:
             colors.append(
-                mpl.colors.to_rgba(
-                    self.target.get_color(), self.target.get_alpha()
-                )
+                mpl.colors.to_rgba(self.target.get_color(), self.target.get_alpha())
             )
         except (TypeError, ValueError):
             pass
         gap_color = getattr(self.target, "get_gapcolor", lambda: None)()
         if self.target.is_dashed() and gap_color is not None:
             try:
-                colors.append(
-                    mpl.colors.to_rgba(gap_color, self.target.get_alpha())
-                )
+                colors.append(mpl.colors.to_rgba(gap_color, self.target.get_alpha()))
             except (TypeError, ValueError):
                 pass
-        if not self.colors_are_visible(colors):
+        return self.colors_are_visible(colors)
+
+    def _line_stroke_is_configured(self) -> bool:
+        if not self._line_style_is_visible():
             return False
-        return self.path_has_drawable_segment(self.target.get_path())
+        points = np.asarray(self.target.get_xydata(), dtype=float)
+        if len(points) < 2:
+            return False
+        finite = np.all(np.isfinite(points[:, :2]), axis=1)
+        return bool(
+            np.any(
+                finite[:-1]
+                & finite[1:]
+                & np.any(points[1:, :2] != points[:-1, :2], axis=1)
+            )
+        )
+
+    def _endpoint_line_paint_is_visible(self) -> bool:
+        """Check only the bounded set of segments affected by endpoint edits."""
+
+        if not self._line_style_is_visible():
+            return False
+        try:
+            linewidth = float(self.target.get_linewidth())
+        except (TypeError, ValueError):
+            return False
+        if not np.isfinite(linewidth) or linewidth <= 0.0:
+            return False
+        points = np.asarray(self.target.get_xydata(), dtype=float)
+        for key in self._endpoint_keys():
+            for neighbour in (key - 1, key + 1):
+                if neighbour < 0 or neighbour >= len(points):
+                    continue
+                segment = points[[key, neighbour], :2]
+                if np.all(np.isfinite(segment)) and np.any(segment[0] != segment[1]):
+                    return True
+        return False
 
     def _line_paint_is_visible(self) -> bool:
         if not self._line_stroke_is_configured():
@@ -5292,7 +5971,7 @@ class Line2DAdapter(ArtistAdapter):
         return bool(np.isfinite(linewidth) and linewidth > 0.0)
 
     def _line_rigid_rotation_supported(self, *, strict: bool = False) -> bool:
-        if not self._line_stroke_is_configured():
+        if not self._line_style_is_visible():
             return True
         try:
             linewidth = float(self.target.get_linewidth())
@@ -5453,9 +6132,7 @@ class Line2DAdapter(ArtistAdapter):
             ):
                 return (
                     len(
-                        range(length)[
-                            slice(int(markevery[0]), None, int(markevery[1]))
-                        ]
+                        range(length)[slice(int(markevery[0]), None, int(markevery[1]))]
                     )
                     == 0
                 )
@@ -5483,11 +6160,7 @@ class Line2DAdapter(ArtistAdapter):
     ) -> bool:
         marker = self.target._marker
         dimensions = self._finite_marker_dimensions()
-        if (
-            not marker
-            or dimensions is None
-            or dimensions[0] <= 0.0
-        ):
+        if not marker or dimensions is None or dimensions[0] <= 0.0:
             return False
         if not self._markevery_schema_is_valid():
             if strict:
@@ -5497,9 +6170,7 @@ class Line2DAdapter(ArtistAdapter):
             return False
         if self._markevery_is_definitely_empty():
             return False
-        if resolve_positions and not len(
-            self._marker_display_positions(strict=strict)
-        ):
+        if resolve_positions and not len(self._marker_display_positions(strict=strict)):
             return False
         return bool(self._marker_painted_paths())
 
@@ -5548,16 +6219,12 @@ class Line2DAdapter(ArtistAdapter):
             marker_scale_pixels = self.points_to_pixels(
                 float(self.target.get_markersize())
             )
-            singular_values = np.linalg.svd(
-                matrix[:2, :2], compute_uv=False
-            )
+            singular_values = np.linalg.svd(matrix[:2, :2], compute_uv=False)
             rendered_anisotropy = marker_scale_pixels * abs(
                 float(singular_values[0] - singular_values[1])
             )
             rendered_offset_sweep = (
-                2.0
-                * marker_scale_pixels
-                * float(np.linalg.norm(matrix[:2, 2]))
+                2.0 * marker_scale_pixels * float(np.linalg.norm(matrix[:2, 2]))
             )
         except (
             AttributeError,
@@ -5597,9 +6264,7 @@ class Line2DAdapter(ArtistAdapter):
         )
         if supported and resolve_positions:
             marker_bounds = self._marker_selection_points(strict=strict)
-            supported = bool(
-                len(marker_bounds) and np.all(np.isfinite(marker_bounds))
-            )
+            supported = bool(len(marker_bounds) and np.all(np.isfinite(marker_bounds)))
         return supported
 
     def _marker_is_pixel(self) -> bool:
@@ -5617,6 +6282,76 @@ class Line2DAdapter(ArtistAdapter):
             raw_reason = self._raw_metadata_reason(self.target)
             if raw_reason is not None:
                 return OperationSupport.denied(operation, raw_reason)
+        if operation is TransformOperation.EDIT_POINTS:
+            replay_conflict = line_endpoint_replay_conflict(self.target)
+            if replay_conflict is not None:
+                return OperationSupport.denied(operation, str(replay_conflict))
+            raw_reason = self._raw_metadata_reason(self.target)
+            if raw_reason is not None:
+                return OperationSupport.denied(operation, raw_reason)
+            legend_owner = legend_owner_for_artist(self.target)
+            if legend_owner is not None:
+                return OperationSupport.denied(
+                    operation,
+                    "Legend-managed Line2D endpoints are owned by Legend layout",
+                )
+            container_owner = container_owner_for_artist(self.target)
+            if container_owner is not None:
+                return OperationSupport.denied(
+                    operation,
+                    f"Line2D is owned by {type(container_owner).__name__} and "
+                    "cannot edit endpoints independently",
+                )
+            layout_owner = active_layout_owner_for_artist(self.target)
+            if layout_owner is not None:
+                return OperationSupport.denied(
+                    operation,
+                    f"Line2D participates in active {type(layout_owner).__name__} layout",
+                )
+            if not self.transform_is_invertible_affine(self.target.get_transform()):
+                return OperationSupport.denied(
+                    operation,
+                    "Line2D endpoint editing requires an invertible affine transform",
+                )
+            if self.target.get_drawstyle() != "default":
+                return OperationSupport.denied(
+                    operation,
+                    "Line2D endpoint editing does not yet preserve stepped drawstyles",
+                )
+            if (
+                self.target.get_agg_filter() is not None
+                or self.target.get_path_effects()
+                or self.target.get_sketch_params() is not None
+            ):
+                return OperationSupport.denied(
+                    operation,
+                    "Line2D endpoint editing does not support filters, path effects, or sketch effects",
+                )
+            if self._float_markevery_parameters(
+                self.target.get_markevery()
+            ) is not None and self._marker_paint_is_visible(resolve_positions=False):
+                return OperationSupport.denied(
+                    operation,
+                    "Line2D float markevery can change its marker inventory when an endpoint moves",
+                )
+            if not self._endpoint_keys():
+                return OperationSupport.denied(
+                    operation,
+                    "Line2D has no jointly finite endpoint",
+                )
+            if not (
+                self._endpoint_line_paint_is_visible()
+                or self._marker_paint_is_visible(resolve_positions=False)
+            ):
+                return OperationSupport.denied(
+                    operation,
+                    "Line2D has no visible stroke or marker paint for endpoint editing",
+                )
+            return OperationSupport.allowed(
+                operation,
+                constraints=("endpoints_only", "stable_raw_storage"),
+                preview_strategy="point_controls",
+            )
         if operation is not TransformOperation.SCALE_APPEARANCE:
             return super().operation_support(operation)
         if not self.capabilities.can_select or not self.capabilities.can_serialize:
@@ -5803,10 +6538,7 @@ class Line2DAdapter(ArtistAdapter):
         # huge-coordinate inputs may conservatively reject instead of risking
         # a preview/commit mismatch.
         ambiguity_tolerance = (
-            16.0
-            * np.finfo(float).eps
-            * max(1, len(vertices))
-            * coordinate_scale
+            16.0 * np.finfo(float).eps * max(1, len(vertices)) * coordinate_scale
         )
         if (
             not np.all(np.isfinite(cumulative))
@@ -5840,9 +6572,7 @@ class Line2DAdapter(ArtistAdapter):
             nearest = np.where(left_error <= right_error, left, right)
             # Zero-length segments have duplicate cumulative distances.
             # Argmin returns the first such vertex, so canonicalize likewise.
-            nearest = np.searchsorted(
-                cumulative, cumulative[nearest], side="left"
-            )
+            nearest = np.searchsorted(cumulative, cumulative[nearest], side="left")
             return nearest, left, right, left_error, right_error
 
         (
@@ -5888,9 +6618,10 @@ class Line2DAdapter(ArtistAdapter):
         # nearest-vertex midpoint is ambiguous.
         if len(marker_distances):
             last_distance = marker_distances[-1]
-            if (
-                abs(cumulative[-1] - last_distance) <= ambiguity_tolerance
-                and marker_is_materially_new(indices[-1], indices[:-1])
+            if abs(
+                cumulative[-1] - last_distance
+            ) <= ambiguity_tolerance and marker_is_materially_new(
+                indices[-1], indices[:-1]
             ):
                 raise UnsupportedArtistError(
                     "Line2D markevery may select different marker vertices "
@@ -6001,9 +6732,7 @@ class Line2DAdapter(ArtistAdapter):
             if not is_pixel:
                 transform.scale(rendered_markersize)
             relative.append(
-                np.asarray(
-                    path.get_extents(transform).get_points(), dtype=float
-                )
+                np.asarray(path.get_extents(transform).get_points(), dtype=float)
             )
         relative = self.bounds_points(np.concatenate(relative))
         if not len(relative):
@@ -6037,7 +6766,7 @@ class Line2DAdapter(ArtistAdapter):
         except (TypeError, ValueError):
             linewidth = float("nan")
         if (
-            self._line_stroke_is_configured()
+            self._line_style_is_visible()
             and np.isfinite(linewidth)
             and linewidth > 0.0
         ):
@@ -6051,12 +6780,16 @@ class Line2DAdapter(ArtistAdapter):
                 )
                 used[:-1] |= drawable
                 used[1:] |= drawable
-            line = self.bounds_points(
-                display_points[used],
-                padding=self.points_to_pixels(linewidth) / 2,
-            )
-            if len(line):
-                return line
+            if np.any(used):
+                points = display_points if np.all(used) else display_points[used]
+                padding = self.points_to_pixels(linewidth) / 2
+                return np.array(
+                    [
+                        np.min(points, axis=0) - padding,
+                        np.max(points, axis=0) + padding,
+                    ],
+                    dtype=float,
+                )
         return np.empty((0, 2), dtype=float)
 
     def selection_points(self) -> np.ndarray:
@@ -6073,6 +6806,8 @@ class Line2DAdapter(ArtistAdapter):
         markers = self._marker_selection_points(display_points)
         if len(markers):
             visible_groups.append(markers)
+        if len(visible_groups) == 1:
+            return visible_groups[0]
         if visible_groups:
             return self.bounds_points(np.concatenate(visible_groups))
         return super().selection_points()
@@ -6108,24 +6843,17 @@ class Line2DAdapter(ArtistAdapter):
         """Recompute Line2D paint from the exact destination marker subset."""
 
         destination_markers = np.empty((0, 2), dtype=float)
-        if self._marker_paint_is_visible(
-            strict=True, resolve_positions=False
-        ):
-            source_markers = self._marker_display_positions(
-                control_points, strict=True
-            )
+        if self._marker_paint_is_visible(strict=True, resolve_positions=False):
+            source_markers = self._marker_display_positions(control_points, strict=True)
             destination_markers = self._marker_display_positions(
                 planned_control_points, strict=True
             )
             expected_markers = self._transform_points(matrix, source_markers)
-            if (
-                destination_markers.shape != expected_markers.shape
-                or not np.allclose(
-                    destination_markers,
-                    expected_markers,
-                    atol=0.25,
-                    rtol=0.0,
-                )
+            if destination_markers.shape != expected_markers.shape or not np.allclose(
+                destination_markers,
+                expected_markers,
+                atol=0.25,
+                rtol=0.0,
             ):
                 raise UnsupportedArtistError(
                     "Line2D markevery would select different marker vertices "
@@ -6148,6 +6876,228 @@ class Line2DAdapter(ArtistAdapter):
 
     def native_control_points(self) -> np.ndarray:
         return self.point_array(self.target.get_xydata()).copy()
+
+    def _endpoint_keys(self) -> tuple[int, ...]:
+        points = np.asarray(self.target.get_xydata(), dtype=float)
+        if not len(points):
+            return ()
+        first = None
+        for index in range(len(points)):
+            if np.all(np.isfinite(points[index, :2])):
+                first = index
+                break
+        if first is None:
+            return ()
+        last = first
+        for index in range(len(points) - 1, first, -1):
+            if np.all(np.isfinite(points[index, :2])):
+                last = index
+                break
+        return (first,) if first == last else (first, last)
+
+    def point_edit_topology_token(self):
+        points = np.asarray(self.target.get_xydata(), dtype=float)
+        return (
+            "line2d-endpoints",
+            tuple(int(value) for value in points.shape),
+            self._endpoint_keys(),
+            self._raw_snapshot_metadata(self.target.get_xdata(orig=True)),
+            self._raw_snapshot_metadata(self.target.get_ydata(orig=True)),
+        )
+
+    def point_handle_model(self) -> PointHandleModel:
+        support = self.operation_support(TransformOperation.EDIT_POINTS)
+        if not support.supported:
+            raise UnsupportedArtistError(support.reason)
+        keys = self._endpoint_keys()
+        if not keys:
+            raise UnsupportedArtistError(
+                "Line2D has no finite endpoint that can be edited"
+            )
+        native = np.asarray(self.target.get_xydata(), dtype=float)[
+            np.asarray(keys, dtype=int)
+        ]
+        try:
+            display = self.point_array(self.target.get_transform().transform(native))
+        except (
+            AttributeError,
+            TypeError,
+            ValueError,
+            RuntimeError,
+            np.linalg.LinAlgError,
+        ) as error:
+            raise UnsupportedArtistError(
+                "Line2D endpoints cannot be transformed to display coordinates"
+            ) from error
+        if len(display) != len(keys) or not np.all(np.isfinite(display)):
+            raise UnsupportedArtistError(
+                "Line2D endpoints have no finite display positions"
+            )
+        return PointHandleModel(
+            self.target,
+            keys,
+            display,
+            self.point_edit_topology_token(),
+        )
+
+    def preview_point_edit_control_points(
+        self,
+        requested_display_points,
+        *,
+        point_keys: Sequence[int],
+    ) -> np.ndarray:
+        """Validate only edited endpoints on warm motion.
+
+        Full raw-array canonicalization remains a release-time prepare step.
+        This keeps a 100k-point endpoint preview to one bounded ndarray copy
+        plus vectorized paint bounds, without weakening the final stale/raw
+        storage checks.
+        """
+
+        requested = np.asarray(requested_display_points, dtype=float)
+        processed = np.asarray(self.target.get_xydata(), dtype=float)
+        if requested.shape != processed.shape:
+            raise UnsupportedArtistError(
+                "Line2D point preview must preserve its processed Nx2 shape"
+            )
+        keys = tuple(int(key) for key in point_keys)
+        if any(
+            key < 0 or key >= len(processed) or not np.all(np.isfinite(processed[key]))
+            for key in keys
+        ):
+            raise UnsupportedArtistError(
+                "Line2D Direct Selection currently exposes endpoints only"
+            )
+        try:
+            inverse = self.target.get_transform().inverted()
+            native_destinations = self.point_array(
+                inverse.transform(requested[np.asarray(keys, dtype=int)])
+            )
+        except (
+            AttributeError,
+            TypeError,
+            ValueError,
+            RuntimeError,
+            np.linalg.LinAlgError,
+        ) as error:
+            raise UnsupportedArtistError(
+                "Line2D endpoint destination cannot be converted to native coordinates"
+            ) from error
+        if len(native_destinations) != len(keys) or not np.all(
+            np.isfinite(native_destinations)
+        ):
+            raise UnsupportedArtistError(
+                "Line2D endpoint destination must remain finite"
+            )
+
+        length = len(processed)
+        specs = (
+            self._raw_axis_spec(self.target.get_xdata(orig=True), "x", length),
+            self._raw_axis_spec(self.target.get_ydata(orig=True), "y", length),
+        )
+        for axis, (axis_name, spec) in enumerate(zip(("x", "y"), specs)):
+            values = native_destinations[:, axis]
+            self._cast_axis_destination(spec, values, axis_name)
+            if spec.size == 1 and length > 1:
+                source = float(np.asarray(spec.data).reshape(-1)[0])
+                if np.any(values != source):
+                    raise UnsupportedArtistError(
+                        f"Line2D length-one {axis_name} broadcast storage cannot "
+                        "represent one independently moved endpoint"
+                    )
+        return requested
+
+    def point_edit_preview_context(
+        self,
+        *,
+        source_control_points,
+        source_selection_points,
+        handle_model: PointHandleModel,
+    ):
+        controls = self.point_array(source_control_points)
+        if self._marker_paint_is_visible(resolve_positions=False):
+            return ("full",)
+        try:
+            linewidth = float(self.target.get_linewidth())
+        except (TypeError, ValueError):
+            linewidth = float("nan")
+        if (
+            not self._line_style_is_visible()
+            or not np.isfinite(linewidth)
+            or linewidth <= 0.0
+        ):
+            return ("full",)
+
+        finite = np.all(np.isfinite(controls), axis=1)
+        drawable = np.zeros(max(len(controls) - 1, 0), dtype=bool)
+        if len(controls) >= 2:
+            drawable = (
+                finite[:-1] & finite[1:] & np.any(controls[1:] != controls[:-1], axis=1)
+            )
+        editable = np.zeros(len(controls), dtype=bool)
+        editable[np.asarray(handle_model.keys, dtype=int)] = True
+        unaffected = drawable & ~editable[:-1] & ~editable[1:]
+        used = np.zeros(len(controls), dtype=bool)
+        used[:-1] |= unaffected
+        used[1:] |= unaffected
+        core = self.bounds_points(controls[used])
+        padding = self.points_to_pixels(linewidth) / 2
+        return (
+            "line-endpoints",
+            tuple(tuple(float(value) for value in row) for row in core),
+            float(padding),
+            tuple(int(key) for key in handle_model.keys),
+        )
+
+    def preview_point_edit_selection_points(
+        self,
+        planned_control_points,
+        *,
+        source_control_points,
+        source_selection_points,
+        point_keys: Sequence[int] = (),
+        preview_context=None,
+    ) -> np.ndarray:
+        planned = np.asarray(planned_control_points, dtype=float)
+        if preview_context and preview_context[0] == "line-endpoints":
+            _kind, core_tuple, padding, endpoint_keys = preview_context
+            groups = []
+            core = np.asarray(core_tuple, dtype=float)
+            if core.shape == (2, 2):
+                groups.append(core)
+            # The compact core excludes every editable endpoint segment so a
+            # moved endpoint can also shrink the selection bounds.  Add those
+            # segments back for *all* endpoints: ``planned`` already contains
+            # the unchanged source position for endpoints outside this drag.
+            for key in endpoint_keys:
+                key = int(key)
+                for neighbour in (key - 1, key + 1):
+                    if neighbour < 0 or neighbour >= len(planned):
+                        continue
+                    segment = planned[[key, neighbour]]
+                    if np.all(np.isfinite(segment)) and np.any(
+                        segment[0] != segment[1]
+                    ):
+                        groups.append(segment)
+            if not groups:
+                return np.empty((0, 2), dtype=float)
+            return self.clip_selection_points(
+                self.bounds_points(np.concatenate(groups), padding=padding)
+            )
+        visible_groups = []
+        line = self._line_selection_points(planned)
+        if len(line):
+            visible_groups.append(line)
+        markers = self._marker_selection_points(planned)
+        if len(markers):
+            visible_groups.append(markers)
+        if not visible_groups:
+            return np.empty((0, 2), dtype=float)
+        if len(visible_groups) == 1:
+            return self.clip_selection_points(visible_groups[0])
+        return self.clip_selection_points(
+            self.bounds_points(np.concatenate(visible_groups))
+        )
 
     def control_points(self) -> np.ndarray:
         preview = self._preview_points("_pylustrator_preview_positions")
@@ -6206,9 +7156,7 @@ class Line2DAdapter(ArtistAdapter):
             else:
                 hasher.update(b"mask")
                 cls._update_fingerprint_array(hasher, raw.mask)
-            fill = repr(raw.fill_value).encode(
-                "utf-8", errors="backslashreplace"
-            )
+            fill = repr(raw.fill_value).encode("utf-8", errors="backslashreplace")
             hasher.update(len(fill).to_bytes(8, "little"))
             hasher.update(fill)
             hasher.update(b"hard" if raw.hardmask else b"soft")
@@ -6267,9 +7215,7 @@ class Line2DAdapter(ArtistAdapter):
             bool(getattr(transform, "has_inverse", True)),
         )
         hasher.update(repr(transform_token).encode("utf-8"))
-        self._update_fingerprint_array(
-            hasher, transform.get_affine().get_matrix()
-        )
+        self._update_fingerprint_array(hasher, transform.get_affine().get_matrix())
 
         axes = self.target.axes
         if axes is None:
@@ -6282,9 +7228,7 @@ class Line2DAdapter(ArtistAdapter):
         figure = self.figure
         self._update_fingerprint_array(
             hasher,
-            np.asarray(
-                (float(figure.dpi), self.points_to_pixels(1.0)), dtype=float
-            ),
+            np.asarray((float(figure.dpi), self.points_to_pixels(1.0)), dtype=float),
         )
 
     def rigid_rotation_source_fingerprint(self):
@@ -6296,9 +7240,7 @@ class Line2DAdapter(ArtistAdapter):
         hasher = hashlib.sha256()
         self._update_raw_fingerprint(hasher, xdata, "x")
         self._update_raw_fingerprint(hasher, ydata, "y")
-        self._update_markevery_fingerprint(
-            hasher, self.target.get_markevery()
-        )
+        self._update_markevery_fingerprint(hasher, self.target.get_markevery())
         self._update_line_context_fingerprint(hasher)
         return id(xdata), id(ydata), hasher.digest()[:16]
 
@@ -6327,9 +7269,7 @@ class Line2DAdapter(ArtistAdapter):
             "_subslice",
             "_x_filled",
         )
-        cache = {
-            name: getattr(self.target, name, missing) for name in cache_names
-        }
+        cache = {name: getattr(self.target, name, missing) for name in cache_names}
         stale_owners = []
         for owner in (self.target, self.target.axes, self.figure):
             if owner is not None and all(owner is not item[0] for item in stale_owners):
@@ -6375,6 +7315,71 @@ class Line2DAdapter(ArtistAdapter):
         prepared = self._prepare_raw_write(points, materialize=True)
         self._atomic_set_raw_data(prepared.xdata, prepared.ydata)
 
+    def _discard_point_replay_change(self) -> None:
+        if not _CHANGE_RECORDING_ENABLED.get():
+            return
+        try:
+            tracker = self.change_tracker()
+        except AttributeError:
+            return
+        changes = getattr(tracker, "changes", None)
+        if isinstance(changes, dict):
+            changes.pop((self.target, self.point_replay_command), None)
+
+    def record_changes(self) -> None:
+        """A full data command supersedes any earlier endpoint delta."""
+
+        if not _CHANGE_RECORDING_ENABLED.get():
+            return
+        self._discard_point_replay_change()
+        super().record_changes()
+
+    def _record_restored_state(self, *, include_rotation: bool = False) -> None:
+        self._discard_point_replay_change()
+        super()._record_restored_state(include_rotation=include_rotation)
+
+    def apply_native_point_edit(self, points) -> None:
+        replay_conflict = line_endpoint_replay_conflict(self.target)
+        if replay_conflict is not None:
+            raise replay_conflict
+        support = self.operation_support(TransformOperation.EDIT_POINTS)
+        if not support.supported:
+            raise UnsupportedArtistError(support.reason)
+        prepared = self._prepare_raw_write(points, materialize=True)
+        ensure_line_endpoint_replay_api(self.target)
+        self._atomic_set_raw_data(prepared.xdata, prepared.ydata)
+        keys = self._endpoint_keys()
+        native = np.asarray(self.target.get_xydata(), dtype=float)
+        values = tuple(
+            tuple(float(value) for value in native[key, :2]) for key in keys
+        )
+        command = (
+            f"{self.point_replay_command}({replay_literal(keys)}, "
+            f"{replay_literal(values)})"
+        )
+        self._record_change_records(
+            (ChangeRecord.command_change(self.target, command),)
+        )
+        self.invalidate_geometry_cache()
+
+    def apply_replayed_endpoints(self, keys, values) -> None:
+        """Replay a compact endpoint delta on top of the source/full command."""
+
+        keys = tuple(int(key) for key in keys)
+        expected = self._endpoint_keys()
+        if keys != expected:
+            raise ValueError(
+                "Line2D endpoint replay topology no longer matches its source"
+            )
+        values = np.asarray(values, dtype=float)
+        if values.shape != (len(keys), 2) or not np.all(np.isfinite(values)):
+            raise ValueError("Line2D endpoint replay values must be finite N-by-2")
+        native = np.asarray(self.target.get_xydata(), dtype=float).copy()
+        native[np.asarray(keys, dtype=int)] = values
+        prepared = self._prepare_raw_write(native, materialize=True)
+        self._atomic_set_raw_data(prepared.xdata, prepared.ydata)
+        self.invalidate_geometry_cache()
+
     def apply_native_control_points(self, points) -> None:
         support = self.operation_support(TransformOperation.TRANSLATE)
         if not support.supported:
@@ -6382,6 +7387,143 @@ class Line2DAdapter(ArtistAdapter):
         prepared = self._prepare_raw_write(points, materialize=True)
         self._atomic_set_raw_data(prepared.xdata, prepared.ydata)
         self.record_changes()
+        self.invalidate_geometry_cache()
+
+    @classmethod
+    def _capture_point_history_axis(
+        cls,
+        raw,
+        *,
+        axis_name: str,
+        processed_length: int,
+        keys: tuple[int, ...],
+    ) -> _Line2DPointAxisHistory:
+        spec = cls._raw_axis_spec(raw, axis_name, processed_length)
+        indices = (0,) if spec.size == 1 else tuple(sorted(set(keys)))
+        values = tuple(
+            deepcopy(np.asarray(spec.data).reshape(-1)[index]) for index in indices
+        )
+        if np.ma.isMaskedArray(raw):
+            return _Line2DPointAxisHistory(
+                "masked",
+                spec.shape,
+                spec.dtype.str,
+                indices,
+                values,
+                fill_value=deepcopy(raw.fill_value),
+                hard_mask=bool(raw.hardmask),
+            )
+        if type(raw) is np.ndarray:
+            return _Line2DPointAxisHistory(
+                "ndarray",
+                spec.shape,
+                spec.dtype.str,
+                indices,
+                values,
+            )
+        # Nested Python containers are less common and their exact structural
+        # template is itself O(N); retain the established full snapshot there.
+        return _Line2DPointAxisHistory(
+            "fallback",
+            spec.shape,
+            spec.dtype.str,
+            indices,
+            values,
+            fallback=deepcopy(raw),
+        )
+
+    @staticmethod
+    def _restore_point_history_axis(
+        state: _Line2DPointAxisHistory,
+        current,
+        *,
+        axis_name: str,
+    ):
+        if state.kind == "fallback":
+            return deepcopy(state.fallback)
+        current_masked = np.ma.isMaskedArray(current)
+        if state.kind == "masked" and not current_masked:
+            raise ValueError(
+                f"Line2D {axis_name} point history lost its masked container"
+            )
+        if state.kind == "ndarray" and (current_masked or type(current) is not np.ndarray):
+            raise ValueError(
+                f"Line2D {axis_name} point history lost its ndarray container"
+            )
+        current_data = np.asarray(current.data if current_masked else current)
+        if current_data.size != int(np.prod(state.shape, dtype=int)):
+            raise ValueError(
+                f"Line2D {axis_name} point history changed coordinate shape"
+            )
+        dtype = np.dtype(state.dtype)
+        with np.errstate(over="ignore", invalid="ignore"):
+            data = np.asarray(current_data, dtype=dtype).reshape(state.shape).copy()
+        flat = data.reshape(-1)
+        flat[np.asarray(state.indices, dtype=int)] = np.asarray(
+            state.values, dtype=dtype
+        )
+        if state.kind == "ndarray":
+            return data
+        mask = (
+            np.ma.nomask
+            if current.mask is np.ma.nomask
+            else np.array(current.mask, dtype=bool, copy=True).reshape(state.shape)
+        )
+        return np.ma.array(
+            data,
+            mask=mask,
+            fill_value=state.fill_value,
+            hard_mask=state.hard_mask,
+        )
+
+    def point_edit_history_snapshot(
+        self, point_keys: Sequence[int]
+    ) -> Line2DPointHistoryState:
+        keys = self._endpoint_keys()
+        if any(int(key) not in keys for key in point_keys):
+            raise IndexError("Line2D point history key is outside its endpoints")
+        processed = np.asarray(self.target.get_xydata(), dtype=float)
+        return Line2DPointHistoryState(
+            keys=keys,
+            processed_shape=tuple(int(value) for value in processed.shape),
+            topology_token=self.point_edit_topology_token(),
+            xaxis=self._capture_point_history_axis(
+                self.target.get_xdata(orig=True),
+                axis_name="x",
+                processed_length=len(processed),
+                keys=keys,
+            ),
+            yaxis=self._capture_point_history_axis(
+                self.target.get_ydata(orig=True),
+                axis_name="y",
+                processed_length=len(processed),
+                keys=keys,
+            ),
+        )
+
+    def restore_point_edit_history_state(self, state) -> None:
+        if not isinstance(state, Line2DPointHistoryState):
+            super().restore_point_edit_history_state(state)
+            return
+        processed = np.asarray(self.target.get_xydata(), dtype=float)
+        if (
+            tuple(int(value) for value in processed.shape) != state.processed_shape
+            or self._endpoint_keys() != state.keys
+        ):
+            raise ValueError("Line2D point history topology changed before restore")
+        xdata = self._restore_point_history_axis(
+            state.xaxis,
+            self.target.get_xdata(orig=True),
+            axis_name="x",
+        )
+        ydata = self._restore_point_history_axis(
+            state.yaxis,
+            self.target.get_ydata(orig=True),
+            axis_name="y",
+        )
+        self._atomic_set_raw_data(xdata, ydata, recache=True)
+        if _CHANGE_RECORDING_ENABLED.get():
+            self.record_changes()
         self.invalidate_geometry_cache()
 
     def snapshot(self):
@@ -6453,8 +7595,7 @@ class Line2DAdapter(ArtistAdapter):
             ),
             ChangeRecord.command_change(
                 self.target,
-                ".set_markeredgewidth("
-                f"{replay_literal(state.markeredgewidth)})",
+                f".set_markeredgewidth({replay_literal(state.markeredgewidth)})",
             ),
         )
 
@@ -6670,9 +7811,7 @@ class CollectionAdapter(ArtistAdapter):
             raise TypeError("Collection appearance plan has an invalid state type")
         linewidths = np.asarray(state.linewidths, dtype=float)
         if not np.all(np.isfinite(linewidths)) or np.any(linewidths < 0.0):
-            raise ValueError(
-                "Collection linewidths must be finite and non-negative"
-            )
+            raise ValueError("Collection linewidths must be finite and non-negative")
         return state
 
     def _apply_appearance_state(self, state) -> None:
@@ -6851,7 +7990,9 @@ class CollectionAdapter(ArtistAdapter):
             return np.zeros(count, dtype=float)
         if edgecolors.ndim == 1:
             edgecolors = edgecolors.reshape(1, -1)
-        alphas = edgecolors[:, 3] if edgecolors.shape[1] >= 4 else np.ones(len(edgecolors))
+        alphas = (
+            edgecolors[:, 3] if edgecolors.shape[1] >= 4 else np.ones(len(edgecolors))
+        )
         visible_edges = alphas[np.arange(count) % len(alphas)] > 0
         return np.where(visible_edges, paddings, 0.0)
 
@@ -6935,7 +8076,9 @@ class PathCollectionAdapter(CollectionAdapter):
         except (AttributeError, TypeError, ValueError, RuntimeError):
             paths = self.target.get_paths()
             count = 0
-        count = max(count, len(sizes), len(facecolors), len(edgecolors), len(linewidths))
+        count = max(
+            count, len(sizes), len(facecolors), len(edgecolors), len(linewidths)
+        )
         if count == 0 or not len(sizes) or not len(paths):
             return False
         item_sizes = self._cycle_values(sizes, count)
@@ -6951,9 +8094,7 @@ class PathCollectionAdapter(CollectionAdapter):
         path_indices = np.arange(count) % len(paths)
         fillable = path_fillable[path_indices]
         drawable = path_drawable[path_indices]
-        painted = (faces & fillable) | (
-            edges & (item_widths > 0.0) & drawable
-        )
+        painted = (faces & fillable) | (edges & (item_widths > 0.0) & drawable)
         return bool(np.any((item_sizes > 0.0) & painted))
 
     def operation_support(
@@ -7048,9 +8189,7 @@ class LineCollectionAdapter(CollectionAdapter):
             and not target.get_path_effects()
             and not target.get_hatch()
         )
-        return replace(
-            capabilities, can_rigid_rotate=can_rigid_rotate
-        )
+        return replace(capabilities, can_rigid_rotate=can_rigid_rotate)
 
     def local_groups(self):
         if self.uses_rendered_offsets():
@@ -7096,9 +8235,7 @@ class PolyCollectionAdapter(CollectionAdapter):
             and not target.get_path_effects()
             and not target.get_hatch()
         )
-        return replace(
-            capabilities, can_rigid_rotate=can_rigid_rotate
-        )
+        return replace(capabilities, can_rigid_rotate=can_rigid_rotate)
 
     def local_groups(self):
         if self.uses_rendered_offsets():
@@ -7204,13 +8341,9 @@ _BUILTIN_ADAPTER_REGISTRATIONS = (
     (LineCollection, LineCollectionAdapter),
     (PolyCollection, PolyCollectionAdapter),
 )
-_fill_between_type = getattr(
-    mpl_collections, "FillBetweenPolyCollection", None
-)
+_fill_between_type = getattr(mpl_collections, "FillBetweenPolyCollection", None)
 if _fill_between_type is not None:
-    _BUILTIN_ADAPTER_REGISTRATIONS += (
-        (_fill_between_type, PolyCollectionAdapter),
-    )
+    _BUILTIN_ADAPTER_REGISTRATIONS += ((_fill_between_type, PolyCollectionAdapter),)
 
 for _artist_type, _adapter_type in _BUILTIN_ADAPTER_REGISTRATIONS:
     artist_adapter_registry.register(_artist_type, _adapter_type)
@@ -7239,8 +8372,10 @@ __all__ = [
     "LegendAdapter",
     "Line2DAdapter",
     "LineCollectionAdapter",
+    "MAX_DIRECT_POINT_HANDLES",
     "PathCollectionAdapter",
     "PathPatchAdapter",
+    "PointHandleModel",
     "PolyCollectionAdapter",
     "PolygonAdapter",
     "RectangleAdapter",

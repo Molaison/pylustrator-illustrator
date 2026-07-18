@@ -1099,7 +1099,11 @@ class PlotWindow(QtWidgets.QWidget):
                 figure.signals = None
             manager = getattr(figure, "figure_dragger", None)
             if manager is not None:
-                manager.deactivate(redraw=False)
+                dispose = getattr(manager, "dispose", None)
+                if callable(dispose):
+                    dispose(redraw=False)
+                else:
+                    manager.deactivate(redraw=False)
                 if getattr(figure, "figure_dragger", None) is manager:
                     figure.figure_dragger = None
                 if getattr(figure, "selection", None) is getattr(
