@@ -69,7 +69,13 @@ from .legend_layout import (
 )
 from .editor_model import EditorGroup, EditorScene
 from .operations import OperationSupport, TransformIntent, TransformOperation
-from .transform_engine import TransformPlan, TransformPreflightError
+from .transform_engine import (
+    GeometryTransformPlan,
+    NativeRotationPlan,
+    StaleTransformPlanError,
+    TransformPlan,
+    TransformPreflightError,
+)
 from .commands import (
     GENERATED_STATE_VERSION,
     ObjectLocator,
@@ -131,6 +137,9 @@ __all__ = [
     "OperationSupport",
     "TransformIntent",
     "TransformOperation",
+    "GeometryTransformPlan",
+    "NativeRotationPlan",
+    "StaleTransformPlanError",
     "TransformPlan",
     "TransformPreflightError",
     "GENERATED_STATE_VERSION",

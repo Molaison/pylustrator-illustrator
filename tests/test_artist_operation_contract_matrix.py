@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import FrozenInstanceError, dataclass, fields
+import gc
+import time
+import tracemalloc
 from types import MethodType
 from typing import Callable
 
@@ -72,12 +75,17 @@ from pylustrator.artist_adapters import (
     iter_legend_managed_artists,
     layout_owner_for_text,
     legend_owner_for_artist,
+    register_artist_adapter,
 )
 from pylustrator.editor_model import EditorGroup
 from pylustrator.commands import semantic_equal
 from pylustrator.operations import TransformIntent, TransformOperation
 from pylustrator.snap import TargetWrapper
-from pylustrator.transform_engine import TransformPlan, TransformPreflightError
+from pylustrator.transform_engine import (
+    StaleTransformPlanError,
+    TransformPlan,
+    TransformPreflightError,
+)
 
 
 PIXEL_TOLERANCE = 0.25
@@ -1290,6 +1298,369 @@ def test_display_resize_matches_preview_and_rendered_bounds(artist_case) -> None
         assert artist_case.axes.get_ylim() == limits_before[1]
 
 
+@pytest.mark.parametrize("operation", ["translate", "resize"])
+def test_frozen_geometry_plan_rejects_stale_source_without_mutation(
+    operation,
+) -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    target = ax.add_patch(Rectangle((0.2, 0.25), 0.3, 0.2))
+    tracker = RecordingChangeTracker()
+    fig.change_tracker = tracker
+    fig.canvas.draw()
+    if operation == "translate":
+        intent = TransformIntent.translate(TRANSLATION)
+    else:
+        intent = TransformIntent.resize(
+            [[1.15, 0.0, -18.0], [0.0, 0.85, 14.0], [0.0, 0.0, 1.0]]
+        )
+    plan = TransformPlan.preflight([target], intent)
+    frozen_control = plan.preview_control_points()[0].copy()
+    frozen_selection = plan.preview_selection_points()[0].copy()
+
+    # External source mutation after preflight must not rewrite the preview or
+    # be overwritten by a later commit of the stale absolute destination.
+    target.set_x(0.42)
+    fig.canvas.draw()
+    adapter = get_artist_adapter(target)
+    externally_changed = adapter.snapshot()
+    tracker_before = tracker.capture_recording_state()
+
+    try:
+        np.testing.assert_array_equal(
+            plan.preview_control_points()[0], frozen_control
+        )
+        np.testing.assert_array_equal(
+            plan.preview_selection_points()[0], frozen_selection
+        )
+        with pytest.raises(StaleTransformPlanError, match="plan is stale"):
+            plan.commit()
+        assert semantic_equal(adapter.snapshot(), externally_changed)
+        assert tracker.capture_recording_state() == tracker_before
+    finally:
+        plt.close(fig)
+
+
+def test_mixed_frozen_plan_revalidates_every_source_before_first_mutation() -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    first = ax.add_patch(Rectangle((0.12, 0.2), 0.2, 0.18))
+    second = ax.add_patch(Rectangle((0.58, 0.48), 0.2, 0.18))
+    tracker = RecordingChangeTracker()
+    fig.change_tracker = tracker
+    fig.canvas.draw()
+    plan = TransformPlan.preflight(
+        [first, second], TransformIntent.translate(TRANSLATION)
+    )
+
+    second.set_y(0.63)
+    fig.canvas.draw()
+    adapters = (get_artist_adapter(first), get_artist_adapter(second))
+    before = tuple(adapter.snapshot() for adapter in adapters)
+    tracker_before = tracker.capture_recording_state()
+
+    try:
+        with pytest.raises(StaleTransformPlanError, match="plan is stale"):
+            plan.commit()
+        assert all(
+            semantic_equal(state, adapter.snapshot())
+            for state, adapter in zip(before, adapters)
+        )
+        assert tracker.capture_recording_state() == tracker_before
+    finally:
+        plt.close(fig)
+
+
+def test_frozen_plan_tracks_raw_storage_and_editor_group_member_order() -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    line = ax.plot([0.2, 0.5, 0.8], [0.3, 0.7, 0.4])[0]
+    tracker = RecordingChangeTracker()
+    fig.change_tracker = tracker
+    fig.canvas.draw()
+    line_plan = TransformPlan.preflight(
+        [line], TransformIntent.translate(TRANSLATION)
+    )
+    line.set_data(
+        np.array(line.get_xdata(orig=True), copy=True),
+        np.array(line.get_ydata(orig=True), copy=True),
+    )
+    fig.canvas.draw()
+    line_before = get_artist_adapter(line).snapshot()
+    tracker_before = tracker.capture_recording_state()
+
+    try:
+        with pytest.raises(StaleTransformPlanError, match="plan is stale"):
+            line_plan.commit()
+        assert semantic_equal(get_artist_adapter(line).snapshot(), line_before)
+        assert tracker.capture_recording_state() == tracker_before
+    finally:
+        plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    first = ax.add_patch(Rectangle((0.2, 0.25), 0.3, 0.2))
+    second = ax.add_patch(Rectangle((0.2, 0.25), 0.3, 0.2))
+    group = EditorGroup(
+        fig,
+        "stale-order",
+        [first, second],
+        name="Stale order",
+        owner=ax,
+    )
+    tracker = RecordingChangeTracker()
+    fig.change_tracker = tracker
+    fig.canvas.draw()
+    group_plan = TransformPlan.preflight(
+        [group], TransformIntent.translate(TRANSLATION)
+    )
+    group.members.reverse()
+    order_before = tuple(group.members)
+    positions_before = tuple(
+        get_artist_adapter(member).snapshot() for member in group.members
+    )
+    tracker_before = tracker.capture_recording_state()
+
+    try:
+        with pytest.raises(StaleTransformPlanError, match="plan is stale"):
+            group_plan.commit()
+        assert tuple(group.members) == order_before
+        assert all(
+            semantic_equal(state, get_artist_adapter(member).snapshot())
+            for state, member in zip(positions_before, group.members)
+        )
+        assert tracker.capture_recording_state() == tracker_before
+    finally:
+        plt.close(fig)
+
+
+@pytest.mark.parametrize("stale_kind", ["transform", "axes_limits", "layout"])
+def test_frozen_plan_rejects_transform_viewport_and_layout_changes(
+    stale_kind,
+) -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    if stale_kind == "axes_limits":
+        target = ax.plot([0.2, 0.5, 0.8], [0.3, 0.7, 0.4])[0]
+    elif stale_kind == "layout":
+        target = ax.text(
+            1.04,
+            0.55,
+            "layout extra",
+            transform=ax.transAxes,
+            clip_on=False,
+        )
+    else:
+        target = ax.add_patch(Rectangle((0.2, 0.25), 0.3, 0.2))
+    tracker = RecordingChangeTracker()
+    fig.change_tracker = tracker
+    fig.canvas.draw()
+    plan = TransformPlan.preflight(
+        [target], TransformIntent.translate(TRANSLATION)
+    )
+
+    if stale_kind == "transform":
+        target.set_transform(Affine2D().translate(0.08, 0.0) + ax.transData)
+    elif stale_kind == "axes_limits":
+        ax.set_xlim(-0.5, 1.5)
+    else:
+        fig.set_layout_engine("constrained")
+    fig.canvas.draw()
+    adapter = get_artist_adapter(target)
+    before = adapter.snapshot()
+    tracker_before = tracker.capture_recording_state()
+
+    try:
+        with pytest.raises(StaleTransformPlanError, match="stale"):
+            plan.commit()
+        assert semantic_equal(adapter.snapshot(), before)
+        assert tracker.capture_recording_state() == tracker_before
+    finally:
+        plt.close(fig)
+
+
+def test_frozen_plan_revalidates_destination_clip_before_mutation() -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    ax.set_xlim(0.0, 1.0)
+    ax.set_ylim(0.0, 1.0)
+    target = ax.add_patch(Rectangle((0.18, 0.42), 0.1, 0.12))
+    tracker = RecordingChangeTracker()
+    fig.change_tracker = tracker
+    fig.canvas.draw()
+    plan = TransformPlan.preflight(
+        [target], TransformIntent.translate((150.0, 0.0))
+    )
+
+    # The new clip still contains all source paint but excludes the accepted
+    # destination. Source bounds therefore stay equal while destination
+    # visibility semantics change after preflight.
+    target.set_clip_path(
+        Rectangle((0.0, 0.0), 0.45, 1.0, transform=ax.transData)
+    )
+    fig.canvas.draw()
+    adapter = get_artist_adapter(target)
+    before = adapter.snapshot()
+    tracker_before = tracker.capture_recording_state()
+
+    try:
+        with pytest.raises(
+            StaleTransformPlanError,
+            match="frozen native destination|source geometry|revalidated",
+        ):
+            plan.commit()
+        assert semantic_equal(adapter.snapshot(), before)
+        assert tracker.capture_recording_state() == tracker_before
+    finally:
+        plt.close(fig)
+
+
+def test_large_line_frozen_plan_has_bounded_retained_memory_and_zero_copy_preview() -> None:
+    count = 100_000
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    target = ax.plot(
+        np.linspace(0.0, 1.0, count),
+        np.linspace(0.2, 0.8, count),
+    )[0]
+    fig.change_tracker = RecordingChangeTracker()
+    fig.canvas.draw()
+
+    tracemalloc.start()
+    started = time.perf_counter()
+    plan = TransformPlan.preflight(
+        [target], TransformIntent.translate(TRANSLATION)
+    )
+    elapsed = time.perf_counter() - started
+    _current, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    geometry = plan.geometry_plans[0]
+    retained = (
+        geometry.control_array().nbytes
+        + geometry.native_array().nbytes
+        + geometry.selection_array().nbytes
+    )
+
+    try:
+        assert retained <= 2 * count * 2 * 8 + 1024
+        assert elapsed < 1.0
+        assert peak < 48 * 1024 * 1024
+        first_preview = plan.preview_control_points()[0]
+        assert first_preview is geometry.control_array()
+        for _index in range(100):
+            assert plan.preview_control_points()[0] is first_preview
+        assert not first_preview.flags.writeable
+        assert not geometry.native_array().flags.writeable
+        with pytest.raises(ValueError):
+            first_preview.setflags(write=True)
+        with pytest.raises(ValueError):
+            geometry.native_array().setflags(write=True)
+    finally:
+        plt.close(fig)
+        del first_preview, geometry, plan, target, ax, fig
+        gc.collect()
+
+
+@pytest.mark.parametrize(
+    "intent",
+    [TransformIntent.translate((0.0, 0.0)), TransformIntent.resize(np.eye(3))],
+    ids=["zero-translation", "identity-resize"],
+)
+def test_frozen_geometry_intent_noop_is_exact_and_records_nothing(intent) -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    target = ax.add_patch(Rectangle((0.2, 0.25), 0.3, 0.2))
+    tracker = RecordingChangeTracker()
+    fig.change_tracker = tracker
+    fig.canvas.draw()
+    adapter = get_artist_adapter(target)
+    before = adapter.snapshot()
+    controls_before = np.asarray(adapter.control_points(), dtype=float)
+    tracker_before = tracker.capture_recording_state()
+    plan = TransformPlan.preflight([target], intent)
+
+    try:
+        assert plan.geometry_plans[0].is_noop
+        np.testing.assert_array_equal(
+            plan.preview_control_points()[0], controls_before
+        )
+        plan.commit()
+        assert semantic_equal(before, adapter.snapshot())
+        assert tracker.capture_recording_state() == tracker_before
+        assert not tracker.calls
+    finally:
+        plt.close(fig)
+
+
+def test_frozen_destination_roundtrip_rejects_mutated_nonlinear_transform() -> None:
+    class MutableWarp(Transform):
+        input_dims = 2
+        output_dims = 2
+        is_separable = True
+        has_inverse = True
+
+        def __init__(self):
+            super().__init__()
+            self.curvature = 0.0
+
+        def transform_non_affine(self, values):
+            result = np.asarray(values, dtype=float).copy()
+            result[..., 0] += self.curvature * result[..., 0] ** 2
+            return result
+
+        def inverted(self):
+            return IdentityTransform()
+
+    class WarpArtist(Artist):
+        def __init__(self, transform):
+            super().__init__()
+            self.position = np.array([0.0, 0.0], dtype=float)
+            self.warp = transform
+
+        def get_window_extent(self, renderer=None):
+            from matplotlib.transforms import Bbox
+
+            point = self.warp.transform(self.position)
+            return Bbox.from_bounds(float(point[0]), float(point[1]), 2.0, 2.0)
+
+    @register_artist_adapter(WarpArtist)
+    class WarpAdapter(ArtistAdapter):
+        default_capabilities = ArtistCapabilities(
+            can_select=True,
+            can_translate=True,
+            can_snapshot=True,
+        )
+
+        def get_transform(self):
+            return self.target.warp
+
+        def native_control_points(self):
+            return [self.target.position.copy()]
+
+        def _apply_native_control_points(self, points) -> None:
+            self.target.position = np.asarray(points[0], dtype=float)
+
+    fig = plt.figure(figsize=(3, 3), dpi=100)
+    warp = MutableWarp()
+    target = WarpArtist(warp)
+    fig.add_artist(target)
+    tracker = RecordingChangeTracker()
+    fig.change_tracker = tracker
+    fig.canvas.draw()
+    plan = TransformPlan.preflight(
+        [target], TransformIntent.translate((10.0, 0.0))
+    )
+    before = target.position.copy()
+    tracker_before = tracker.capture_recording_state()
+
+    try:
+        # The source point and source bbox remain identical at x=0, and the
+        # transform class/affine matrix are unchanged. Only the accepted native
+        # destination now maps one pixel away from the frozen preview.
+        warp.curvature = 0.01
+        with pytest.raises(
+            StaleTransformPlanError, match="frozen native destination"
+        ):
+            plan.commit()
+        np.testing.assert_array_equal(target.position, before)
+        assert tracker.capture_recording_state() == tracker_before
+    finally:
+        artist_adapter_registry.unregister(WarpArtist, WarpAdapter)
+        plt.close(fig)
+
+
 def test_native_rotation_is_applied_to_the_selected_artist_only(artist_case) -> None:
     adapter = artist_case.adapter
     if not adapter.capabilities.can_rotate:
@@ -1299,6 +1670,9 @@ def test_native_rotation_is_applied_to_the_selected_artist_only(artist_case) -> 
     old_rotation = adapter.rotation()
     plan = TransformPlan.preflight(
         [artist_case.target], TransformIntent.rotate(17.0)
+    )
+    planned_selection = np.asarray(
+        plan.preview_selection_points()[0], dtype=float
     )
 
     assert plan.preview_control_points()[0].shape == np.asarray(
@@ -1312,6 +1686,7 @@ def test_native_rotation_is_applied_to_the_selected_artist_only(artist_case) -> 
         artist_case.figure.canvas.get_renderer()
     )
     selection = _bounds(adapter.selection_points())
+    _assert_px_close(selection, _bounds(planned_selection))
     assert selection[0] <= visible.x0 + PIXEL_TOLERANCE
     assert selection[1] <= visible.y0 + PIXEL_TOLERANCE
     assert selection[2] >= visible.x1 - PIXEL_TOLERANCE
@@ -1319,6 +1694,73 @@ def test_native_rotation_is_applied_to_the_selected_artist_only(artist_case) -> 
     np.testing.assert_allclose(
         _axis_position(artist_case.axes), axes_before, atol=0, rtol=0
     )
+
+
+def test_native_rotation_plan_is_absolute_stale_safe_and_strict_noop() -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    first = ax.add_patch(Rectangle((0.18, 0.25), 0.22, 0.18))
+    second = ax.add_patch(Rectangle((0.58, 0.52), 0.22, 0.18))
+    tracker = RecordingChangeTracker()
+    fig.change_tracker = tracker
+    fig.canvas.draw()
+    plan = TransformPlan.preflight(
+        [first, second], TransformIntent.rotate(17.0)
+    )
+    frozen = tuple(value.copy() for value in plan.preview_selection_points())
+
+    second.set_angle(9.0)
+    fig.canvas.draw()
+    before = (first.get_angle(), second.get_angle())
+    tracker_before = tracker.capture_recording_state()
+
+    try:
+        for actual, expected in zip(plan.preview_selection_points(), frozen):
+            np.testing.assert_array_equal(actual, expected)
+        with pytest.raises(
+            StaleTransformPlanError, match="Native-rotation plan is stale"
+        ):
+            plan.commit()
+        assert (first.get_angle(), second.get_angle()) == before
+        assert tracker.capture_recording_state() == tracker_before
+
+        noop = TransformPlan.preflight([first], TransformIntent.rotate(360.0))
+        noop_before = get_artist_adapter(first).snapshot()
+        tracker_before = tracker.capture_recording_state()
+        assert noop.native_rotation_plans[0].is_noop
+        noop.commit()
+        assert semantic_equal(noop_before, get_artist_adapter(first).snapshot())
+        assert tracker.capture_recording_state() == tracker_before
+    finally:
+        plt.close(fig)
+
+
+def test_native_rotation_plan_revalidates_destination_clip_before_mutation() -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    ax.set_xlim(0.0, 1.0)
+    ax.set_ylim(0.0, 1.0)
+    target = ax.add_patch(Rectangle((0.4, 0.4), 0.2, 0.1))
+    tracker = RecordingChangeTracker()
+    fig.change_tracker = tracker
+    fig.canvas.draw()
+    plan = TransformPlan.preflight([target], TransformIntent.rotate(90.0))
+
+    target.set_clip_path(
+        Rectangle((0.38, 0.0), 0.62, 1.0, transform=ax.transData)
+    )
+    fig.canvas.draw()
+    before = get_artist_adapter(target).snapshot()
+    tracker_before = tracker.capture_recording_state()
+
+    try:
+        with pytest.raises(
+            StaleTransformPlanError,
+            match="destination visible geometry or clip changed",
+        ):
+            plan.commit()
+        assert semantic_equal(before, get_artist_adapter(target).snapshot())
+        assert tracker.capture_recording_state() == tracker_before
+    finally:
+        plt.close(fig)
 
 
 def test_native_rotation_undo_redo_restores_angle_and_bookkeeping(
@@ -1559,6 +2001,69 @@ def test_legend_managed_rotation_leaves_reject_before_plan_or_recording() -> Non
         plt.close(fig)
 
 
+def test_legend_layout_only_geometry_rejects_without_blocking_visible_children() -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+    tracker = RecordingChangeTracker()
+    fig.change_tracker = tracker
+    line = ax.plot([0.15, 0.8], [0.2, 0.7], label="line proxy")[0]
+    legend = ax.legend(handles=[line], title="Managed title")
+    fig.canvas.draw()
+
+    frame = legend.get_frame()
+    adapter = get_artist_adapter(frame)
+    before = adapter.snapshot()
+    recording_before = tracker.capture_recording_state()
+
+    try:
+        assert frame in iter_legend_managed_artists(legend)
+        assert legend_owner_for_artist(frame) is legend
+        assert adapter.operation_support(TransformOperation.SELECT).supported
+        support = adapter.operation_support(TransformOperation.TRANSLATE)
+        assert not support.supported
+        assert "recomputed on draw" in support.reason
+        with pytest.raises(TransformPreflightError, match="recomputed on draw"):
+            TransformPlan.preflight(
+                [frame], TransformIntent.translate(TRANSLATION)
+            )
+
+        assert semantic_equal(before, adapter.snapshot())
+        assert tracker.capture_recording_state() == recording_before
+
+        # Direct Selection still permits independently positioned visible
+        # Legend children; only draw-recomputed layout-only geometry blocks.
+        assert get_artist_adapter(legend.get_texts()[0]).operation_support(
+            TransformOperation.TRANSLATE
+        ).supported
+        assert get_artist_adapter(legend.legend_handles[0]).operation_support(
+            TransformOperation.TRANSLATE
+        ).supported
+        assert get_artist_adapter(legend.get_title()).operation_support(
+            TransformOperation.TRANSLATE
+        ).supported
+
+        legend.set_title("")
+        fig.canvas.draw()
+        title = legend.get_title()
+        title_adapter = get_artist_adapter(title)
+        title_before = title_adapter.snapshot()
+        recording_before = tracker.capture_recording_state()
+        title_support = title_adapter.operation_support(
+            TransformOperation.TRANSLATE
+        )
+        assert not title_support.supported
+        assert "no stable visible geometry" in title_support.reason
+        with pytest.raises(
+            TransformPreflightError, match="no stable visible geometry"
+        ):
+            TransformPlan.preflight(
+                [title], TransformIntent.translate(TRANSLATION)
+            )
+        assert semantic_equal(title_before, title_adapter.snapshot())
+        assert tracker.capture_recording_state() == recording_before
+    finally:
+        plt.close(fig)
+
+
 def test_legend_owner_inventory_tracks_replacement_retention_and_removal() -> None:
     fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
     first = ax.legend(handles=[Rectangle((0, 0), 1, 1, label="first")])
@@ -1735,6 +2240,18 @@ def test_active_layout_bbox_feedback_is_rejected_without_overblocking_collection
             recording_before = tracker.capture_recording_state()
 
             assert active_layout_owner_for_artist(target) is ax
+            translation = adapter.operation_support(
+                TransformOperation.TRANSLATE
+            )
+            assert not translation.supported
+            assert "a draw could move its coordinate system" in translation.reason
+            with pytest.raises(
+                TransformPreflightError,
+                match="a draw could move its coordinate system",
+            ):
+                TransformPlan.preflight(
+                    [target], TransformIntent.translate(TRANSLATION)
+                )
             assert not adapter.capabilities.can_rigid_rotate
             with pytest.raises(UnsupportedArtistError, match="active Axes layout"):
                 adapter.plan_rigid_rotation(37.0, (250.0, 175.0))
@@ -1742,15 +2259,257 @@ def test_active_layout_bbox_feedback_is_rejected_without_overblocking_collection
             assert tracker.capture_recording_state() == recording_before
 
         assert active_layout_owner_for_artist(excluded_text) is None
+        assert get_artist_adapter(excluded_text).operation_support(
+            TransformOperation.TRANSLATE
+        ).supported
         assert get_artist_adapter(excluded_text).capabilities.can_rigid_rotate
         for target in (line_collection, poly_collection):
             assert active_layout_owner_for_artist(target) is None
+            assert get_artist_adapter(target).operation_support(
+                TransformOperation.TRANSLATE
+            ).supported
             assert get_artist_adapter(target).capabilities.can_rigid_rotate
     finally:
         plt.close(fig)
 
 
-def test_container_background_rotation_rejects_without_blocking_user_patches() -> None:
+def test_active_layout_mixed_preflight_builds_one_identity_inventory() -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100, layout="constrained")
+    targets = [
+        ax.text(
+            1.02 + 0.002 * index,
+            0.05 + 0.013 * index,
+            f"extra-{index}",
+            transform=ax.transAxes,
+            clip_on=False,
+        )
+        for index in range(64)
+    ]
+    fig.change_tracker = RecordingChangeTracker()
+    fig.canvas.draw()
+    original = ax.get_default_bbox_extra_artists
+    calls = 0
+
+    def counted_extras():
+        nonlocal calls
+        calls += 1
+        return original()
+
+    ax.get_default_bbox_extra_artists = counted_extras
+    try:
+        with pytest.raises(TransformPreflightError):
+            TransformPlan.preflight(
+                targets, TransformIntent.translate(TRANSLATION)
+            )
+        assert calls == 1
+    finally:
+        plt.close(fig)
+
+
+def test_auto_superlabels_reject_layout_feedback_without_blocking_stable_modes() -> None:
+    manual_position = {
+        "suptitle": {"y": 0.72},
+        "supxlabel": {"y": 0.12},
+        "supylabel": {"x": 0.12},
+    }
+    modes = ("auto_layout", "manual", "out_of_layout", "no_layout")
+
+    for owner_kind in ("figure", "subfigure"):
+        for method_name in ("suptitle", "supxlabel", "supylabel"):
+            for mode in modes:
+                fig = plt.figure(
+                    figsize=(5, 4),
+                    dpi=100,
+                    layout=None if mode == "no_layout" else "constrained",
+                )
+                owner = fig if owner_kind == "figure" else fig.subfigures(1, 1)
+                kwargs = manual_position[method_name] if mode == "manual" else {}
+                target = getattr(owner, method_name)("QA super label", **kwargs)
+                if mode == "out_of_layout":
+                    target.set_in_layout(False)
+                tracker = RecordingChangeTracker()
+                fig.change_tracker = tracker
+                fig.canvas.draw()
+                adapter = get_artist_adapter(target)
+                before = adapter.snapshot()
+                bounds_before = np.asarray(adapter.selection_points(), dtype=float)
+                recording_before = tracker.capture_recording_state()
+
+                try:
+                    support = adapter.operation_support(
+                        TransformOperation.TRANSLATE
+                    )
+                    if mode == "auto_layout":
+                        assert getattr(target, "_autopos", False)
+                        assert target.get_in_layout()
+                        assert active_layout_owner_for_artist(target) is owner
+                        assert not support.supported
+                        assert "a draw could move its coordinate system" in (
+                            support.reason
+                        )
+                        with pytest.raises(
+                            TransformPreflightError,
+                            match="a draw could move its coordinate system",
+                        ):
+                            TransformPlan.preflight(
+                                [target], TransformIntent.translate(TRANSLATION)
+                            )
+                        assert semantic_equal(before, adapter.snapshot())
+                        assert (
+                            tracker.capture_recording_state() == recording_before
+                        )
+                        _assert_px_close(adapter.selection_points(), bounds_before)
+                        continue
+
+                    assert active_layout_owner_for_artist(target) is None
+                    assert support.supported
+                    plan = TransformPlan.preflight(
+                        [target], TransformIntent.translate(TRANSLATION)
+                    )
+                    planned = np.asarray(
+                        plan.preview_selection_points()[0], dtype=float
+                    )
+                    plan.commit()
+                    fig.canvas.draw()
+                    _assert_px_close(adapter.selection_points(), planned)
+                finally:
+                    plt.close(fig)
+
+
+def test_auto_axes_titles_reject_without_blocking_explicit_title_positions() -> None:
+    for loc in ("center", "left", "right"):
+        for explicit_y in (None, 0.8):
+            fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
+            kwargs = {} if explicit_y is None else {"y": explicit_y}
+            target = ax.set_title(f"QA {loc}", loc=loc, **kwargs)
+            tracker = RecordingChangeTracker()
+            fig.change_tracker = tracker
+            fig.canvas.draw()
+            adapter = get_artist_adapter(target)
+            before = adapter.snapshot()
+            bounds_before = np.asarray(adapter.selection_points(), dtype=float)
+            recording_before = tracker.capture_recording_state()
+
+            try:
+                support = adapter.operation_support(
+                    TransformOperation.TRANSLATE
+                )
+                if explicit_y is None:
+                    assert ax._autotitlepos
+                    assert not support.supported
+                    assert "automatic title layout" in support.reason
+                    with pytest.raises(
+                        TransformPreflightError,
+                        match="automatic title layout",
+                    ):
+                        TransformPlan.preflight(
+                            [target], TransformIntent.translate(TRANSLATION)
+                        )
+                    assert semantic_equal(before, adapter.snapshot())
+                    assert tracker.capture_recording_state() == recording_before
+                    _assert_px_close(adapter.selection_points(), bounds_before)
+                    continue
+
+                assert not ax._autotitlepos
+                assert support.supported
+                plan = TransformPlan.preflight(
+                    [target], TransformIntent.translate(TRANSLATION)
+                )
+                planned = np.asarray(
+                    plan.preview_selection_points()[0], dtype=float
+                )
+                plan.commit()
+                fig.canvas.draw()
+                _assert_px_close(adapter.selection_points(), planned)
+            finally:
+                plt.close(fig)
+
+
+def test_axis_managed_text_translation_distinguishes_stable_labelpad_plan() -> None:
+    for axis_name in ("x", "y"):
+        for mode in ("plain", "constrained", "out_of_layout"):
+            fig, ax = plt.subplots(
+                figsize=(5, 4),
+                dpi=100,
+                layout=None if mode == "plain" else "constrained",
+            )
+            target = getattr(ax, f"set_{axis_name}label")("QA axis label")
+            if mode == "out_of_layout":
+                target.set_in_layout(False)
+            tracker = RecordingChangeTracker()
+            fig.change_tracker = tracker
+            fig.canvas.draw()
+            adapter = get_artist_adapter(target)
+            before = adapter.snapshot()
+            bounds_before = np.asarray(adapter.selection_points(), dtype=float)
+            recording_before = tracker.capture_recording_state()
+
+            try:
+                support = adapter.operation_support(
+                    TransformOperation.TRANSLATE
+                )
+                if mode != "plain":
+                    assert active_layout_owner_for_artist(target) is ax
+                    assert not support.supported
+                    assert "active Axes layout" in support.reason
+                    with pytest.raises(
+                        TransformPreflightError, match="active Axes layout"
+                    ):
+                        TransformPlan.preflight(
+                            [target], TransformIntent.translate(TRANSLATION)
+                        )
+                    assert semantic_equal(before, adapter.snapshot())
+                    assert tracker.capture_recording_state() == recording_before
+                    _assert_px_close(adapter.selection_points(), bounds_before)
+                    continue
+
+                assert active_layout_owner_for_artist(target) is None
+                assert support.supported
+                plan = TransformPlan.preflight(
+                    [target], TransformIntent.translate(TRANSLATION)
+                )
+                planned = np.asarray(
+                    plan.preview_selection_points()[0], dtype=float
+                )
+                plan.commit()
+                fig.canvas.draw()
+                _assert_px_close(adapter.selection_points(), planned)
+            finally:
+                plt.close(fig)
+
+        for layout in (None, "constrained"):
+            fig, ax = plt.subplots(figsize=(5, 4), dpi=100, layout=layout)
+            ax.plot([1.0e6, 2.0e6], [1.0e6, 3.0e6])
+            ax.ticklabel_format(style="sci", axis="both", scilimits=(0, 0))
+            tracker = RecordingChangeTracker()
+            fig.change_tracker = tracker
+            fig.canvas.draw()
+            axis = ax.xaxis if axis_name == "x" else ax.yaxis
+            target = axis.get_offset_text()
+            adapter = get_artist_adapter(target)
+            before = adapter.snapshot()
+            recording_before = tracker.capture_recording_state()
+
+            try:
+                assert target.get_text()
+                support = adapter.operation_support(
+                    TransformOperation.TRANSLATE
+                )
+                assert not support.supported
+                assert "formatter-owned" in support.reason
+                with pytest.raises(
+                    TransformPreflightError, match="formatter-owned"
+                ):
+                    TransformPlan.preflight(
+                        [target], TransformIntent.translate(TRANSLATION)
+                    )
+                assert semantic_equal(before, adapter.snapshot())
+                assert tracker.capture_recording_state() == recording_before
+            finally:
+                plt.close(fig)
+
+
+def test_container_background_geometry_rejects_without_blocking_user_patches() -> None:
     fig = plt.figure(figsize=(4, 4), dpi=100)
     tracker = RecordingChangeTracker()
     fig.change_tracker = tracker
@@ -1779,6 +2538,27 @@ def test_container_background_rotation_rejects_without_blocking_user_patches() -
             recording_before = tracker.capture_recording_state()
 
             assert container_owner_for_artist(target) is owner
+            translate_support = adapter.operation_support(
+                TransformOperation.TRANSLATE
+            )
+            resize_support = adapter.operation_support(
+                TransformOperation.RESIZE_GEOMETRY
+            )
+            assert not translate_support.supported
+            assert not resize_support.supported
+            assert "background" in translate_support.reason
+            assert "background" in resize_support.reason
+            with pytest.raises(TransformPreflightError, match="background"):
+                TransformPlan.preflight(
+                    [target], TransformIntent.translate(TRANSLATION)
+                )
+            with pytest.raises(TransformPreflightError, match="background"):
+                TransformPlan.preflight(
+                    [target],
+                    TransformIntent.resize(
+                        [[1.1, 0.0, 3.0], [0.0, 0.9, -2.0], [0.0, 0.0, 1.0]]
+                    ),
+                )
             assert not adapter.capabilities.can_rotate
             assert not adapter.capabilities.can_rigid_rotate
             with pytest.raises(UnsupportedArtistError, match="background"):
@@ -1792,6 +2572,10 @@ def test_container_background_rotation_rejects_without_blocking_user_patches() -
         for target in ordinary:
             adapter = get_artist_adapter(target)
             assert container_owner_for_artist(target) is None
+            assert adapter.operation_support(TransformOperation.TRANSLATE).supported
+            assert adapter.operation_support(
+                TransformOperation.RESIZE_GEOMETRY
+            ).supported
             assert adapter.capabilities.can_rotate
             assert adapter.capabilities.can_rigid_rotate
             assert adapter.plan_rigid_rotation(7.0, (200.0, 200.0)).target is target
@@ -4427,6 +5211,39 @@ def test_fixed_aspect_axes_preview_and_commit_share_native_constraint(
         plt.close(fig)
 
 
+def test_constrained_axes_snapshot_restores_layout_membership_with_geometry() -> None:
+    fig, ax = plt.subplots(figsize=(5, 4), dpi=100, layout="constrained")
+    fig.change_tracker = RecordingChangeTracker()
+    fig.canvas.draw()
+    adapter = get_artist_adapter(ax)
+    before = adapter.snapshot()
+    bounds_before = np.asarray(adapter.selection_points(), dtype=float)
+    plan = TransformPlan.preflight(
+        [ax], TransformIntent.translate((18.0, -6.0))
+    )
+    planned = np.asarray(plan.preview_selection_points()[0], dtype=float)
+
+    try:
+        assert before["in_layout"] is True
+        plan.commit()
+        moved = adapter.snapshot()
+        fig.canvas.draw()
+        assert moved["in_layout"] is False
+        _assert_px_close(adapter.selection_points(), planned)
+
+        adapter.restore(before)
+        fig.canvas.draw()
+        assert ax.get_in_layout()
+        _assert_px_close(adapter.selection_points(), bounds_before)
+
+        adapter.restore(moved)
+        fig.canvas.draw()
+        assert not ax.get_in_layout()
+        _assert_px_close(adapter.selection_points(), planned)
+    finally:
+        plt.close(fig)
+
+
 class AtomicQAArtist(Artist):
     def __init__(self, position, *, fail=False):
         super().__init__()
@@ -4526,36 +5343,28 @@ def test_logical_group_failure_restores_generated_change_bookkeeping() -> None:
 
 
 def test_failed_multi_artist_rotation_rolls_back_native_angles() -> None:
-    class FailingRotationRectangle(Rectangle):
-        fail_rotation = False
-
-        def set_angle(self, angle):
-            if self.fail_rotation:
-                raise RuntimeError("QA planned rotation failure")
-            return super().set_angle(angle)
-
     fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
     fig.change_tracker = RecordingChangeTracker()
     first = ax.add_patch(Rectangle((0.2, 0.25), 0.2, 0.3))
-    second = ax.add_patch(FailingRotationRectangle((0.6, 0.25), 0.2, 0.3))
-    second.fail_rotation = True
+    second = ax.add_patch(Rectangle((0.6, 0.25), 0.2, 0.3))
     fig.canvas.draw()
-    artist_adapter_registry.register(
-        FailingRotationRectangle, RectangleAdapter
+    plan = TransformPlan.preflight(
+        [first, second], TransformIntent.rotate(17.0)
+    )
+
+    def fail_rotation(_self, _value):
+        raise RuntimeError("QA planned rotation failure")
+
+    plan.adapters[1].set_rotation = MethodType(
+        fail_rotation, plan.adapters[1]
     )
 
     try:
-        plan = TransformPlan.preflight(
-            [first, second], TransformIntent.rotate(17.0)
-        )
         with pytest.raises(RuntimeError, match="QA planned rotation failure"):
             plan.commit()
         assert first.get_angle() == pytest.approx(0.0)
         assert second.get_angle() == pytest.approx(0.0)
     finally:
-        artist_adapter_registry.unregister(
-            FailingRotationRectangle, RectangleAdapter
-        )
         plt.close(fig)
 
 

@@ -90,6 +90,8 @@ _SELECTION_GEOMETRY_CACHE = ContextVar(
 _LEGEND_OWNER_CACHE = ContextVar("pylustrator_legend_owner_cache", default=None)
 _LEGEND_OWNER_INVENTORY_ATTR = "_pylustrator_legend_owner_inventory"
 _ACTIVE_LAYOUT_OWNER_SNAPSHOT_KEY = object()
+_ACTIVE_LAYOUT_EXTRAS_SNAPSHOT_KEY = object()
+_CONTAINER_OWNER_SNAPSHOT_KEY = object()
 
 
 @contextmanager
@@ -583,28 +585,82 @@ def active_layout_owner_for_artist(target: Artist) -> Artist | None:
         )
     if not layout_active:
         return None
+
+    if isinstance(target, Text):
+        owner = layout_owner_for_text(target)
+        if target is getattr(owner, "label", None):
+            # Axis.draw always owns one label coordinate, while an active
+            # Figure layout can also move the Axes itself. ``in_layout=False``
+            # on the Text does not disable either channel; the labelpad-aware
+            # adapter is exact only while the Figure layout is inactive.
+            return getattr(owner, "axes", None) or owner
+
     if not target.get_visible() or not getattr(
         target, "get_in_layout", lambda: True
     )():
         return None
+
+    # Constrained layout rewrites the automatic coordinate of Figure and
+    # SubFigure super labels after a drag preview. Matplotlib marks exactly
+    # those auto-positioned labels with ``_autopos``. A manually positioned
+    # super label, ordinary ``figure.text``, or an object explicitly removed
+    # from layout remains independently movable.
+    if (
+        isinstance(target, Text)
+        and getattr(target, "axes", None) is None
+        and bool(getattr(target, "_autopos", False))
+    ):
+        owner = layout_owner_for_text(target)
+        if owner is not None:
+            return owner
+
     axes = getattr(target, "axes", None)
     if axes is None:
         return None
 
     snapshot = _SELECTION_GEOMETRY_CACHE.get()
+    if snapshot is None:
+        # Transform capability preflight already has an ownership snapshot.
+        # Reuse it so a mixed selection asks Matplotlib for each Axes' bbox
+        # extras once rather than once per selected Artist.
+        snapshot = _LEGEND_OWNER_CACHE.get()
     snapshot_key = (_ACTIVE_LAYOUT_OWNER_SNAPSHOT_KEY, id(target))
     if snapshot is not None:
         entry = snapshot.get(snapshot_key)
         if entry is not None and entry[0] is target:
             return entry[1]
 
-    try:
-        extras = axes.get_default_bbox_extra_artists()
-    except (AttributeError, TypeError, ValueError, RuntimeError):
+    extras = None
+    extras_inventory = None
+    extras_key = (_ACTIVE_LAYOUT_EXTRAS_SNAPSHOT_KEY, id(axes))
+    if snapshot is not None:
+        entry = snapshot.get(extras_key)
+        if entry is not None and entry[0] is axes:
+            extras = entry[1]
+            extras_inventory = entry[2]
+    if extras is None:
+        try:
+            extras = tuple(axes.get_default_bbox_extra_artists())
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            extras = None
+        extras_inventory = (
+            None
+            if extras is None
+            else {id(artist): artist for artist in extras}
+        )
+        if snapshot is not None:
+            snapshot[extras_key] = (axes, extras, extras_inventory)
+
+    if extras is None:
         owner = axes
     else:
         owner = None
-        if any(target is artist for artist in extras):
+        if extras_inventory is not None:
+            candidate = extras_inventory.get(id(target))
+            is_extra = candidate is target
+        else:
+            is_extra = any(target is artist for artist in extras)
+        if is_extra:
             try:
                 bbox = target.get_tightbbox(figure.canvas.get_renderer())
                 bounds = np.asarray(bbox.extents, dtype=float)
@@ -628,6 +684,41 @@ def container_owner_for_artist(target: Artist) -> Artist | None:
     figure = getattr(target, "figure", None)
     if figure is None:
         return None
+
+    get_root = getattr(target, "get_figure", None)
+    if callable(get_root):
+        try:
+            root = get_root(root=True)
+        except (AttributeError, TypeError, ValueError):
+            root = figure
+    else:
+        root = figure
+
+    snapshot = _LEGEND_OWNER_CACHE.get()
+    snapshot_key = (_CONTAINER_OWNER_SNAPSHOT_KEY, id(root))
+    if snapshot is not None:
+        entry = snapshot.get(snapshot_key)
+        if entry is not None and entry[0] is root:
+            owned = entry[1].get(id(target))
+            return owned[1] if owned is not None and owned[0] is target else None
+
+        inventory = {}
+
+        def collect(owner) -> None:
+            patch = getattr(owner, "patch", None)
+            if patch is not None:
+                inventory[id(patch)] = (patch, owner)
+            for axes in getattr(owner, "axes", []):
+                patch = getattr(axes, "patch", None)
+                if patch is not None:
+                    inventory[id(patch)] = (patch, axes)
+            for subfigure in getattr(owner, "subfigs", []):
+                collect(subfigure)
+
+        collect(root)
+        snapshot[snapshot_key] = (root, inventory)
+        owned = inventory.get(id(target))
+        return owned[1] if owned is not None and owned[0] is target else None
 
     def visit(owner):
         if target is getattr(owner, "patch", None):
@@ -895,6 +986,12 @@ class ArtistAdapter:
         self, operation: TransformOperation | str
     ) -> OperationSupport:
         operation = TransformOperation.coerce(operation)
+        container_geometry_operation = operation in {
+            TransformOperation.TRANSLATE,
+            TransformOperation.RESIZE_GEOMETRY,
+            TransformOperation.ROTATE,
+            TransformOperation.RIGID_ROTATE,
+        }
         if operation in {
             TransformOperation.ROTATE,
             TransformOperation.RIGID_ROTATE,
@@ -921,21 +1018,23 @@ class ArtistAdapter:
                         f"{type(layout_owner).__name__} layout and has no stable "
                         "native pivot",
                     )
+        if container_geometry_operation:
             container_owner = container_owner_for_artist(self.target)
             if container_owner is not None:
                 return OperationSupport.denied(
                     operation,
                     f"{type(self.target).__name__} is the background of "
-                    f"{type(container_owner).__name__} and cannot rotate "
-                    "independently",
+                    f"{type(container_owner).__name__} and cannot be transformed "
+                    "independently; select the container instead",
                 )
             active_layout_owner = active_layout_owner_for_artist(self.target)
             if active_layout_owner is not None:
                 return OperationSupport.denied(
                     operation,
                     f"{type(self.target).__name__} participates in active "
-                    f"{type(active_layout_owner).__name__} layout; rotation could "
-                    "move its coordinate system during draw",
+                    f"{type(active_layout_owner).__name__} layout; a draw could "
+                    "move its coordinate system after the preview. Set "
+                    "in_layout=False before transforming it independently",
                 )
         capabilities = self.capabilities
         legacy_support = {
@@ -2049,6 +2148,25 @@ class ArtistAdapter:
             f"{type(self.target).__name__} has no native rotation property"
         )
 
+    def preview_native_rotation_selection_points(self, value: float) -> np.ndarray:
+        """Measure one absolute native angle without mutating the live Artist."""
+
+        clone = copy(self.target)
+        for attribute in (
+            "_pylustrator_preview_positions",
+            "_pylustrator_preview_selection_points",
+        ):
+            try:
+                delattr(clone, attribute)
+            except AttributeError:
+                pass
+        adapter = type(self)(clone)
+        with suspend_change_recording():
+            adapter._apply_rotation(float(value))
+        return adapter.point_array(
+            adapter.clip_selection_points(adapter.selection_points())
+        )
+
     def rotation_pivot(self) -> np.ndarray:
         """Return the native-rotation anchor in display coordinates."""
 
@@ -2977,6 +3095,21 @@ class ConnectionPatchAdapter(FancyArrowPatchAdapter):
 
 
 class FancyBboxPatchAdapter(PatchAdapter):
+    def operation_support(
+        self, operation: TransformOperation | str
+    ) -> OperationSupport:
+        operation = TransformOperation.coerce(operation)
+        if (
+            operation is TransformOperation.TRANSLATE
+            and legend_owner_for_artist(self.target) is not None
+        ):
+            return OperationSupport.denied(
+                operation,
+                "Legend frame geometry is owned by its layout and is recomputed "
+                "on draw; select the Legend instead",
+            )
+        return super().operation_support(operation)
+
     @classmethod
     def capabilities_for(cls, target: FancyBboxPatch) -> ArtistCapabilities:
         # BoxStyle padding and corners do not follow a display delta through a
@@ -3371,6 +3504,37 @@ class TextAdapter(ArtistAdapter):
                 "Tick-label position is managed by its Axis; edit tick content "
                 "or Axis spacing instead of dragging the generated Text",
             )
+        if operation is TransformOperation.TRANSLATE:
+            legend_owner = legend_owner_for_text(self.target)
+            if (
+                legend_owner is not None
+                and self.target is legend_owner.get_title()
+                and (
+                    not self.target.get_visible()
+                    or not self.target.get_text().strip()
+                )
+            ):
+                return OperationSupport.denied(
+                    operation,
+                    "An empty or hidden Legend title has no stable visible "
+                    "geometry and its position is recomputed on draw",
+                )
+            layout_owner = layout_owner_for_text(self.target)
+            if isinstance(layout_owner, Axes) and bool(
+                getattr(layout_owner, "_autotitlepos", True)
+            ):
+                return OperationSupport.denied(
+                    operation,
+                    "Axes title position is managed by automatic title layout "
+                    "and is recomputed on draw; pass an explicit title y position "
+                    "before translating it independently",
+                )
+            if self.target is getattr(layout_owner, "offsetText", None):
+                return OperationSupport.denied(
+                    operation,
+                    "Axis offset-text position is formatter-owned and is "
+                    "recomputed on draw",
+                )
         return super().operation_support(operation)
 
     def appearance_state(self):
@@ -3815,6 +3979,22 @@ class AxesAdapter(ArtistAdapter):
         points = self._constrain_native_control_points(points)
         position = np.array([points[0], points[1] - points[0]]).flatten()
         self.target.set_position(position)
+
+    def snapshot(self):
+        state = super().snapshot()
+        state["in_layout"] = bool(self.target.get_in_layout())
+        return state
+
+    def restore(self, state) -> None:
+        if state.get("type") != "positions":
+            raise ValueError(
+                f"Unsupported snapshot for {type(self).__name__}: {state!r}"
+            )
+        self._apply_native_control_points(state["positions"])
+        if "in_layout" in state:
+            self.target.set_in_layout(bool(state["in_layout"]))
+        self._record_restored_state()
+        self.invalidate_geometry_cache()
 
     def serialize_changes(self):
         return (ChangeRecord.axes_change(self.target),)
