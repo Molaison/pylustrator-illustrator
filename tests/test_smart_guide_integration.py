@@ -542,6 +542,60 @@ def test_idle_warmup_publishes_cache_before_nonblocking_gesture() -> None:
     plt.close(fig)
 
 
+def test_idle_warmup_publishes_hit_index_before_guides(monkeypatch) -> None:
+    fig, ax = plt.subplots(figsize=(7, 5), dpi=100)
+    for ix in range(24):
+        for iy in range(18):
+            ax.add_patch(
+                Rectangle(
+                    (ix / 24, iy / 18),
+                    0.7 / 24,
+                    0.7 / 18,
+                    linewidth=0.2,
+                )
+            )
+    fig.canvas.draw()
+    manager = _attach_manager(fig)
+    manager._smart_guide_idle_warmup_enabled = True
+    manager._smart_guide_scene_cache = None
+    roster, _editable, _order = manager._interaction_roster_snapshot()
+    queued = []
+    monkeypatch.setattr(
+        QtCore.QTimer,
+        "singleShot",
+        lambda _delay, callback: queued.append(callback),
+    )
+
+    assert schedule_smart_guide_warmup(manager, batch_budget_ms=0.25)
+    turns = 0
+    while not manager._interaction_index.is_current(
+        revision=manager._interaction_revision,
+        source_ids=roster.source_ids,
+    ):
+        assert queued
+        queued.pop(0)()
+        turns += 1
+        assert turns < 5000
+
+    pending = manager._smart_guide_pending_capture
+    assert pending is not None
+    assert _cached_scene_guides(manager) is None
+    assert pending.next_index < len(pending.artists)
+    hit_turns = turns
+
+    while _cached_scene_guides(manager) is None:
+        assert queued
+        queued.pop(0)()
+        turns += 1
+        assert turns < 5000
+    assert turns > hit_turns
+    assert manager._smart_guide_pending_capture is None
+
+    manager._smart_guide_idle_warmup_enabled = False
+    manager.selection.clear_targets()
+    plt.close(fig)
+
+
 def test_idle_warmup_makes_first_fig2_scale_hit_query_hot(monkeypatch) -> None:
     app = QtWidgets.QApplication.instance()
     fig, ax = plt.subplots(figsize=(7, 5), dpi=100)

@@ -343,28 +343,36 @@ def schedule_smart_guide_warmup(manager, *, batch_budget_ms: float = 4.0) -> boo
         scope_id = f"figure:{id(manager.figure)}"
         deadline = perf_counter() + budget
         with geometry.snapshot():
-            while True:
-                worked = False
-                hit_build = pending.hit_build
-                if (
-                    hit_build is not None
-                    and hit_build.active
-                    and not hit_build.complete
-                ):
-                    hit_artist = pending.hit_artists[hit_build.next_index]
-                    try:
-                        bounds = manager._interaction_index_bounds(
-                            hit_artist, geometry
-                        )
-                    except Exception:
-                        # Keep pointer handling fail-open if an unusual Artist
-                        # cannot be measured safely during idle work.
-                        hit_build.cancel()
-                        pending.hit_build = None
-                    else:
-                        hit_build.add_bounds(bounds)
-                    worked = True
-                if (
+            hit_build = pending.hit_build
+            while (
+                hit_build is not None
+                and hit_build.active
+                and not hit_build.complete
+            ):
+                hit_artist = pending.hit_artists[hit_build.next_index]
+                try:
+                    bounds = manager._interaction_index_bounds(
+                        hit_artist, geometry
+                    )
+                except Exception:
+                    # Keep pointer handling fail-open if an unusual Artist
+                    # cannot be measured safely during idle work.
+                    hit_build.cancel()
+                    pending.hit_build = None
+                    break
+                hit_build.add_bounds(bounds)
+                if perf_counter() >= deadline:
+                    break
+            if hit_build is not None and hit_build.active and hit_build.complete:
+                if hit_build.finish():
+                    pending.hit_build = None
+            elif hit_build is not None and not hit_build.active:
+                pending.hit_build = None
+
+            # Pointer selection is latency-critical; only spend this slice's
+            # remaining budget on guides after the hit index is publishable.
+            if pending.hit_build is None and perf_counter() < deadline:
+                while (
                     pending.capture_guides
                     and pending.next_index < len(pending.artists)
                 ):
@@ -381,15 +389,8 @@ def schedule_smart_guide_warmup(manager, *, batch_budget_ms: float = 4.0) -> boo
                     )
                     if entry is not None:
                         pending.entries.append(entry)
-                    worked = True
-                if not worked:
-                    break
-                if perf_counter() >= deadline:
-                    break
-        hit_build = pending.hit_build
-        if hit_build is not None and hit_build.active and hit_build.complete:
-            if hit_build.finish():
-                pending.hit_build = None
+                    if perf_counter() >= deadline:
+                        break
         if (
             pending.capture_guides
             and pending.next_index == len(pending.artists)
@@ -402,6 +403,7 @@ def schedule_smart_guide_warmup(manager, *, batch_budget_ms: float = 4.0) -> boo
             )
             manager._smart_guide_scene_cache = result
             pending.capture_guides = False
+        hit_build = pending.hit_build
         hit_pending = hit_build is not None and hit_build.active
         if pending.capture_guides or hit_pending:
             QtCore.QTimer.singleShot(0, step)
