@@ -3405,6 +3405,10 @@ class DragManager:
         """Drop visible-bound caches after any render/transform change."""
         for artist in getattr(self, "_selectable_artists", []):
             setattr(artist, "_pylustrator_cached_get_extend", None)
+        # Child list order is part of the authoritative paint/hit order and can
+        # change independently from zorder (including through external
+        # Matplotlib mutations). Never retain it across a completed draw.
+        self._draw_child_orders = {}
         # Locators may materialize additional Tick/Text objects during draw.
         # Keep visible labels in the same explicit hit inventory as all other
         # direct-selection targets without rebuilding the complete scene.
@@ -4419,7 +4423,6 @@ class DragManager:
         self.selected_element = current[-1] if current else None
         self._update_interaction_controls()
         self._notify_selected_element_changed()
-        self.figure.canvas.draw()
 
     def redo(self):
         if self._cancel_active_pointer_transform():
@@ -4430,7 +4433,6 @@ class DragManager:
         self.selected_element = current[-1] if current else None
         self._update_interaction_controls()
         self._notify_selected_element_changed()
-        self.figure.canvas.draw()
 
     def _cancel_active_pointer_transform(self) -> bool:
         """Rollback an in-flight move/resize and keep the selection intact."""
