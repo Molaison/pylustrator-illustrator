@@ -57,6 +57,7 @@ from .snap import (
 from .change_tracker import ChangeTracker, add_text_default, getReference
 from .components.plot_layout import scene_point_to_canvas_pixels
 from .editor_model import EditorGroup, EditorScene
+from .display_geometry import ArtistRoster, DisplayGeometryCache
 from .interaction import HitCandidate, HitStack, SelectionKernel, SelectionMode
 from .interaction_index import DisplaySpaceHitIndex
 from .operations import OperationSupport, TransformIntent, TransformOperation
@@ -439,6 +440,9 @@ class GrabbableRectangleSelection(GrabFunctions):
         self.targets = []
         self.targets_rects = []
         self.target_bounds = []
+        self.selection_overlay_batch_threshold = 128
+        self._batched_selection_overlay = False
+        self._batched_selection_overlay_items = []
         self.lock_aspect_ratio = False
         self.reference_point = (0.5, 0.5)
         self._custom_rotation_pivot_inches = None
@@ -452,12 +456,77 @@ class GrabbableRectangleSelection(GrabFunctions):
 
         self.hide_grabber()
 
+    def configure_target_overlay(self, target_count: int) -> bool:
+        """Use a fixed number of scene items for a large target inventory."""
+
+        threshold = max(int(self.selection_overlay_batch_threshold), 1)
+        self._batched_selection_overlay = int(target_count) >= threshold
+        if self._batched_selection_overlay:
+            self._ensure_batched_selection_overlay()
+        return self._batched_selection_overlay
+
+    def _ensure_batched_selection_overlay(self):
+        items = getattr(self, "_batched_selection_overlay_items", [])
+        if items:
+            return items
+
+        outline = QtWidgets.QGraphicsPathItem(self.graphics_scene_myparent)
+        outline.setPen(QtGui.QPen(QtGui.QColor("#1E88E5"), 3))
+        outline.setBrush(QtGui.QBrush(QtGui.QColor(30, 136, 229, 32)))
+        outline.setZValue(900)
+
+        contrast = QtWidgets.QGraphicsPathItem(self.graphics_scene_myparent)
+        contrast_pen = QtGui.QPen(QtGui.QColor("white"), 1)
+        contrast_pen.setStyle(QtCore.Qt.DashLine)
+        contrast.setPen(contrast_pen)
+        contrast.setBrush(QtGui.QBrush(QtCore.Qt.NoBrush))
+        contrast.setZValue(901)
+
+        key = QtWidgets.QGraphicsPathItem(self.graphics_scene_myparent)
+        key.setPen(QtGui.QPen(QtGui.QColor("#0D47A1"), 5))
+        key.setBrush(QtGui.QBrush(QtGui.QColor(30, 136, 229, 32)))
+        key.setZValue(905)
+        items = [outline, contrast, key]
+        self._batched_selection_overlay_items = items
+        return items
+
+    def _remove_batched_selection_overlay(self) -> None:
+        for item in getattr(self, "_batched_selection_overlay_items", []):
+            scene = item.scene()
+            if scene is not None:
+                scene.removeItem(item)
+        self._batched_selection_overlay_items = []
+
+    def _update_batched_selection_overlay(self) -> None:
+        if not getattr(self, "_batched_selection_overlay", False):
+            return
+        outline, contrast, key_item = self._ensure_batched_selection_overlay()
+        ordinary_path = QtGui.QPainterPath()
+        key_path = QtGui.QPainterPath()
+        key = (
+            self.alignment_key
+            if self.alignment_reference_mode == "key_object"
+            else None
+        )
+        for target, bounds in zip(self.targets, self.target_bounds):
+            if bounds is None:
+                continue
+            x0, y0, x1, y1 = (float(value) for value in bounds)
+            path = key_path if target.target is key else ordinary_path
+            path.addRect(QtCore.QRectF(x0, y0, x1 - x0, y1 - y0))
+        outline.setPath(ordinary_path)
+        contrast.setPath(ordinary_path)
+        key_item.setPath(key_path)
+
     def add_target(self, target: Artist, update: bool = True):
         """add an artist to the selection"""
         if target in [wrapped.target for wrapped in self.targets]:
             return
         target = TargetWrapper(target)
-        if not target.supported:
+        if (
+            not getattr(self, "_batch_targets_prevalidated", False)
+            and not target.supported
+        ):
             return
         if not getattr(self, "_batch_add_targets", False):
             self._clear_custom_rotation_pivot()
@@ -481,6 +550,10 @@ class GrabbableRectangleSelection(GrabFunctions):
             np.max(new_points[:, 1]),
         )
         self.target_bounds.append(np.array([x0, y0, x1, y1], dtype=float))
+        if getattr(self, "_batched_selection_overlay", False):
+            if update:
+                self.update_extent()
+            return
         if 0:
             rect1 = Rectangle(
                 (x0, y0),
@@ -550,6 +623,7 @@ class GrabbableRectangleSelection(GrabFunctions):
 
         if not bounds:
             self.hide_grabber()
+            self._update_batched_selection_overlay()
             return
 
         self._apply_target_bounds(bounds, refresh_capabilities=True)
@@ -593,6 +667,7 @@ class GrabbableRectangleSelection(GrabFunctions):
                 self._grabber_scale_supported,
                 self._grabber_rotation_supported,
             )
+        self._update_batched_selection_overlay()
 
     def refresh_targets_after_draw(self, target_indices: Iterable[int]) -> None:
         """Remeasure only targets whose layout is finalized during draw."""
@@ -1129,10 +1204,18 @@ class GrabbableRectangleSelection(GrabFunctions):
     def rotation_handle_supported(self) -> bool:
         """Expose native single-object or common-pivot multi-object rotation."""
 
-        operation = self.rotation_operation()
-        if operation is None:
+        if not self.targets:
             return False
-        return self.rotation_interaction_support(operation).supported
+        if len(self.targets) == 1:
+            target = self.targets[0]
+            return bool(
+                target.operation_support(TransformOperation.RIGID_ROTATE).supported
+                or target.native_rotation_handle_support().supported
+            )
+        return all(
+            target.operation_support(TransformOperation.RIGID_ROTATE).supported
+            for target in self.targets
+        )
 
     def rotation_pivot(self) -> np.ndarray:
         if not self.rotation_handle_supported():
@@ -1403,6 +1486,22 @@ class GrabbableRectangleSelection(GrabFunctions):
                 if 0 <= index < len(self.targets)
             )
         )
+        if getattr(self, "_batched_selection_overlay", False):
+            for index in indices:
+                target = self.targets[index]
+                new_points = None
+                if use_previous_offset:
+                    new_points = getattr(
+                        self, "move_current_selection_points", {}
+                    ).get(id(target.target))
+                if new_points is None:
+                    new_points = np.asarray(target.get_selection_points())
+                if new_points.ndim != 2 or not len(new_points):
+                    self.target_bounds[index] = None
+                    continue
+                self.target_bounds[index] = self._bounds_from_points([new_points])
+            self._update_batched_selection_overlay()
+            return
         if 0:
             for index in indices:
                 target = self.targets[index]
@@ -1445,6 +1544,10 @@ class GrabbableRectangleSelection(GrabFunctions):
     def _update_alignment_key_style(self) -> None:
         """Draw the active key object with Illustrator-style emphasis."""
 
+        if getattr(self, "_batched_selection_overlay", False):
+            self._update_batched_selection_overlay()
+            return
+
         key = (
             self.alignment_key
             if self.alignment_reference_mode == "key_object"
@@ -1471,10 +1574,11 @@ class GrabbableRectangleSelection(GrabFunctions):
         self._clear_preview(self.targets[index])
         self.targets.pop(index)
         self.target_bounds.pop(index)
-        rect1 = self.targets_rects.pop(index * 2)
-        rect2 = self.targets_rects.pop(index * 2)
-        rect1.scene().removeItem(rect1)
-        rect2.scene().removeItem(rect2)
+        if not getattr(self, "_batched_selection_overlay", False):
+            rect1 = self.targets_rects.pop(index * 2)
+            rect2 = self.targets_rects.pop(index * 2)
+            rect1.scene().removeItem(rect1)
+            rect2.scene().removeItem(rect2)
         self._clear_custom_rotation_pivot()
         # self.figure.patches.remove(rect1)
         # self.figure.patches.remove(rect2)
@@ -1529,6 +1633,8 @@ class GrabbableRectangleSelection(GrabFunctions):
             self.graphics_scene.scene().removeItem(rect)
             # self.figure.patches.remove(rect)
         self.targets_rects = []
+        self._remove_batched_selection_overlay()
+        self._batched_selection_overlay = False
         self.targets = []
         self.target_bounds = []
         self.alignment_key = None
@@ -1539,7 +1645,10 @@ class GrabbableRectangleSelection(GrabFunctions):
 
     def do_target_scale(self) -> bool:
         """Only expose resize handles when every selected artist can scale."""
-        return self.operation_support(TransformOperation.RESIZE_GEOMETRY).supported
+        return bool(self.targets) and all(
+            target.operation_support(TransformOperation.RESIZE_GEOMETRY).supported
+            for target in self.targets
+        )
 
     def do_change_aspect_ratio(self) -> bool:
         """if any of the element sin the selection wants to perserve its aspect ratio"""
@@ -2564,6 +2673,11 @@ class DragManager:
         self._draw_child_orders = {}
         self._interaction_revision = 0
         self._interaction_index = DisplaySpaceHitIndex()
+        self._marquee_index = DisplaySpaceHitIndex()
+        self._interaction_roster_cache = None
+        self._selectable_roster_cache = None
+        self._marquee_roster_cache = None
+        self._display_geometry_cache = DisplayGeometryCache()
         self._smart_guide_idle_warmup_enabled = True
         self.editor_scene = EditorScene(
             figure, ownership_parent=self._draw_parent
@@ -2611,12 +2725,97 @@ class DragManager:
             self._interaction_revision = 0
         return index
 
+    def _ensure_marquee_index(self) -> DisplaySpaceHitIndex:
+        index = getattr(self, "_marquee_index", None)
+        if index is None:
+            index = DisplaySpaceHitIndex()
+            self._marquee_index = index
+        return index
+
+    def _invalidate_artist_rosters(self) -> None:
+        """Drop immutable inventories only after a structural roster change."""
+
+        self._interaction_roster_cache = None
+        self._selectable_roster_cache = None
+        self._marquee_roster_cache = None
+
+    def _interaction_roster_snapshot(self):
+        cached = getattr(self, "_interaction_roster_cache", None)
+        if cached is not None:
+            return cached
+        roster = ArtistRoster.capture(
+            getattr(
+                self,
+                "_interaction_artists",
+                getattr(self, "_selectable_artists", ()),
+            )
+        )
+        selectable_ids = getattr(self, "_selectable_artist_ids", set())
+        editable = tuple(id(artist) in selectable_ids for artist in roster.artists)
+        registration_order = {
+            source_id: index for index, source_id in enumerate(roster.source_ids)
+        }
+        cached = roster, editable, registration_order
+        self._interaction_roster_cache = cached
+        return cached
+
+    def _selectable_roster_snapshot(self) -> ArtistRoster:
+        cached = getattr(self, "_selectable_roster_cache", None)
+        if cached is None:
+            artists = getattr(self, "_selectable_artists", None)
+            if artists is None:
+                artists = tuple(self.iter_selectable_artists())
+            cached = ArtistRoster.capture(artists)
+            self._selectable_roster_cache = cached
+        return cached
+
+    def _marquee_roster_snapshot(self) -> ArtistRoster:
+        """Exclude formatter output that can never join a marquee selection."""
+
+        cached = getattr(self, "_marquee_roster_cache", None)
+        if cached is None:
+            cached = ArtistRoster.capture(
+                tuple(
+                    artist
+                    for artist in getattr(self, "_selectable_artists", ())
+                    if not (
+                        isinstance(artist, Text)
+                        and getattr(
+                            artist,
+                            "_pylustrator_formatter_owned_tick_label",
+                            False,
+                        )
+                    )
+                )
+            )
+            self._marquee_roster_cache = cached
+        return cached
+
+    def _ensure_display_geometry_cache(self) -> DisplayGeometryCache:
+        cache = getattr(self, "_display_geometry_cache", None)
+        if cache is None:
+            cache = DisplayGeometryCache()
+            self._display_geometry_cache = cache
+        try:
+            renderer = self.figure.canvas.get_renderer()
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            renderer = None
+        return cache.bind(
+            revision=getattr(self, "_interaction_revision", 0),
+            roster=self._selectable_roster_snapshot(),
+            renderer=renderer,
+        )
+
     def _invalidate_interaction_index(self) -> None:
         """Advance the geometry/inventory version used by pointer queries."""
 
         index = self._ensure_interaction_index()
         self._interaction_revision = int(self._interaction_revision) + 1
         index.invalidate()
+        self._ensure_marquee_index().invalidate()
+        geometry = getattr(self, "_display_geometry_cache", None)
+        if geometry is not None:
+            geometry.invalidate()
         active_session = getattr(self, "_active_smart_guide_session", None)
         if active_session is not None:
             active_session.invalidate()
@@ -2711,7 +2910,9 @@ class DragManager:
         return tolerance + 2.0
 
     def _interaction_index_bounds(
-        self, artist: Artist
+        self,
+        artist: Artist,
+        geometry: DisplayGeometryCache | None = None,
     ) -> tuple[float, float, float, float] | None:
         """Return a conservative bounded hit envelope, otherwise ``None``.
 
@@ -2740,12 +2941,24 @@ class DragManager:
         needs_adapter_envelope = isinstance(artist, Collection)
         if needs_adapter_envelope:
             try:
-                points = np.asarray(adapter.selection_points(), dtype=float)
-                if points.ndim == 2 and points.shape[1] >= 2:
-                    points = points[:, :2]
-                    points = points[np.all(np.isfinite(points), axis=1)]
-                    if len(points):
-                        point_sets.append(points)
+                effective_clip = bool(artist.get_clip_on()) and (
+                    artist.get_clip_box() is not None
+                    or artist.get_clip_path() is not None
+                )
+                shared = (
+                    None
+                    if geometry is None or effective_clip
+                    else geometry.selection_bounds(artist)
+                )
+                if shared is not None:
+                    point_sets.append(np.asarray(shared, dtype=float).reshape(2, 2))
+                else:
+                    points = np.asarray(adapter.selection_points(), dtype=float)
+                    if points.ndim == 2 and points.shape[1] >= 2:
+                        points = points[:, :2]
+                        points = points[np.all(np.isfinite(points), axis=1)]
+                        if len(points):
+                            point_sets.append(points)
             except (
                 AttributeError,
                 IndexError,
@@ -2769,10 +2982,29 @@ class DragManager:
         # collection hit geometry, so do not union that incompatible extent.
         if not isinstance(artist, Collection):
             try:
-                renderer = self.figure.canvas.get_renderer()
+                renderer = (
+                    geometry.renderer
+                    if geometry is not None and geometry.renderer is not None
+                    else self.figure.canvas.get_renderer()
+                )
                 if isinstance(artist, Text) and artist.get_bbox_patch() is not None:
                     artist.update_bbox_position_size(renderer)
-                for extent_artist in (artist, *components):
+                effective_clip = bool(artist.get_clip_on()) and (
+                    artist.get_clip_box() is not None
+                    or artist.get_clip_path() is not None
+                )
+                shared = (
+                    None
+                    if geometry is None
+                    or effective_clip
+                    or isinstance(artist, Annotation)
+                    else geometry.selection_bounds(artist)
+                )
+                extent_artists = (artist, *components)
+                if shared is not None:
+                    point_sets.append(np.asarray(shared, dtype=float).reshape(2, 2))
+                    extent_artists = components
+                for extent_artist in extent_artists:
                     extent = np.asarray(
                         extent_artist.get_window_extent(renderer).extents,
                         dtype=float,
@@ -2820,18 +3052,26 @@ class DragManager:
         )
 
     def _interaction_candidate_indices(
-        self, event: MouseEvent, artists: Sequence[Artist]
+        self,
+        event: MouseEvent,
+        artists: Sequence[Artist],
+        *,
+        source_ids: tuple[int, ...] | None = None,
     ) -> Sequence[int]:
         """Return indexed candidates, falling back to the original full scan."""
 
         index = self._ensure_interaction_index()
+        geometry = self._ensure_display_geometry_cache()
         try:
             candidates = index.candidate_indices(
                 event.x,
                 event.y,
                 artists,
                 revision=self._interaction_revision,
-                bounds_provider=self._interaction_index_bounds,
+                bounds_provider=lambda artist: self._interaction_index_bounds(
+                    artist, geometry
+                ),
+                source_ids=source_ids,
             )
         except Exception:
             candidates = None
@@ -3194,6 +3434,7 @@ class DragManager:
             id(item) for item in getattr(self, "_interaction_artists", ())
         )
         if inventory_after != inventory_before:
+            self._invalidate_artist_rosters()
             self._invalidate_interaction_index()
 
     def _hide_preselection(self) -> None:
@@ -3756,6 +3997,7 @@ class DragManager:
             self._interaction_artist_ids = set()
         self._ensure_interaction_index()
         index_changed = False
+        roster_changed = False
         if parent is None:
             if isinstance(target, Legend):
                 parent = getattr(target, "parent", None)
@@ -3802,6 +4044,7 @@ class DragManager:
             self._interaction_artist_ids.add(id(target))
             self._draw_child_orders = {}
             index_changed = True
+            roster_changed = True
         if not TargetWrapper.supports_target(target):
             if (
                 id(target) not in self._selectable_artist_ids
@@ -3809,6 +4052,8 @@ class DragManager:
             ):
                 self._uneditable_artists.append(target)
                 self._uneditable_artist_ids.add(id(target))
+            if roster_changed:
+                self._invalidate_artist_rosters()
             if index_changed:
                 self._invalidate_interaction_index()
             return False
@@ -3816,10 +4061,13 @@ class DragManager:
             self._selectable_artists.append(target)
             self._selectable_artist_ids.add(id(target))
             index_changed = True
+            roster_changed = True
         target._pylustrator_explicitly_editable = True
         if not target.pickable():
             target.set_picker(True)
             index_changed = True
+        if roster_changed:
+            self._invalidate_artist_rosters()
         if index_changed:
             self._invalidate_interaction_index()
         if isinstance(target, Text):
@@ -3880,7 +4128,16 @@ class DragManager:
                 for label in (tick.label1, tick.label2):
                     if label.get_visible() and label.get_text() != "":
                         label._pylustrator_geometry_finalized_on_draw = True
+                        was_formatter_owned = bool(
+                            getattr(
+                                label,
+                                "_pylustrator_formatter_owned_tick_label",
+                                False,
+                            )
+                        )
                         label._pylustrator_formatter_owned_tick_label = True
+                        if not was_formatter_owned:
+                            self._marquee_roster_cache = None
                         # Draw events revisit the same Tick/Text identities very
                         # frequently. Registration and capability discovery are
                         # inventory work, not geometry invalidation work.
@@ -4148,21 +4405,18 @@ class DragManager:
                 primary = normalized[-1] if normalized else None
         return normalized, primary
 
-    @selection_geometry_snapshot()
     def get_hit_stack(self, event: MouseEvent) -> HitStack:
+        geometry = self._ensure_display_geometry_cache()
+        with geometry.snapshot():
+            return self._get_hit_stack(event)
+
+    def _get_hit_stack(self, event: MouseEvent) -> HitStack:
         """Return every visual hit from front to back using one draw-order model."""
 
-        selectable_ids = getattr(self, "_selectable_artist_ids", set())
-        interaction_artists = [
-            (artist, id(artist) in selectable_ids)
-            for artist in getattr(
-                self, "_interaction_artists", getattr(self, "_selectable_artists", [])
-            )
-        ]
-        registration_order = {
-            id(artist): index
-            for index, (artist, _editable) in enumerate(interaction_artists)
-        }
+        roster, editable_flags, registration_order = (
+            self._interaction_roster_snapshot()
+        )
+        artists = roster.artists
         child_orders: dict[int, dict[int, int]] = getattr(
             self, "_draw_child_orders", {}
         )
@@ -4180,8 +4434,8 @@ class DragManager:
                 }
             return child_orders[parent_key].get(id(child), fallback)
 
-        def pick_order(entry):
-            index, (artist, _editable) = entry
+        def pick_order(index):
+            artist = artists[index]
             path = []
             current = artist
             seen = set()
@@ -4201,18 +4455,20 @@ class DragManager:
                 current = parent
             return tuple(reversed(path)), index
 
-        artists = [artist for artist, _editable in interaction_artists]
-        candidate_indices = self._interaction_candidate_indices(event, artists)
-        candidate_entries = (
-            (index, interaction_artists[index]) for index in candidate_indices
+        candidate_indices = self._interaction_candidate_indices(
+            event,
+            artists,
+            source_ids=roster.source_ids,
         )
         ordered_entries = sorted(
-            ((pick_order(entry), entry) for entry in candidate_entries),
+            ((pick_order(index), index) for index in candidate_indices),
             key=lambda item: item[0],
             reverse=True,
         )
         hits: list[HitCandidate] = []
-        for draw_key, (index, (candidate, registered_editable)) in ordered_entries:
+        for draw_key, index in ordered_entries:
+            candidate = artists[index]
+            registered_editable = editable_flags[index]
             if not self._is_interaction_hit(
                 candidate,
                 event,
@@ -4391,9 +4647,19 @@ class DragManager:
             self.update_preselection(event)
 
     def _artist_intersects_bbox(
-        self, artist: Artist, x0: float, y0: float, x1: float, y1: float
+        self,
+        artist: Artist,
+        x0: float,
+        y0: float,
+        x1: float,
+        y1: float,
+        geometry: DisplayGeometryCache | None = None,
     ) -> bool:
-        bounds = self._artist_display_bounds(artist)
+        bounds = (
+            geometry.selection_bounds(artist)
+            if geometry is not None
+            else self._artist_display_bounds(artist)
+        )
         if bounds is None:
             return False
         return self._bounds_intersect(*bounds, x0, y0, x1, y1)
@@ -4439,21 +4705,57 @@ class DragManager:
     def select_elements_in_bbox(
         self, x0: float, y0: float, x1: float, y1: float, additive: bool = False
     ) -> list[Artist]:
-        with selection_geometry_snapshot():
-            return self._select_elements_in_bbox(x0, y0, x1, y1, additive)
+        geometry = self._ensure_display_geometry_cache()
+        with geometry.snapshot():
+            return self._select_elements_in_bbox(
+                x0, y0, x1, y1, additive, geometry=geometry
+            )
 
     def _select_elements_in_bbox(
-        self, x0: float, y0: float, x1: float, y1: float, additive: bool = False
+        self,
+        x0: float,
+        y0: float,
+        x1: float,
+        y1: float,
+        additive: bool = False,
+        *,
+        geometry: DisplayGeometryCache | None = None,
     ) -> list[Artist]:
         x0, x1 = sorted((float(x0), float(x1)))
         y0, y1 = sorted((float(y0), float(y1)))
+        if geometry is None:
+            geometry = self._ensure_display_geometry_cache()
+        if hasattr(self, "_selectable_artists"):
+            roster = self._marquee_roster_snapshot()
+            candidates = self._ensure_marquee_index().candidate_indices_for_bounds(
+                x0,
+                y0,
+                x1,
+                y1,
+                roster.artists,
+                revision=getattr(self, "_interaction_revision", 0),
+                bounds_provider=geometry.selection_bounds,
+                source_ids=roster.source_ids,
+            )
+            candidate_indices = (
+                range(len(roster.artists)) if candidates is None else candidates
+            )
+            candidate_artists = (
+                roster.artists[index]
+                for index in candidate_indices
+                if self._is_pick_candidate(roster.artists[index], explicit=True)
+            )
+        else:
+            # Preserve the lightweight legacy/test-double surface. Production
+            # managers always own the explicit revisioned roster above.
+            candidate_artists = self.iter_selectable_artists()
         # Formatter-owned tick labels are click-selectable for property edits,
         # but cannot participate in a rigid marquee transform.  Requiring an
         # explicit click also prevents one generated label from disabling an
         # otherwise movable mixed marquee selection.
         artists = [
             artist
-            for artist in self.iter_selectable_artists()
+            for artist in candidate_artists
             if not (
                 isinstance(artist, Text)
                 and (
@@ -4469,7 +4771,9 @@ class DragManager:
         elements = [
             artist
             for artist in artists
-            if self._artist_intersects_bbox(artist, x0, y0, x1, y1)
+            if self._artist_intersects_bbox(
+                artist, x0, y0, x1, y1, geometry=geometry
+            )
         ]
         prefer_containers = bool(getattr(self, "marquee_select_containers_only", False))
         if prefer_containers:
@@ -4513,6 +4817,7 @@ class DragManager:
                 additive=additive,
                 preserve_axes=prefer_containers,
                 prefer_containers=prefer_containers,
+                _prevalidated=True,
             )
         else:
             selected_elements = []
@@ -4661,13 +4966,17 @@ class DragManager:
         primary: Artist = None,
         preserve_axes: bool = False,
         prefer_containers: bool = False,
+        _prevalidated: bool = False,
     ):
         """Select one or more artists through the same model used by the canvas."""
         if additive:
             elements = [target.target for target in self.selection.targets] + list(
                 elements
             )
-        elements, primary = self._resolve_selectable_elements(elements, primary)
+        if _prevalidated:
+            elements = list(elements)
+        else:
+            elements, primary = self._resolve_selectable_elements(elements, primary)
         elements, primary = self._normalize_selection(
             elements,
             primary,
@@ -4687,8 +4996,10 @@ class DragManager:
         self.selection.clear_targets(
             preserve_rotation_pivot=same_membership
         )
+        self.selection.configure_target_overlay(len(elements))
 
         self.selection._batch_add_targets = True
+        self.selection._batch_targets_prevalidated = True
         try:
             for element in elements:
                 if element != primary:
@@ -4700,6 +5011,7 @@ class DragManager:
                 self.on_select(None, event)
         finally:
             self.selection._batch_add_targets = False
+            self.selection._batch_targets_prevalidated = False
         self.selected_element = primary
         if self.selection.targets:
             self.selection.update_extent()

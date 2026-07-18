@@ -19,7 +19,6 @@ from matplotlib.artist import Artist
 from matplotlib.text import Text
 from qtpy import QtCore, QtGui, QtWidgets
 
-from .artist_adapters import selection_geometry_snapshot
 from .smart_guides import (
     Axis,
     DisplayBounds,
@@ -33,7 +32,6 @@ from .smart_guides import (
     SnapPlan,
     StaleGuideSnapshotError,
 )
-from .snap import TargetWrapper
 
 
 def _finite_bounds(points) -> DisplayBounds | None:
@@ -120,11 +118,11 @@ def _scene_semantic_key(manager) -> tuple[str, tuple[int, ...]]:
 
 
 def _scene_state(manager):
-    artists = tuple(getattr(manager, "_selectable_artists", ()))
+    roster = manager._selectable_roster_snapshot()
     return (
-        artists,
+        roster.artists,
         _scene_revision(manager),
-        tuple(id(artist) for artist in artists),
+        roster.source_ids,
         _scene_semantic_key(manager),
     )
 
@@ -138,7 +136,7 @@ def _cache_matches(
     return (
         isinstance(cache, _SceneGuideCache)
         and cache.revision == revision
-        and cache.inventory_ids == inventory_ids
+        and cache.inventory_ids is inventory_ids
         and cache.semantic_key == semantic_key
     )
 
@@ -147,6 +145,7 @@ def _measure_scene_guide(
     manager,
     scene,
     renderer,
+    geometry,
     scope_id: str,
     order: int,
     artist: Artist,
@@ -169,9 +168,10 @@ def _measure_scene_guide(
             or (isinstance(artist, Text) and artist.get_text() == "")
         ):
             return None
-        bounds = _finite_bounds(TargetWrapper(artist).get_selection_points())
-        if bounds is None:
+        measured_bounds = geometry.selection_bounds(artist)
+        if measured_bounds is None:
             return None
+        bounds = DisplayBounds(*measured_bounds)
         baseline, anchors = _text_features(artist, renderer)
         z_order = float(artist.get_zorder())
         if not np.isfinite(z_order):
@@ -213,13 +213,14 @@ def _capture_scene_guides(manager) -> _SceneGuideCache:
     manager._smart_guide_pending_capture = None
     artists = tuple(_logical_source_artists(manager, artists))
     renderer = manager.figure.canvas.get_renderer()
+    geometry = manager._ensure_display_geometry_cache()
     scene = manager._ensure_editor_scene()
     entries: list[_SceneGuideEntry] = []
     scope_id = f"figure:{id(manager.figure)}"
-    with selection_geometry_snapshot():
+    with geometry.snapshot():
         for order, artist in enumerate(artists):
             entry = _measure_scene_guide(
-                manager, scene, renderer, scope_id, order, artist
+                manager, scene, renderer, geometry, scope_id, order, artist
             )
             if entry is not None:
                 entries.append(entry)
@@ -258,7 +259,7 @@ def schedule_smart_guide_warmup(manager, *, batch_budget_ms: float = 4.0) -> boo
     if (
         isinstance(pending, _PendingSceneGuideCapture)
         and pending.revision == revision
-        and pending.inventory_ids == inventory_ids
+        and pending.inventory_ids is inventory_ids
         and pending.semantic_key == semantic_key
     ):
         return False
@@ -289,21 +290,22 @@ def schedule_smart_guide_warmup(manager, *, batch_budget_ms: float = 4.0) -> boo
         )
         if (
             current_revision != pending.revision
-            or current_ids != pending.inventory_ids
+            or current_ids is not pending.inventory_ids
             or current_key != pending.semantic_key
         ):
             manager._smart_guide_pending_capture = None
             return
         renderer = manager.figure.canvas.get_renderer()
+        geometry = manager._ensure_display_geometry_cache()
         scene = manager._ensure_editor_scene()
         scope_id = f"figure:{id(manager.figure)}"
         deadline = perf_counter() + budget
-        with selection_geometry_snapshot():
+        with geometry.snapshot():
             while pending.next_index < len(pending.artists):
                 order, artist = pending.artists[pending.next_index]
                 pending.next_index += 1
                 entry = _measure_scene_guide(
-                    manager, scene, renderer, scope_id, order, artist
+                    manager, scene, renderer, geometry, scope_id, order, artist
                 )
                 if entry is not None:
                     pending.entries.append(entry)

@@ -32,14 +32,18 @@ class DisplaySpaceHitIndex:
         *,
         cell_size: float = 64.0,
         max_cells_per_artist: int = 4096,
+        max_query_cells: int = 65536,
     ) -> None:
         cell_size = float(cell_size)
         if not np.isfinite(cell_size) or cell_size <= 0.0:
             raise ValueError("cell_size must be finite and positive")
         if int(max_cells_per_artist) <= 0:
             raise ValueError("max_cells_per_artist must be positive")
+        if int(max_query_cells) <= 0:
+            raise ValueError("max_query_cells must be positive")
         self.cell_size = cell_size
         self.max_cells_per_artist = int(max_cells_per_artist)
+        self.max_query_cells = int(max_query_cells)
         self._built_revision: Optional[int] = None
         self._source_ids: tuple[int, ...] = ()
         self._cells: dict[tuple[int, int], tuple[int, ...]] = {}
@@ -117,6 +121,51 @@ class DisplaySpaceHitIndex:
         self._built_revision = int(revision)
         self._failed_key = None
 
+    def _ensure_current(
+        self,
+        artists: Sequence[Artist],
+        *,
+        revision: int,
+        source_ids: tuple[int, ...] | None,
+        bounds_provider: BoundsProvider,
+    ) -> bool:
+        """Build once for the supplied allocation-stable roster identity."""
+
+        if source_ids is None:
+            source_ids = tuple(id(artist) for artist in artists)
+        elif len(source_ids) != len(artists):
+            return False
+        revision = int(revision)
+        key = revision, source_ids
+        current = self._built_revision == revision and self._source_ids is source_ids
+        if not current:
+            # External callers are allowed to provide an equal tuple rather
+            # than the exact cached object.  Manager hot paths always reuse the
+            # identical object and avoid this potentially large comparison.
+            current = (
+                self._built_revision == revision and self._source_ids == source_ids
+            )
+        if current:
+            return True
+        if self._failed_key == key:
+            return False
+        try:
+            self._build(
+                artists,
+                revision=revision,
+                source_ids=source_ids,
+                bounds_provider=bounds_provider,
+            )
+        except Exception:
+            # Never retain or query a partial/stale snapshot after failure.
+            self._built_revision = None
+            self._source_ids = ()
+            self._cells = {}
+            self._always = ()
+            self._failed_key = key
+            return False
+        return True
+
     def candidate_indices(
         self,
         x: float,
@@ -125,6 +174,7 @@ class DisplaySpaceHitIndex:
         *,
         revision: int,
         bounds_provider: BoundsProvider,
+        source_ids: tuple[int, ...] | None = None,
     ) -> Optional[tuple[int, ...]]:
         """Return conservative source indices, or ``None`` for a full scan."""
 
@@ -135,28 +185,13 @@ class DisplaySpaceHitIndex:
         if not np.isfinite(x) or not np.isfinite(y):
             return None
 
-        source_ids = tuple(id(artist) for artist in artists)
-        revision = int(revision)
-        key = revision, source_ids
-        current = self._built_revision == revision and self._source_ids == source_ids
-        if not current:
-            if self._failed_key == key:
-                return None
-            try:
-                self._build(
-                    artists,
-                    revision=revision,
-                    source_ids=source_ids,
-                    bounds_provider=bounds_provider,
-                )
-            except Exception:
-                # Never retain or query a partial/stale snapshot after failure.
-                self._built_revision = None
-                self._source_ids = ()
-                self._cells = {}
-                self._always = ()
-                self._failed_key = key
-                return None
+        if not self._ensure_current(
+            artists,
+            revision=revision,
+            source_ids=source_ids,
+            bounds_provider=bounds_provider,
+        ):
+            return None
 
         cell = (floor(x / self.cell_size), floor(y / self.cell_size))
         local = self._cells.get(cell, ())
@@ -167,3 +202,43 @@ class DisplaySpaceHitIndex:
         # Indexed and always-tested items are disjoint.  Source-order sorting
         # makes the result deterministic and keeps downstream stable ordering.
         return tuple(sorted((*self._always, *local)))
+
+    def candidate_indices_for_bounds(
+        self,
+        x0: float,
+        y0: float,
+        x1: float,
+        y1: float,
+        artists: Sequence[Artist],
+        *,
+        revision: int,
+        bounds_provider: BoundsProvider,
+        source_ids: tuple[int, ...] | None = None,
+    ) -> Optional[Sequence[int]]:
+        """Return a conservative roster subset intersecting a display bbox."""
+
+        try:
+            x0, x1 = sorted((float(x0), float(x1)))
+            y0, y1 = sorted((float(y0), float(y1)))
+        except (TypeError, ValueError):
+            return None
+        if not np.all(np.isfinite((x0, y0, x1, y1))):
+            return None
+        if not self._ensure_current(
+            artists,
+            revision=revision,
+            source_ids=source_ids,
+            bounds_provider=bounds_provider,
+        ):
+            return None
+
+        ix0, iy0 = floor(x0 / self.cell_size), floor(y0 / self.cell_size)
+        ix1, iy1 = floor(x1 / self.cell_size), floor(y1 / self.cell_size)
+        cell_count = (ix1 - ix0 + 1) * (iy1 - iy0 + 1)
+        if cell_count > self.max_query_cells:
+            return range(len(artists))
+        found = set(self._always)
+        for ix in range(ix0, ix1 + 1):
+            for iy in range(iy0, iy1 + 1):
+                found.update(self._cells.get((ix, iy), ()))
+        return tuple(sorted(found))

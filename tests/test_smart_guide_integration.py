@@ -598,6 +598,46 @@ def test_text_guides_capture_insertion_anchor_and_unrotated_baseline() -> None:
     plt.close(fig)
 
 
+def test_hit_and_guides_share_one_renderer_revision_geometry_measurement() -> None:
+    fig = plt.figure(figsize=(4, 3), dpi=100)
+    rectangle = _figure_rectangle(fig, (0.2, 0.3, 0.2, 0.2))
+    fig.canvas.draw()
+    calls = 0
+    original_get_window_extent = rectangle.get_window_extent
+
+    def counted_get_window_extent(renderer=None):
+        nonlocal calls
+        calls += 1
+        return original_get_window_extent(renderer)
+
+    rectangle.get_window_extent = counted_get_window_extent
+    manager = _attach_manager(fig)
+    x, y = fig.transFigure.transform((0.3, 0.4))
+    event = _event(fig, "button_press_event", float(x), float(y))
+
+    assert rectangle in manager.get_hit_stack(event).artists
+    _capture_scene_guides(manager)
+
+    geometry = manager._ensure_display_geometry_cache()
+    assert calls == 1
+    assert geometry.revision == manager._interaction_revision
+    assert geometry.renderer is fig.canvas.get_renderer()
+    assert geometry.roster is manager._selectable_roster_snapshot()
+
+    geometry.bind(
+        revision=manager._interaction_revision,
+        roster=manager._selectable_roster_snapshot(),
+        renderer=object(),
+    )
+    assert geometry.selection_bounds(rectangle) is not None
+    assert calls == 2
+
+    manager.invalidate_geometry_cache()
+    _capture_scene_guides(manager)
+    assert calls == 3
+    plt.close(fig)
+
+
 def test_formatter_owned_tick_labels_are_not_unstable_guide_sources() -> None:
     fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
     ax.plot([0, 1], [0, 1])

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from time import perf_counter
 from types import SimpleNamespace
 
 import matplotlib
@@ -4572,7 +4573,7 @@ def test_drag_rectangle_omits_containing_axes_by_default() -> None:
     assert app is not None
 
 
-def test_marquee_reuses_one_geometry_snapshot_per_artist_and_action() -> None:
+def test_marquee_reuses_revision_geometry_until_explicit_invalidation() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
     rectangle = ax.add_patch(
@@ -4595,7 +4596,89 @@ def test_marquee_reuses_one_geometry_snapshot_per_artist_and_action() -> None:
     assert calls == 1
 
     manager.select_elements_in_bbox(*bounds)
+    assert calls == 1
+
+    manager.invalidate_geometry_cache()
+    manager.select_elements_in_bbox(*bounds)
     assert calls == 2
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_marquee_spatial_index_preserves_targets_without_full_roster_scan() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig = plt.figure(figsize=(8, 6), dpi=100)
+    rectangles = []
+    for ix in range(25):
+        for iy in range(16):
+            rectangle = Rectangle(
+                (ix / 25 + 0.004, iy / 16 + 0.004),
+                0.018,
+                0.025,
+                transform=fig.transFigure,
+            )
+            fig.add_artist(rectangle)
+            rectangles.append(rectangle)
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    target = rectangles[8 * 16 + 7]
+    bounds = artist_visible_extent(target)
+    calls = 0
+    original_pick_candidate = manager._is_pick_candidate
+
+    def counted_pick_candidate(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_pick_candidate(*args, **kwargs)
+
+    manager._is_pick_candidate = counted_pick_candidate
+    selected = manager.select_elements_in_bbox(*bounds)
+
+    assert selected == [target]
+    assert calls < len(rectangles) // 10
+    assert manager._marquee_index.built_revision == manager._interaction_revision
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_large_selection_uses_constant_overlay_items_and_fast_warm_reselect() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig = plt.figure(figsize=(8, 6), dpi=100)
+    texts = [
+        fig.text((index % 25) / 25, (index // 25) / 15, str(index), fontsize=4)
+        for index in range(365)
+    ]
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+
+    start = perf_counter()
+    selected = manager.select_elements_in_bbox(*fig.bbox.extents)
+    cold_elapsed = perf_counter() - start
+
+    assert selected == texts
+    assert manager.selection.targets_rects == []
+    overlay_items = manager.selection._batched_selection_overlay_items
+    assert len(overlay_items) == 3
+    assert overlay_items[0].path().elementCount() == 5 * len(texts)
+    assert overlay_items[2].path().isEmpty()
+    assert cold_elapsed < 0.100
+
+    manager.selection.set_alignment_reference("key_object", key=texts[0])
+    assert overlay_items[0].path().elementCount() == 5 * (len(texts) - 1)
+    assert overlay_items[2].path().elementCount() == 5
+    assert overlay_items[2].pen().width() == 5
+
+    start = perf_counter()
+    manager.select_elements_in_bbox(*fig.bbox.extents)
+    assert perf_counter() - start < 0.050
+
+    manager.selection.clear_targets()
+    assert all(item.scene() is None for item in overlay_items)
+    manager.select_elements(texts[:2], primary=texts[1])
+    assert len(manager.selection.targets_rects) == 4
+    assert manager.selection._batched_selection_overlay_items == []
     manager.selection.clear_targets()
     plt.close(fig)
     assert app is not None

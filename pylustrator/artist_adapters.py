@@ -126,15 +126,21 @@ def legend_owner_snapshot():
 
 
 @contextmanager
-def selection_geometry_snapshot():
-    """Reuse one immutable geometry measurement during a selection action."""
+def selection_geometry_snapshot(cache: dict | None = None):
+    """Reuse one immutable geometry measurement during a selection action.
+
+    A caller-owned cache may span several read-only interaction phases that
+    belong to the same renderer revision.  Nested callers always reuse the
+    active cache, so mutation/preview code cannot accidentally switch snapshots
+    midway through one operation.
+    """
 
     with legend_owner_snapshot():
         existing = _SELECTION_GEOMETRY_CACHE.get()
         if existing is not None:
             yield existing
             return
-        cache = {}
+        cache = {} if cache is None else cache
         token = _SELECTION_GEOMETRY_CACHE.set(cache)
         try:
             yield cache
