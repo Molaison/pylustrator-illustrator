@@ -3104,7 +3104,14 @@ class TextAdapter(ArtistAdapter):
             )
         if (
             operation is TransformOperation.TRANSLATE
-            and axis_tick_label_reference(self.target) is not None
+            and (
+                getattr(
+                    self.target,
+                    "_pylustrator_formatter_owned_tick_label",
+                    False,
+                )
+                or axis_tick_label_reference(self.target) is not None
+            )
         ):
             return OperationSupport.denied(
                 operation,

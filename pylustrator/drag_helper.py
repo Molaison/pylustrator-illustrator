@@ -3580,7 +3580,11 @@ class DragManager:
                     if label.get_visible() and label.get_text() != "":
                         label._pylustrator_geometry_finalized_on_draw = True
                         label._pylustrator_formatter_owned_tick_label = True
-                        self.make_draggable(label, axes)
+                        # Draw events revisit the same Tick/Text identities very
+                        # frequently. Registration and capability discovery are
+                        # inventory work, not geometry invalidation work.
+                        if id(label) not in self._interaction_artist_ids:
+                            self.make_draggable(label, axes)
 
     def make_figure_draggable(self, fig: Figure | SubFigure) -> None:
         for artist in fig.artists:
@@ -4151,7 +4155,14 @@ class DragManager:
             for artist in self.iter_selectable_artists()
             if not (
                 isinstance(artist, Text)
-                and axis_tick_label_reference(artist) is not None
+                and (
+                    getattr(
+                        artist,
+                        "_pylustrator_formatter_owned_tick_label",
+                        False,
+                    )
+                    or axis_tick_label_reference(artist) is not None
+                )
             )
         ]
         elements = [
