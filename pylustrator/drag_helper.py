@@ -2657,7 +2657,71 @@ class DragManager:
     selected_element = None
     grab_element = None
 
-    def __init__(self, figure: Figure, no_save):
+    @staticmethod
+    def _capture_figure_structure(figure: Figure) -> tuple[int, ...]:
+        """Capture the explicit Artist inventory defining an editor session.
+
+        Renderer-managed ticks are deliberately excluded because an ordinary
+        draw may materialize them. Replacing Axes or direct Figure/Axes
+        children through ``clf`` or external mutation requires a fresh manager
+        and source tracker even when the Figure object itself is reused.
+        """
+
+        result: list[int] = []
+        seen: set[int] = set()
+
+        def add(artist) -> bool:
+            if artist is None or id(artist) in seen:
+                return False
+            seen.add(id(artist))
+            result.append(id(artist))
+            return True
+
+        def add_axes(axes) -> None:
+            if not add(axes):
+                return
+            add(getattr(axes, "legend_", None))
+            for name in ("title", "_left_title", "_right_title"):
+                add(getattr(axes, name, None))
+            add(axes.xaxis.get_label())
+            add(axes.yaxis.get_label())
+            for name in (
+                "artists",
+                "texts",
+                "patches",
+                "lines",
+                "collections",
+                "images",
+            ):
+                for artist in getattr(axes, name, ()):
+                    add(artist)
+            for child in getattr(axes, "child_axes", ()):
+                add_axes(child)
+
+        def add_owner(owner) -> None:
+            add(owner)
+            for name in ("artists", "texts", "patches", "legends"):
+                for artist in getattr(owner, name, ()):
+                    add(artist)
+            for subfigure in getattr(owner, "subfigs", ()):
+                add_owner(subfigure)
+            for axes in getattr(owner, "axes", ()):
+                add_axes(axes)
+
+        add_owner(figure)
+        return tuple(result)
+
+    def _refresh_figure_structure_signature(self) -> tuple[int, ...]:
+        signature = self._capture_figure_structure(self.figure)
+        self._figure_structure_signature = signature
+        return signature
+
+    def figure_structure_matches(self) -> bool:
+        return getattr(self, "_figure_structure_signature", None) == (
+            self._capture_figure_structure(self.figure)
+        )
+
+    def __init__(self, figure: Figure, no_save, source_stack_position=None):
         self.figure = figure
         previous = getattr(figure, "figure_dragger", None)
         if previous is not None and previous is not self:
@@ -2712,8 +2776,13 @@ class DragManager:
         self.selection = GrabbableRectangleSelection(figure, figure._pyl_scene)
         self._selection_callback_canvas = figure.canvas
         self.figure.selection = self.selection
-        self.change_tracker = ChangeTracker(figure, no_save)
+        self.change_tracker = ChangeTracker(
+            figure,
+            no_save,
+            source_stack_position=source_stack_position,
+        )
         self.figure.change_tracker = self.change_tracker
+        self._refresh_figure_structure_signature()
         schedule_smart_guide_warmup(self)
 
     def _ensure_interaction_index(self) -> DisplaySpaceHitIndex:

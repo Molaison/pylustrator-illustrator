@@ -219,19 +219,28 @@ def _managed_figures():
 
 def _live_window(figure):
     window = getattr(figure, "window", None)
+    manager = getattr(figure, "figure_dragger", None)
+    structure_matches = getattr(manager, "figure_structure_matches", None)
     if (
         isinstance(window, PlotWindow)
         and not getattr(window, "_deactivated", False)
         and window.owns_figure(figure)
+        and manager is not None
+        and callable(structure_matches)
+        and structure_matches()
     ):
         return window
     return None
 
 
-def _prepare_figure(window, figure):
+def _prepare_figure(window, figure, *, source_stack_position=None):
     """Attach one Figure to one window exactly once."""
 
-    current_window = _live_window(figure)
+    current_window = getattr(figure, "window", None)
+    if not isinstance(current_window, PlotWindow) or getattr(
+        current_window, "_deactivated", False
+    ):
+        current_window = None
     if current_window is not None and current_window is not window:
         current_window.deactivate()
 
@@ -245,7 +254,11 @@ def _prepare_figure(window, figure):
     window.setFigure(figure)
     init_figure(figure)
     warnAboutTicks(figure)
-    manager = DragManager(figure, no_save_allowed)
+    manager = DragManager(
+        figure,
+        no_save_allowed,
+        source_stack_position=source_stack_position,
+    )
     configure = getattr(window, "configure_figure_manager", None)
     if configure is not None:
         configure(figure)
@@ -265,11 +278,29 @@ def _set_windows_app_id() -> None:
 def pyl_show(hide_window: bool = False):
     """Open all pyplot figures in one reusable Pylustrator window."""
 
+    source_stack_position = traceback.extract_stack()[-2]
     _set_windows_app_id()
     application = _ensure_application()
     managed_figures = _managed_figures()
     if not managed_figures:
         return None
+
+    attached_windows = {
+        window
+        for figure in managed_figures
+        if isinstance((window := getattr(figure, "window", None)), PlotWindow)
+        and not getattr(window, "_deactivated", False)
+    }
+    # A stale Figure invalidates its shared multi-Figure window. Tear it down
+    # before iteration so an earlier fresh Figure is not detached after its
+    # turn has already passed.
+    if any(
+        getattr(figure, "window", None) in attached_windows
+        and _live_window(figure) is None
+        for figure in managed_figures
+    ):
+        for attached in attached_windows:
+            attached.deactivate()
 
     existing_windows = {
         window
@@ -282,7 +313,11 @@ def pyl_show(hide_window: bool = False):
         else PlotWindow()
     )
     for figure in managed_figures:
-        _prepare_figure(window, figure)
+        _prepare_figure(
+            window,
+            figure,
+            source_stack_position=source_stack_position,
+        )
         window.addFigure(figure)
     if not hide_window:
         window.show()
@@ -294,6 +329,7 @@ def show(hide_window: bool = False):
     """the function overloads the matplotlib show function.
     It opens a DragManager window instead of the default matplotlib window.
     """
+    source_stack_position = traceback.extract_stack()[-2]
     _set_windows_app_id()
     application = _ensure_application()
     windows = []
@@ -303,7 +339,11 @@ def show(hide_window: bool = False):
                 setFigureVariableNames(figure_number)
             figure = manager.canvas.figure
             window = _live_window(figure) or PlotWindow()
-            _prepare_figure(window, figure)
+            _prepare_figure(
+                window,
+                figure,
+                source_stack_position=source_stack_position,
+            )
             if window not in windows:
                 windows.append(window)
             if not hide_window:

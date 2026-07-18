@@ -111,6 +111,46 @@ def test_show_close_and_reopen_has_one_live_session() -> None:
         QtGuiDrag.no_save_allowed = original_no_save
 
 
+def test_replaced_figure_structure_starts_fresh_session_in_caller_source() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    original_show = plt.show
+    original_no_save = QtGuiDrag.no_save_allowed
+    _close_all_windows()
+    try:
+        QtGuiDrag.initialize(disable_save=True)
+        fig, old_axes = plt.subplots()
+        (old_line,) = old_axes.plot([0.1, 0.9], [0.2, 0.8])
+        old_window, = QtGuiDrag.show(hide_window=True)
+        old_manager = fig.figure_dragger
+
+        assert old_manager.figure_structure_matches()
+        assert old_line in old_manager._interaction_artists
+        assert old_manager.change_tracker.stack_position.filename == __file__
+
+        fig.clear()
+        new_axes = fig.subplots()
+        (new_line,) = new_axes.plot([0.2, 0.8], [0.7, 0.3])
+        fig.canvas.draw()
+        assert not old_manager.figure_structure_matches()
+
+        new_window, = QtGuiDrag.show(hide_window=True)
+
+        assert old_window._deactivated
+        assert new_window is not old_window
+        assert fig.figure_dragger is not old_manager
+        assert new_line in fig.figure_dragger._interaction_artists
+        assert old_line not in fig.figure_dragger._interaction_artists
+        assert fig.figure_dragger.figure_structure_matches()
+        assert fig.change_tracker.stack_position.filename == __file__
+        new_window.deactivate()
+        new_window.deleteLater()
+    finally:
+        _close_all_windows()
+        _flush_deferred_deletes(app)
+        plt.show = original_show
+        QtGuiDrag.no_save_allowed = original_no_save
+
+
 def test_drag_manager_activate_deactivate_is_idempotent() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     original_no_save = QtGuiDrag.no_save_allowed

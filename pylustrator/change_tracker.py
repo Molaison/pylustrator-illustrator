@@ -494,7 +494,7 @@ class ChangeTracker:
 
     update_changes_signal = None
 
-    def __init__(self, figure: Figure, no_save):
+    def __init__(self, figure: Figure, no_save, source_stack_position=None):
         global stack_position
         self.figure = figure
         self.edits = []
@@ -509,9 +509,18 @@ class ChangeTracker:
 
         # store the position where StartPylustrator was called
         if custom_stack_position is None:
-            stack_position = traceback.extract_stack()[-4]
+            stack_position = (
+                source_stack_position
+                if source_stack_position is not None
+                else traceback.extract_stack()[-4]
+            )
         else:
             stack_position = custom_stack_position
+        # Keep source ownership per tracker.  A module-global position made a
+        # second Figure redirect saves from the first Figure, and helper layers
+        # inserted between ``show`` and ``DragManager`` could redirect output
+        # into Pylustrator's own source file.
+        self.stack_position = stack_position
 
         self.fig_inch_size = self.figure.get_size_inches()
 
@@ -1144,11 +1153,14 @@ class ChangeTracker:
 
         self.get_reference_cached = {}
 
-        block, lineno = getTextFromFile(getReference(self.figure), stack_position)
+        source_position = getattr(
+            self, "stack_position", globals().get("stack_position")
+        )
+        block, lineno = getTextFromFile(getReference(self.figure), source_position)
         if not block:
             block, lineno = getTextFromFile(
                 getReference(self.figure, allow_using_variable_names=False),
-                stack_position,
+                source_position,
             )
         for line in block:
             try:
@@ -1428,12 +1440,15 @@ class ChangeTracker:
             "#% end: automatic generated code from pylustrator" + custom_append
         )
         block_id = getReference(self.figure)
-        block = getTextFromFile(block_id, stack_position)
+        source_position = getattr(
+            self, "stack_position", globals().get("stack_position")
+        )
+        block = getTextFromFile(block_id, source_position)
         if not block:
             block_id = getReference(self.figure, allow_using_variable_names=False)
-            block = getTextFromFile(block_id, stack_position)
+            block = getTextFromFile(block_id, source_position)
         try:
-            insertTextToFile(output, stack_position, block_id)
+            insertTextToFile(output, source_position, block_id)
         except FileNotFoundError:
             print(
                 "WARNING: no file to save the changes was found; generated "
