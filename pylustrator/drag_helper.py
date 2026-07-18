@@ -3924,8 +3924,90 @@ class DragManager:
             "Change stacking order"
         )
 
+    def _prune_detached_interaction_artists(self) -> int:
+        """Release externally removed Artists at the authoritative draw boundary.
+
+        Editor delete keeps undoable objects attached and merely hidden, so it
+        is unaffected.  This only removes Artists that Matplotlib (or a removed
+        semantic parent) has actually detached from the live figure.
+        """
+
+        interaction = list(getattr(self, "_interaction_artists", ()))
+        if not interaction:
+            return 0
+        detached_ids = {
+            id(artist) for artist in interaction if not self._is_artist_attached(artist)
+        }
+        parent_map = getattr(self, "_selection_parent_by_id", {})
+        for artist in interaction:
+            current = parent_map.get(id(artist))
+            seen = set()
+            while current is not None and id(current) not in seen:
+                if id(current) in detached_ids or getattr(current, "figure", None) is None:
+                    detached_ids.add(id(artist))
+                    break
+                seen.add(id(current))
+                current = parent_map.get(id(current))
+
+        scene = getattr(self, "editor_scene", None)
+        if scene is not None:
+            for group in list(scene.groups.values()):
+                group.members = [
+                    member for member in group.members if id(member) not in detached_ids
+                ]
+                if not group.members:
+                    scene.remove_group(group)
+                    detached_ids.add(id(group))
+        if not detached_ids:
+            return 0
+
+        def keep(items):
+            return [item for item in items if id(item) not in detached_ids]
+
+        self._interaction_artists = keep(interaction)
+        self._interaction_artist_ids = {
+            id(item) for item in self._interaction_artists
+        }
+        self._selectable_artists = keep(
+            list(getattr(self, "_selectable_artists", ()))
+        )
+        self._selectable_artist_ids = {
+            id(item) for item in self._selectable_artists
+        }
+        self._uneditable_artists = keep(
+            list(getattr(self, "_uneditable_artists", ()))
+        )
+        self._uneditable_artist_ids = {
+            id(item) for item in self._uneditable_artists
+        }
+        self._selection_parent_by_id = {
+            key: parent
+            for key, parent in parent_map.items()
+            if key not in detached_ids and id(parent) not in detached_ids
+        }
+        if scene is not None:
+            for key in detached_ids:
+                scene._known_artists.pop(key, None)
+                scene._logical_parent_by_id.pop(key, None)
+                scene._locked_ids.discard(key)
+                scene._explicitly_hidden_ids.discard(key)
+
+        selection = getattr(self, "selection", None)
+        if selection is not None:
+            for target in list(selection.targets):
+                if id(target.target) in detached_ids:
+                    selection.remove_target(target.target)
+        if id(getattr(self, "selected_element", None)) in detached_ids:
+            remaining = [target.target for target in getattr(selection, "targets", ())]
+            self.selected_element = remaining[-1] if remaining else None
+        if id(getattr(self, "preselection_artist", None)) in detached_ids:
+            self._hide_preselection()
+        self._invalidate_artist_rosters()
+        return len(detached_ids)
+
     def invalidate_geometry_cache(self, _event=None):
         """Drop visible-bound caches after any render/transform change."""
+        self._prune_detached_interaction_artists()
         for artist in getattr(self, "_selectable_artists", []):
             setattr(artist, "_pylustrator_cached_get_extend", None)
         # Child list order is part of the authoritative paint/hit order and can
@@ -4814,7 +4896,17 @@ class DragManager:
                         )
                     )
                 ]
-            elements = self._ensure_selection_kernel().map_artists(elements)
+            validated_ids = {id(element) for element in elements}
+            mapped = self._ensure_selection_kernel().map_artists(elements)
+            # Object Selection may promote a validated leaf to a logical
+            # group. The group is a distinct transform target and must pass
+            # attachment/lock/capability/geometry checks in its own right.
+            elements = [
+                element
+                for element in mapped
+                if id(element) in validated_ids
+                or self._is_pick_candidate(element, explicit=True)
+            ]
         if elements or not additive:
             selected_elements = self.select_elements(
                 elements,

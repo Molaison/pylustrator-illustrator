@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import gc
 from time import perf_counter
 from types import SimpleNamespace
+import weakref
 
 import matplotlib
 
@@ -605,6 +607,37 @@ def test_direct_marquee_skips_empty_logical_group_bounds() -> None:
     manager.set_selection_mode(SelectionMode.DIRECT)
     assert manager.select_elements_in_bbox(x - 1, y - 1, x + 1, y + 1) == []
     assert manager.selection.targets == []
+    plt.close(fig)
+    assert app is not None
+
+
+def test_marquee_revalidates_leaf_promoted_to_logical_group() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    first = ax.add_patch(Rectangle((0.15, 0.2), 0.25, 0.3, zorder=3))
+    second = ax.add_patch(Rectangle((0.55, 0.2), 0.25, 0.3, zorder=3))
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_elements([first, second], primary=second)
+    group = manager.group_selection("Pair")
+    manager.selection.clear_targets()
+    manager.selected_element = None
+    original_has_geometry = manager._artist_has_selection_geometry
+
+    def group_has_no_valid_geometry(artist):
+        return False if artist is group else original_has_geometry(artist)
+
+    manager._artist_has_selection_geometry = group_has_no_valid_geometry
+    bounds = artist_visible_extent(first)
+    selected = manager.select_elements_in_bbox(*bounds)
+
+    assert selected == []
+    assert manager.selection.targets == []
+
+    manager._artist_has_selection_geometry = original_has_geometry
+    manager.editor_scene.set_locked([group], True)
+    assert manager.select_elements_in_bbox(*bounds) == []
+    manager.selection.clear_targets()
     plt.close(fig)
     assert app is not None
 
@@ -4712,12 +4745,58 @@ def test_large_selection_uses_constant_overlay_items_and_fast_warm_reselect() ->
     manager.select_elements_in_bbox(*fig.bbox.extents)
     assert perf_counter() - start < 0.050
 
+    manager.selection.update_selection_rectangles(target_indices=(0, len(texts) - 1))
+    manager.selection.refresh_targets_after_draw((0, len(texts) - 1))
+    manager.selection.remove_target(texts[0])
+    assert len(manager.selection.targets) == len(texts) - 1
+    assert manager.selection.targets_rects == []
+    assert manager.selection._batched_selection_overlay_items == overlay_items
+    assert overlay_items[2].path().isEmpty()
+
     manager.selection.clear_targets()
     assert all(item.scene() is None for item in overlay_items)
     manager.select_elements(texts[:2], primary=texts[1])
     assert len(manager.selection.targets_rects) == 4
     assert manager.selection._batched_selection_overlay_items == []
     manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_draw_invalidation_releases_externally_removed_artist_rosters() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    rectangle = ax.add_patch(Rectangle((0.2, 0.25), 0.3, 0.35))
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    rectangle_id = id(rectangle)
+    reference = weakref.ref(rectangle)
+    bounds = artist_visible_extent(rectangle)
+    event = MouseEvent(
+        "button_press_event",
+        fig.canvas,
+        (bounds[0] + bounds[2]) / 2,
+        (bounds[1] + bounds[3]) / 2,
+        button=1,
+    )
+    assert rectangle in manager.get_hit_stack(event).artists
+    assert rectangle in manager._selectable_roster_snapshot().artists
+    assert rectangle_id in manager.editor_scene._known_artists
+
+    rectangle.remove()
+    manager.invalidate_geometry_cache()
+
+    assert rectangle not in manager._interaction_artists
+    assert rectangle not in manager._selectable_artists
+    assert rectangle not in manager._interaction_roster_snapshot()[0].artists
+    assert rectangle not in manager._selectable_roster_snapshot().artists
+    assert rectangle_id not in manager.editor_scene._known_artists
+    assert rectangle_id not in manager._selection_parent_by_id
+    assert manager._display_geometry_cache.roster is None
+
+    del rectangle
+    gc.collect()
+    assert reference() is None
     plt.close(fig)
     assert app is not None
 
