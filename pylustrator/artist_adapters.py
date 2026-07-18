@@ -2016,6 +2016,7 @@ class ArtistAdapter:
             planned_native = self.point_array(
                 self.canonicalize_native_control_points(planned_native)
             )
+            self.validate_native_control_points(planned_native)
             representable_control = self.point_array(
                 self.native_to_display(planned_native)
             )
@@ -2097,26 +2098,145 @@ class ArtistAdapter:
         )
 
     def rigid_rotation_source_fingerprint(self):
-        """Return an inexpensive token used to reject stale absolute plans."""
+        """Return a stable token for source semantics not visible in controls.
 
+        Generic geometry is re-planned from the live source at commit instead
+        of byte-hashing display floats that may drift by an ulp after preview
+        restoration. Adapters such as Line2D override this hook when hidden raw
+        storage also needs exact protection.
+        """
+
+        if self.rigid_rotation_uses_native_angle():
+            return "native-angle", float(self.rotation())
         return None
 
     def validate_rigid_rotation_plan_source(self, plan: RigidRotationPlan) -> None:
         """Reject a plan whose source storage changed after preflight."""
 
-    def apply_rigid_rotation_plan(
-        self, plan: RigidRotationPlan, *, record_changes: bool = True
+        if plan.source_fingerprint != self.rigid_rotation_source_fingerprint():
+            raise UnsupportedArtistError(
+                f"{type(self.target).__name__} source semantics changed after "
+                "rigid-rotation preflight; discard the stale plan and start a "
+                "new gesture"
+            )
+
+    @staticmethod
+    def _validate_rigid_rotation_display_destination(
+        expected, actual, *, operation: str
     ) -> None:
+        """Require one live display destination to match its frozen preview."""
+
+        expected = np.asarray(expected, dtype=float)
+        actual = np.asarray(actual, dtype=float)
+        expected_finite = np.isfinite(expected)
+        actual_finite = np.isfinite(actual)
+        structure_matches = bool(
+            expected.shape == actual.shape
+            and np.array_equal(expected_finite, actual_finite)
+            and np.array_equal(np.isnan(expected), np.isnan(actual))
+            and np.array_equal(np.isposinf(expected), np.isposinf(actual))
+            and np.array_equal(np.isneginf(expected), np.isneginf(actual))
+        )
+        if expected.shape == actual.shape and np.any(expected_finite):
+            error = float(
+                np.max(
+                    np.abs(
+                        expected[expected_finite]
+                        - actual[expected_finite]
+                    )
+                )
+            )
+        elif structure_matches:
+            error = 0.0
+        else:
+            error = float("inf")
+        if not structure_matches or error > 0.25:
+            raise UnsupportedArtistError(
+                f"{operation} changed after rigid-rotation preflight; its live "
+                "destination no longer matches the frozen preview within "
+                f"0.25 px (error {error:.6g} px)"
+            )
+
+    def revalidate_rigid_rotation_plan(
+        self, plan: RigidRotationPlan
+    ) -> RigidRotationPlan:
+        """Recompute a frozen rotation destination before any mutation.
+
+        Source fingerprints remain a cheap first line of defence.  The live
+        planner is then authoritative: it regenerates both native payload and
+        visible paint from the current transform, appearance, clipping, and
+        renderer state.  Commit accepts that candidate only when its display
+        destination still matches the immutable preview.
+        """
+
         if plan.target is not self.target:
             raise ValueError("Rigid-rotation plan belongs to another artist")
         support = self.operation_support(TransformOperation.RIGID_ROTATE)
         if not support.supported:
             raise UnsupportedArtistError(support.reason)
         self.validate_rigid_rotation_plan_source(plan)
+        try:
+            source_control = self.point_array(self.control_points())
+            source_selection = self.point_array(self.selection_points())
+            candidate = self.plan_rigid_rotation(
+                plan.angle_degrees,
+                plan.pivot,
+                control_points=source_control,
+                selection_points=source_selection,
+            )
+            self._validate_rigid_rotation_display_destination(
+                plan.control_array(),
+                candidate.control_array(),
+                operation=f"{type(self.target).__name__} native/display mapping",
+            )
+            self._validate_rigid_rotation_display_destination(
+                plan.selection_array(),
+                candidate.selection_array(),
+                operation=f"{type(self.target).__name__} visible paint envelope",
+            )
+        except UnsupportedArtistError:
+            raise
+        except (
+            AttributeError,
+            IndexError,
+            OverflowError,
+            TypeError,
+            ValueError,
+            NotImplementedError,
+            RuntimeError,
+            ZeroDivisionError,
+            np.linalg.LinAlgError,
+        ) as error:
+            raise UnsupportedArtistError(
+                f"{type(self.target).__name__} rigid-rotation destination "
+                f"cannot be revalidated: {error}"
+            ) from error
+        return candidate
+
+    def apply_rigid_rotation_plan(
+        self,
+        plan: RigidRotationPlan,
+        *,
+        record_changes: bool = True,
+    ) -> None:
+        prepared = self.revalidate_rigid_rotation_plan(plan)
+        self._apply_prevalidated_rigid_rotation_plan(
+            prepared, record_changes=record_changes
+        )
+
+    def _apply_prevalidated_rigid_rotation_plan(
+        self, plan: RigidRotationPlan, *, record_changes: bool = True
+    ) -> None:
+        """Apply a plan prepared synchronously by the trusted caller."""
+
+        if plan.target is not self.target:
+            raise ValueError("Rigid-rotation plan belongs to another artist")
+        support = self.operation_support(TransformOperation.RIGID_ROTATE)
+        if not support.supported:
+            raise UnsupportedArtistError(support.reason)
         if not self.rigid_rotation_plan_changes(plan):
             return
         native = plan.native_array()
-        self.validate_native_control_points(native)
         with suspend_change_recording():
             self._apply_native_control_points(native)
             if plan.rotation_value is not None:
@@ -2130,13 +2250,18 @@ class ArtistAdapter:
     def rigid_rotation_plan_changes(self, plan: RigidRotationPlan) -> bool:
         current = np.asarray(self.control_points(), dtype=float)
         planned = plan.control_array()
-        if current.shape != planned.shape or not np.allclose(
+        if current.shape != planned.shape or not np.array_equal(
             current, planned, equal_nan=True
         ):
             return True
         return bool(
             plan.rotation_value is not None
-            and not np.isclose(self.rotation(), plan.rotation_value)
+            and not np.isclose(
+                self.rotation(),
+                plan.rotation_value,
+                atol=1e-12,
+                rtol=0.0,
+            )
         )
 
     def rigid_rotate(self, angle_degrees: float, pivot) -> None:
@@ -4522,6 +4647,15 @@ class EditorGroupAdapter(ArtistAdapter):
             adapter.plan_rigid_rotation(angle_degrees, pivot)
             for adapter in adapters
         )
+        return self._compose_rigid_rotation_plan(
+            angle_degrees, pivot, adapters, member_plans
+        )
+
+    def _compose_rigid_rotation_plan(
+        self, angle_degrees, pivot, adapters, member_plans
+    ) -> RigidRotationPlan:
+        """Freeze one group destination from already preflighted members."""
+
         control = np.concatenate(
             [plan.control_array() for plan in member_plans], axis=0
         )
@@ -4549,6 +4683,17 @@ class EditorGroupAdapter(ArtistAdapter):
         )
 
     def apply_rigid_rotation_plan(
+        self,
+        plan: RigidRotationPlan,
+        *,
+        record_changes: bool = True,
+    ) -> None:
+        prepared = self.revalidate_rigid_rotation_plan(plan)
+        self._apply_prevalidated_rigid_rotation_plan(
+            prepared, record_changes=record_changes
+        )
+
+    def _apply_prevalidated_rigid_rotation_plan(
         self, plan: RigidRotationPlan, *, record_changes: bool = True
     ) -> None:
         if plan.target is not self.target:
@@ -4580,8 +4725,9 @@ class EditorGroupAdapter(ArtistAdapter):
         try:
             with suspend_change_recording():
                 for adapter, member_plan in zip(adapters, plan.member_plans):
-                    adapter.apply_rigid_rotation_plan(
-                        member_plan, record_changes=False
+                    adapter._apply_prevalidated_rigid_rotation_plan(
+                        member_plan,
+                        record_changes=False,
                     )
             if record_changes:
                 self._record_restored_state()
@@ -4597,6 +4743,41 @@ class EditorGroupAdapter(ArtistAdapter):
             self.invalidate_geometry_cache()
             raise
         self.invalidate_geometry_cache()
+
+    def revalidate_rigid_rotation_plan(
+        self, plan: RigidRotationPlan
+    ) -> RigidRotationPlan:
+        """Validate every member before an EditorGroup mutates any member."""
+
+        if plan.target is not self.target:
+            raise ValueError("Rigid-rotation plan belongs to another artist")
+        support = self.operation_support(TransformOperation.RIGID_ROTATE)
+        if not support.supported:
+            raise UnsupportedArtistError(support.reason)
+        adapters = self._member_adapters()
+        if len(adapters) != len(plan.member_plans):
+            raise ValueError("Editor-group membership changed after rotation preflight")
+        prepared_members = tuple(
+            adapter.revalidate_rigid_rotation_plan(member_plan)
+            for adapter, member_plan in zip(adapters, plan.member_plans)
+        )
+        candidate = self._compose_rigid_rotation_plan(
+            plan.angle_degrees,
+            plan.pivot,
+            adapters,
+            prepared_members,
+        )
+        self._validate_rigid_rotation_display_destination(
+            plan.control_array(),
+            candidate.control_array(),
+            operation="EditorGroup native/display mapping",
+        )
+        self._validate_rigid_rotation_display_destination(
+            plan.selection_array(),
+            candidate.selection_array(),
+            operation="EditorGroup visible member envelope",
+        )
+        return candidate
 
     def _apply_native_control_points(self, points) -> None:
         start = 0

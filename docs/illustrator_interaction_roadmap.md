@@ -24,7 +24,7 @@ Implementation order follows architectural dependencies.
 
 Status (2026-07-18): implemented on
 ``codex/p0-correctness-performance``. The current implementation is covered by
-1,281 passing tests, 178 explicit skips, no strict xfails, Ruff, the full Fig2
+1,299 passing tests, 178 explicit skips, no strict xfails, Ruff, the full Fig2
 interaction probe, and a read-only smoke replay of the unmodified formal Fig2.
 The formal file retained SHA-256
 ``aba67bbd663fd16da535aa30d43f607c7205d096455f44544e518607cdce2dbb``.
@@ -427,6 +427,17 @@ preview and commit could agree on the wrong marker identity. NaN/masked slots
 remain in the marker index stream, while an isolated point across a NaN gap no
 longer inflates the visible line-stroke box.
 
+Rigid rotation now uses a two-stage prepare/apply commit boundary. Each frozen
+``RigidRotationPlan`` keeps compact tokens only for stable source semantics,
+such as Line2D raw storage and a native angle, instead of byte-hashing restored
+display floats or enumerating Artist-specific appearance fields. Prepare
+rebuilds a live candidate and recomputes its native/display destination and
+paint/clip envelope; every selected Artist must prepare successfully before any
+apply mutates geometry. Mouse-move preview is the trusted fast path: it applies
+the plan produced for that frame without a second ``O(N)`` revalidation,
+preserving large-Line2D frame latency while every commit remains stale-safe and
+atomic.
+
 The interactive path was optimized as part of the same correctness contract.
 Line2D forward/inverse transforms are vectorized, a handle gesture reuses its
 source controls and visible envelope, and ``RigidRotationPlan`` stores compact
@@ -541,7 +552,7 @@ target, raw leaf, and blocked state. Cold median/p95 fell from
 from a fail-open unmeasured tail whose foreground hit is late in paint order;
 no renderer measurement or object is dropped to avoid it.
 
-The combined repository suite now passes 1,281 tests with 178 explicit skips.
+The combined repository suite now passes 1,299 tests with 178 explicit skips.
 Matplotlib 3.8.4 / NumPy 1.23.5 passes the 87 new and directly related tests.
 A read-only real-Fig2 fork produced edge/center hits, one atomic history item,
 ``2.27e-13 px`` preview/commit error, and zero Undo/Redo error. The formal Fig2
@@ -599,7 +610,7 @@ draw contracts, and over-budget rasters remain conservative. Capture success,
 failure, and denial leave the Artist, clip dependency, Legend/Axes/Figure
 owners, callbacks, and derived draw state unchanged.
 
-The combined suite passes 1,281 tests with 178 explicit skips and Ruff. The
+The combined suite passes 1,299 tests with 178 explicit skips and Ruff. The
 read-only Fig2 fork retains identical accepted preview/commit/Undo geometry,
 and the formal file remains byte-identical at SHA-256
 ``aba67bbd663fd16da535aa30d43f607c7205d096455f44544e518607cdce2dbb``.

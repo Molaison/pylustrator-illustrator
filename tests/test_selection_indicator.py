@@ -3464,6 +3464,110 @@ def test_multi_rotation_handle_previews_shared_pivot_and_shift_snap() -> None:
     assert app is not None
 
 
+@pytest.mark.parametrize("commit_path", ["numeric", "handle"])
+def test_multi_rigid_rotation_prepares_every_target_before_first_apply(
+    monkeypatch, commit_path
+) -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    artists = [
+        ax.add_patch(
+            Polygon([[0.22, 0.27], [0.36, 0.29], [0.29, 0.44]], closed=True)
+        ),
+        ax.add_patch(
+            Polygon([[0.57, 0.52], [0.73, 0.56], [0.64, 0.7]], closed=True)
+        ),
+    ]
+    for artist in artists:
+        artist.set_clip_on(False)
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    fig.signals.figure_selection_property_changed = Signal()
+    manager.select_elements(artists, primary=artists[-1])
+    selection = manager.selection
+    before = [TargetWrapper(artist).get_positions().copy() for artist in artists]
+
+    if commit_path == "handle":
+        pivot = selection.rotation_pivot().copy()
+        start = np.asarray(selection.rotation_grabber.get_xy(), dtype=float)
+        vector = start - pivot
+        angle = np.deg2rad(19.0)
+        pointer = pivot + np.array(
+            [
+                vector[0] * np.cos(angle) - vector[1] * np.sin(angle),
+                vector[0] * np.sin(angle) + vector[1] * np.cos(angle),
+            ]
+        )
+        selection.start_rotation(
+            SimpleNamespace(x=start[0], y=start[1], key=None)
+        )
+        assert selection.preview_rotation(
+            SimpleNamespace(x=pointer[0], y=pointer[1], key=None)
+        ) == pytest.approx(19.0)
+
+    first_adapter = selection.targets[0].adapter
+    second_adapter = selection.targets[1].adapter
+    original_apply = first_adapter._apply_prevalidated_rigid_rotation_plan
+    original_setter = first_adapter._apply_native_control_points
+    apply_calls = []
+    setter_calls_during_apply = []
+    applying = False
+
+    def capture_apply(plan, *, record_changes=True):
+        nonlocal applying
+        apply_calls.append(plan)
+        applying = True
+        try:
+            return original_apply(
+                plan,
+                record_changes=record_changes,
+            )
+        finally:
+            applying = False
+
+    def capture_setter(points):
+        if applying:
+            setter_calls_during_apply.append(np.asarray(points, dtype=float).copy())
+        return original_setter(points)
+
+    def fail_second_prepare(_plan):
+        raise UnsupportedArtistError("QA second rigid prepare failure")
+
+    monkeypatch.setattr(
+        first_adapter,
+        "_apply_prevalidated_rigid_rotation_plan",
+        capture_apply,
+    )
+    monkeypatch.setattr(first_adapter, "_apply_native_control_points", capture_setter)
+    monkeypatch.setattr(
+        second_adapter,
+        "revalidate_rigid_rotation_plan",
+        fail_second_prepare,
+    )
+
+    try:
+        with pytest.raises(
+            UnsupportedArtistError, match="second rigid prepare failure"
+        ):
+            if commit_path == "handle":
+                selection.end_rotation()
+            else:
+                selection.rotate_selection(19.0)
+
+        assert apply_calls == []
+        assert setter_calls_during_apply == []
+        assert all(
+            np.allclose(TargetWrapper(artist).get_positions(), state, atol=1e-8)
+            for artist, state in zip(artists, before)
+        )
+        assert not fig.change_tracker.edits
+        assert not fig.change_tracker.changes
+    finally:
+        selection.clear_targets()
+        plt.close(fig)
+    assert app is not None
+
+
 def test_rotation_handle_reuses_cached_gesture_source_geometry(monkeypatch) -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
@@ -3513,6 +3617,58 @@ def test_rotation_handle_reuses_cached_gesture_source_geometry(monkeypatch) -> N
         assert calls[0][
             "selection_points"
         ] is selection.move_start_raw_selection_points[id(target)]
+        selection.cancel_rotation()
+    finally:
+        selection.clear_targets()
+        plt.close(fig)
+    assert app is not None
+
+
+def test_large_line_rigid_preview_skips_commit_revalidation(monkeypatch) -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    count = 100_000
+    target = ax.plot(
+        np.linspace(0.2, 0.8, count),
+        np.linspace(0.3, 0.7, count),
+        linewidth=1.0,
+        clip_on=False,
+    )[0]
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    fig.signals.figure_selection_property_changed = Signal()
+    manager.select_element(target)
+    selection = manager.selection
+    pivot = selection.rotation_pivot().copy()
+    start = np.asarray(selection.rotation_grabber.get_xy(), dtype=float)
+    vector = start - pivot
+    angle = np.deg2rad(17.0)
+    pointer = pivot + np.array(
+        [
+            vector[0] * np.cos(angle) - vector[1] * np.sin(angle),
+            vector[0] * np.sin(angle) + vector[1] * np.cos(angle),
+        ]
+    )
+
+    selection.start_rotation(SimpleNamespace(x=start[0], y=start[1], key=None))
+    adapter = selection.targets[0].adapter
+    revalidation_calls = []
+
+    def unexpected_revalidation(plan):
+        revalidation_calls.append(plan)
+        raise AssertionError("pointer preview entered commit revalidation")
+
+    monkeypatch.setattr(
+        adapter,
+        "revalidate_rigid_rotation_plan",
+        unexpected_revalidation,
+    )
+
+    try:
+        assert selection.preview_rotation(
+            SimpleNamespace(x=pointer[0], y=pointer[1], key=None)
+        ) == pytest.approx(17.0)
+        assert revalidation_calls == []
         selection.cancel_rotation()
     finally:
         selection.clear_targets()

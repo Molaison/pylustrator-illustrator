@@ -491,7 +491,7 @@ QT_QPA_PLATFORM=offscreen uv run pytest tests -q
 uv run ruff check .
 ```
 
-The current full suite reports 1,281 passed and 178 skipped tests, with no strict
+The current full suite reports 1,299 passed and 178 skipped tests, with no strict
 xfails. Within the dedicated matrix, supported-operation tests skip denied types
 while rejection tests skip supported types; those skips are branch accounting,
 not missing Artist coverage. Registry equality covers all 23 always-present

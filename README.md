@@ -132,6 +132,10 @@ the user-facing interaction rules shared.
   per vertex. Interaction-scoped geometry and legend discovery caches reduce
   repeated renderer work, while source-only saves avoid replaying unrelated
   figure exports.
+- Rigid-rotation commits rebuild a live candidate from the same planner used by
+  preview, verify its native/display and paint/clip destination, and prepare
+  every selected object before the first mutation. Pointer previews use the
+  just-built trusted plan without repeating that commit-only `O(N)` work.
 
 ### Explicit Capability Boundaries
 
@@ -151,7 +155,7 @@ and the extension API is introduced in the [API documentation](docs/api.rst).
 
 At the current fork milestone on 2026-07-18:
 
-- the full test suite passed with **1,281 passed and 178 skipped**;
+- the full test suite passed with **1,299 passed and 178 skipped**;
 - Ruff and Ty completed successfully, with an explicit incremental type-check
   baseline for the dynamic Matplotlib/Qt interaction modules; and
 - the real multi-panel Fig2 workflow was used to validate selection, movement,
