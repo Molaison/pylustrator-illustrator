@@ -7,14 +7,19 @@ import matplotlib
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
+import numpy as np
 from matplotlib import _pylab_helpers
+from matplotlib.backend_bases import KeyEvent
 from matplotlib.backends.qt_compat import QtCore, QtWidgets
+from matplotlib.patches import Rectangle
 
 from pylustrator import QtGuiDrag
 from pylustrator.change_tracker import init_figure
 from pylustrator.drag_helper import DragManager
 from pylustrator.components.matplotlibwidget import EmbeddedFigureManager
+from pylustrator.interaction import SelectionMode
 from pylustrator.QtGuiDrag import PlotWindow
+from pylustrator.snap import TargetWrapper
 
 
 def _callback_count(canvas, owner) -> int:
@@ -181,7 +186,6 @@ def test_ten_reopens_release_qt_objects_and_preserve_source_callbacks() -> None:
         fig, _ax = plt.subplots()
         source_canvas = fig.canvas
         source_manager = source_canvas.manager
-        source_key_handler = source_manager.key_press_handler_id
         callback_counts = _figure_callback_counts(fig)
         baseline_top_levels = set(app.topLevelWidgets())
         references = []
@@ -194,6 +198,7 @@ def test_ten_reopens_release_qt_objects_and_preserve_source_callbacks() -> None:
             timer = canvas.timer
             assert isinstance(manager, EmbeddedFigureManager)
             assert timer.parent() is canvas
+            assert source_manager.key_press_handler_id is None
             current_active_counts = _figure_callback_counts(fig)
             if active_callback_counts is None:
                 active_callback_counts = current_active_counts
@@ -210,9 +215,10 @@ def test_ten_reopens_release_qt_objects_and_preserve_source_callbacks() -> None:
             assert all(reference() is None for group in references for reference in group)
             assert set(app.topLevelWidgets()).issubset(baseline_top_levels)
             assert _figure_callback_counts(fig) == callback_counts
-            assert (
-                source_key_handler
-                in fig._canvas_callbacks.callbacks.get("key_press_event", {})
+            restored_key_handler = source_manager.key_press_handler_id
+            assert isinstance(restored_key_handler, int)
+            assert restored_key_handler in fig._canvas_callbacks.callbacks.get(
+                "key_press_event", {}
             )
             assert fig.canvas is source_canvas
 
@@ -266,6 +272,100 @@ def test_multi_figure_history_signal_follows_only_the_active_figure() -> None:
         window.close()
         _flush_deferred_deletes(app)
     finally:
+        _close_all_windows()
+        _flush_deferred_deletes(app)
+        plt.show = original_show
+        QtGuiDrag.no_save_allowed = original_no_save
+
+
+def test_embedded_keys_suspend_only_source_default_navigation_handler() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    original_show = plt.show
+    original_no_save = QtGuiDrag.no_save_allowed
+    _close_all_windows()
+    _flush_deferred_deletes(app)
+    custom_cid = None
+    source_canvas = None
+    try:
+        QtGuiDrag.initialize(disable_save=True)
+        fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+        rectangle = ax.add_patch(Rectangle((0.2, 0.3), 0.25, 0.2))
+        fig.canvas.draw()
+        source_canvas = fig.canvas
+        source_manager = source_canvas.manager
+        source_key_cid = source_manager.key_press_handler_id
+        custom_keys = []
+        custom_cid = source_canvas.mpl_connect(
+            "key_press_event", lambda event: custom_keys.append(event.key)
+        )
+        callback_counts = _figure_callback_counts(fig)
+
+        (window,) = QtGuiDrag.show(hide_window=True)
+        embedded_canvas = fig.canvas
+        manager = fig.figure_dragger
+        manager.select_element(rectangle)
+        navigation = window.plot_layout.toolbar.navi_toolbar
+        navigation_calls = []
+        navigation.forward = lambda: navigation_calls.append("forward")
+        navigation.back = lambda: navigation_calls.append("back")
+        mode_calls = []
+        original_set_mode = manager.set_selection_mode
+
+        def counted_set_mode(mode):
+            mode_calls.append(SelectionMode.coerce(mode))
+            return original_set_mode(mode)
+
+        manager.set_selection_mode = counted_set_mode
+        assert source_manager.key_press_handler_id is None
+        assert source_key_cid not in fig._canvas_callbacks.callbacks.get(
+            "key_press_event", {}
+        )
+        assert custom_cid in fig._canvas_callbacks.callbacks.get(
+            "key_press_event", {}
+        )
+
+        def press(key: str) -> None:
+            embedded_canvas.callbacks.process(
+                "key_press_event",
+                KeyEvent("key_press_event", embedded_canvas, key),
+            )
+
+        press("v")
+        before = TargetWrapper(rectangle).get_selection_points().copy()
+        press("right")
+        after_right = TargetWrapper(rectangle).get_selection_points().copy()
+        press("left")
+        after_left = TargetWrapper(rectangle).get_selection_points().copy()
+        press("backspace")
+
+        assert mode_calls == [SelectionMode.OBJECT]
+        assert np.allclose(after_right - before, [1, 0])
+        assert np.allclose(after_left, before)
+        assert not rectangle.get_visible()
+        assert len(
+            [
+                edit
+                for edit in fig.change_tracker.edits
+                if str(edit[2]).startswith("Delete")
+            ]
+        ) == 1
+        assert navigation_calls == []
+        assert custom_keys == ["v", "right", "left", "backspace"]
+
+        window.close()
+        _flush_deferred_deletes(app)
+        assert _figure_callback_counts(fig) == callback_counts
+        restored_key_cid = source_manager.key_press_handler_id
+        assert isinstance(restored_key_cid, int)
+        assert restored_key_cid in fig._canvas_callbacks.callbacks.get(
+            "key_press_event", {}
+        )
+        assert custom_cid in fig._canvas_callbacks.callbacks.get(
+            "key_press_event", {}
+        )
+    finally:
+        if source_canvas is not None and custom_cid is not None:
+            source_canvas.mpl_disconnect(custom_cid)
         _close_all_windows()
         _flush_deferred_deletes(app)
         plt.show = original_show

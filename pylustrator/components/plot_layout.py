@@ -25,6 +25,38 @@ except ModuleNotFoundError:
 from .matplotlibwidget import MatplotlibWidget
 
 
+class _SourceKeyHandlerSuspension:
+    """Temporarily remove only a source manager's default key callback."""
+
+    def __init__(self, source_canvas):
+        self.source_canvas = source_canvas
+        self.manager = getattr(source_canvas, "manager", None)
+        self.original_cid = getattr(self.manager, "key_press_handler_id", None)
+        callbacks = source_canvas.figure._canvas_callbacks.callbacks.get(
+            "key_press_event", {}
+        )
+        callback_ref = callbacks.get(self.original_cid)
+        self.callback = callback_ref() if callback_ref is not None else None
+        self.was_connected = self.callback is not None
+        self.restored = False
+        if self.was_connected:
+            source_canvas.mpl_disconnect(self.original_cid)
+            self.manager.key_press_handler_id = None
+
+    def restore(self) -> bool:
+        if self.restored:
+            return False
+        self.restored = True
+        if self.was_connected and self.manager is not None and self.callback is not None:
+            self.manager.key_press_handler_id = self.source_canvas.mpl_connect(
+                "key_press_event", self.callback
+            )
+        self.callback = None
+        self.manager = None
+        self.source_canvas = None
+        return self.was_connected
+
+
 class MyScene(QtWidgets.QGraphicsScene):
     grabber_pressed = None
 
@@ -138,6 +170,7 @@ class Canvas(QtWidgets.QWidget):
         self._last_ruler_state = None
         self._figure_canvases = {}
         self._source_canvases = {}
+        self._source_key_handlers = {}
         self._canvas_connections = {}
         self._scene_roots = {}
 
@@ -245,8 +278,18 @@ class Canvas(QtWidgets.QWidget):
 
         canvas = self._figure_canvases.get(figure)
         if canvas is None:
-            self._source_canvases[figure] = figure.canvas
-            canvas = MatplotlibWidget(self, figure=figure)
+            source_canvas = figure.canvas
+            self._source_canvases[figure] = source_canvas
+            key_handler = _SourceKeyHandlerSuspension(source_canvas)
+            self._source_key_handlers[figure] = key_handler
+            try:
+                canvas = MatplotlibWidget(self, figure=figure)
+            except Exception:
+                figure.set_canvas(source_canvas)
+                key_handler.restore()
+                self._source_key_handlers.pop(figure, None)
+                self._source_canvases.pop(figure, None)
+                raise
             self._figure_canvases[figure] = canvas
             root = QtWidgets.QGraphicsRectItem(
                 0, 0, 0, 0, self.selections_scene_origin
@@ -254,10 +297,6 @@ class Canvas(QtWidgets.QWidget):
             root.view = self.selections_view
             self._scene_roots[figure] = root
 
-            manager = getattr(canvas, "manager", None)
-            key_handler = getattr(manager, "key_press_handler_id", None)
-            if key_handler is not None:
-                canvas.mpl_disconnect(key_handler)
             self._canvas_connections[canvas] = (
                 canvas.mpl_connect("scroll_event", self.scroll_event),
                 canvas.mpl_connect("key_press_event", self.canvas_key_press),
@@ -309,6 +348,9 @@ class Canvas(QtWidgets.QWidget):
                 source_canvas = self._source_canvases.get(figure)
                 if source_canvas is not None:
                     figure.set_canvas(source_canvas)
+            key_handler = self._source_key_handlers.pop(figure, None)
+            if key_handler is not None:
+                key_handler.restore()
             if getattr(figure, "widget", None) is canvas:
                 figure.widget = None
             if getattr(figure, "_pyl_scene", None) is self._scene_roots.get(
@@ -345,6 +387,7 @@ class Canvas(QtWidgets.QWidget):
                 pass
         self._figure_canvases.clear()
         self._source_canvases.clear()
+        self._source_key_handlers.clear()
         self._scene_roots.clear()
         self.selections_view.canvas_canvas = None
         self.canvas = None
