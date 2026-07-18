@@ -5560,6 +5560,182 @@ class Line2DAdapter(ArtistAdapter):
             return points
         return self.point_array(self.target.get_transform().transform(points))
 
+    @staticmethod
+    def _float_markevery_parameters(markevery) -> tuple[float, float] | None:
+        """Return Matplotlib's axes-relative ``markevery`` parameters."""
+
+        if isinstance(markevery, Real) and not isinstance(markevery, Integral):
+            return 0.0, float(markevery)
+        if (
+            isinstance(markevery, tuple)
+            and len(markevery) == 2
+            and isinstance(markevery[0], Real)
+            and isinstance(markevery[1], Real)
+            and not isinstance(markevery[1], Integral)
+        ):
+            return float(markevery[0]), float(markevery[1])
+        return None
+
+    def _stable_float_marker_display_positions(
+        self, points: np.ndarray, markevery
+    ) -> np.ndarray | None:
+        """Resolve float ``markevery`` and reject hardware-sensitive ties.
+
+        Matplotlib selects the vertex nearest each axes-relative path distance.
+        An exact or near tie can flip between vertices after a mathematically
+        rigid transform because ``hypot`` and cumulative sums differ by a few
+        ulps across CPUs.  Reproduce Matplotlib's resolver in one pass and fail
+        closed when two materially different vertices are within the numerical
+        error envelope.  This runs only during strict transform preflight; the
+        ordinary selection and pointer paths remain unchanged.
+        """
+
+        parameters = self._float_markevery_parameters(markevery)
+        if parameters is None:
+            return None
+        start, step = parameters
+        axes = self.target.axes
+        if axes is None:
+            raise ValueError(
+                "float markevery requires the Line2D to have an Axes parent"
+            )
+
+        finite = np.isfinite(points).all(axis=1)
+        vertices = points[finite]
+        delta_vectors = np.empty((len(vertices), 2), dtype=float)
+        delta_vectors[0, :] = 0.0
+        delta_vectors[1:, :] = vertices[1:, :] - vertices[:-1, :]
+        cumulative = np.hypot(*delta_vectors.T).cumsum()
+        (x0, y0), (x1, y1) = axes.transAxes.transform([[0, 0], [1, 1]])
+        axes_diagonal = np.hypot(x1 - x0, y1 - y0)
+        start_distance = start * axes_diagonal
+        step_distance = step * axes_diagonal
+        coordinate_scale = max(
+            1.0,
+            float(np.max(np.abs(vertices), initial=0.0)),
+            float(np.max(np.abs(cumulative), initial=0.0)),
+            abs(float(start_distance)),
+            abs(float(step_distance)),
+        )
+        # Subtraction, hypot, and a cumulative sum contribute error.  The
+        # small linear factor covers cross-runner ulp variation.  Pathological
+        # huge-coordinate inputs may conservatively reject instead of risking
+        # a preview/commit mismatch.
+        ambiguity_tolerance = (
+            16.0
+            * np.finfo(float).eps
+            * max(1, len(vertices))
+            * coordinate_scale
+        )
+        if (
+            not np.all(np.isfinite(cumulative))
+            or not np.isfinite(axes_diagonal)
+            or not np.isfinite(start_distance)
+            or not np.isfinite(step_distance)
+            or not np.isfinite(ambiguity_tolerance)
+            or abs(step_distance) <= ambiguity_tolerance
+        ):
+            raise UnsupportedArtistError(
+                "Line2D markevery may select different marker vertices after "
+                "rigid rotation because its distance grid is numerically "
+                "ambiguous"
+            )
+        marker_distances = np.arange(
+            start_distance,
+            cumulative[-1],
+            step_distance,
+        )
+
+        # ``cumulative`` is monotonic, so the nearest vertex must be one of
+        # the two insertion neighbours.  Matplotlib currently materializes an
+        # M-by-N distance matrix here; searchsorted preserves its lower-index
+        # tie rule while keeping preflight memory linear in M + N.
+        def resolve_nearest(distances):
+            right = np.searchsorted(cumulative, distances, side="left")
+            left = np.clip(right - 1, 0, len(vertices) - 1)
+            right = np.clip(right, 0, len(vertices) - 1)
+            left_error = np.abs(cumulative[left] - distances)
+            right_error = np.abs(cumulative[right] - distances)
+            nearest = np.where(left_error <= right_error, left, right)
+            # Zero-length segments have duplicate cumulative distances.
+            # Argmin returns the first such vertex, so canonicalize likewise.
+            nearest = np.searchsorted(
+                cumulative, cumulative[nearest], side="left"
+            )
+            return nearest, left, right, left_error, right_error
+
+        (
+            indices,
+            left_indices,
+            right_indices,
+            left_distances,
+            right_distances,
+        ) = resolve_nearest(marker_distances)
+
+        if len(indices) and len(vertices) > 1:
+            distance_gaps = np.abs(left_distances - right_distances)
+            materially_distinct = np.any(
+                np.abs(vertices[left_indices] - vertices[right_indices]) > 0.25,
+                axis=1,
+            )
+            if np.any(
+                (left_indices != right_indices)
+                & (distance_gaps <= ambiguity_tolerance)
+                & materially_distinct
+            ):
+                raise UnsupportedArtistError(
+                    "Line2D markevery may select different marker vertices "
+                    "after rigid rotation because a marker distance is "
+                    "numerically ambiguous"
+                )
+
+        def marker_is_materially_new(index, existing) -> bool:
+            if not len(existing):
+                return True
+            return not bool(
+                np.any(
+                    np.all(
+                        np.abs(vertices[existing] - vertices[index]) <= 0.25,
+                        axis=1,
+                    )
+                )
+            )
+
+        # ``arange`` excludes its stop.  If the path endpoint is within the
+        # error envelope of the last included or first excluded grid point,
+        # different CPUs can also disagree on the marker count, even when no
+        # nearest-vertex midpoint is ambiguous.
+        if len(marker_distances):
+            last_distance = marker_distances[-1]
+            if (
+                abs(cumulative[-1] - last_distance) <= ambiguity_tolerance
+                and marker_is_materially_new(indices[-1], indices[:-1])
+            ):
+                raise UnsupportedArtistError(
+                    "Line2D markevery may select different marker vertices "
+                    "after rigid rotation because its sequence endpoint is "
+                    "numerically ambiguous"
+                )
+            next_distance = last_distance + step_distance
+        else:
+            next_distance = start_distance
+        if not np.isfinite(next_distance):
+            raise UnsupportedArtistError(
+                "Line2D markevery may select different marker vertices after "
+                "rigid rotation because its distance grid is numerically "
+                "ambiguous"
+            )
+        if abs(cumulative[-1] - next_distance) <= ambiguity_tolerance:
+            next_index = resolve_nearest(np.asarray([next_distance]))[0][0]
+            if marker_is_materially_new(next_index, indices):
+                raise UnsupportedArtistError(
+                    "Line2D markevery may select different marker vertices "
+                    "after rigid rotation because its sequence endpoint is "
+                    "numerically ambiguous"
+                )
+
+        return vertices[np.unique(indices)]
+
     def _marker_display_positions(
         self, points=None, *, strict: bool = False
     ) -> np.ndarray:
@@ -5573,12 +5749,22 @@ class Line2DAdapter(ArtistAdapter):
         if markevery is None:
             return self.finite_points(points)
         try:
-            points = _mark_every_path(
-                markevery,
-                Path(points),
-                IdentityTransform(),
-                self.target.axes,
-            ).vertices
+            resolved = (
+                self._stable_float_marker_display_positions(points, markevery)
+                if strict
+                else None
+            )
+            if resolved is None:
+                points = _mark_every_path(
+                    markevery,
+                    Path(points),
+                    IdentityTransform(),
+                    self.target.axes,
+                ).vertices
+            else:
+                points = resolved
+        except UnsupportedArtistError:
+            raise
         except (
             IndexError,
             OverflowError,
@@ -5848,6 +6034,78 @@ class Line2DAdapter(ArtistAdapter):
             return
         cls._update_fingerprint_array(hasher, raw)
 
+    @classmethod
+    def _update_markevery_fingerprint(cls, hasher, markevery) -> None:
+        """Hash valid markevery state by semantics rather than object identity."""
+
+        if markevery is None:
+            token = ("none",)
+        elif isinstance(markevery, Integral):
+            token = ("int", int(markevery))
+        elif isinstance(markevery, Real):
+            token = ("float", float(markevery))
+        elif isinstance(markevery, tuple):
+            start, step = markevery
+            if isinstance(step, Integral):
+                token = ("int_tuple", int(start), int(step))
+            else:
+                token = ("float_tuple", float(start), float(step))
+        elif isinstance(markevery, slice):
+            token = (
+                "slice",
+                None if markevery.start is None else int(markevery.start),
+                None if markevery.stop is None else int(markevery.stop),
+                None if markevery.step is None else int(markevery.step),
+            )
+        else:
+            values = np.asarray(markevery)
+            hasher.update(b"markevery-array")
+            if values.size == 0:
+                hasher.update(b"empty")
+                return
+            if np.issubdtype(values.dtype, np.bool_):
+                hasher.update(b"bool")
+                normalized = np.asarray(values, dtype=np.bool_)
+            else:
+                hasher.update(b"int")
+                normalized = np.asarray(values, dtype=np.int64)
+            cls._update_fingerprint_array(hasher, normalized)
+            return
+        encoded = repr(token).encode("ascii", errors="backslashreplace")
+        hasher.update(len(encoded).to_bytes(8, "little"))
+        hasher.update(encoded)
+
+    def _update_line_context_fingerprint(self, hasher) -> None:
+        """Hash display state used by Line2D float markevery and rotation."""
+
+        transform = self.target.get_transform()
+        transform_token = (
+            type(transform).__module__,
+            type(transform).__qualname__,
+            bool(getattr(transform, "is_affine", False)),
+            bool(getattr(transform, "has_inverse", True)),
+        )
+        hasher.update(repr(transform_token).encode("utf-8"))
+        self._update_fingerprint_array(
+            hasher, transform.get_affine().get_matrix()
+        )
+
+        axes = self.target.axes
+        if axes is None:
+            hasher.update(b"no-axes")
+        else:
+            hasher.update(id(axes).to_bytes(8, "little", signed=False))
+            self._update_fingerprint_array(
+                hasher, axes.transAxes.get_affine().get_matrix()
+            )
+        figure = self.figure
+        self._update_fingerprint_array(
+            hasher,
+            np.asarray(
+                (float(figure.dpi), self.points_to_pixels(1.0)), dtype=float
+            ),
+        )
+
     def rigid_rotation_source_fingerprint(self):
         xdata = self.target.get_xdata(orig=True)
         ydata = self.target.get_ydata(orig=True)
@@ -5857,13 +6115,18 @@ class Line2DAdapter(ArtistAdapter):
         hasher = hashlib.sha256()
         self._update_raw_fingerprint(hasher, xdata, "x")
         self._update_raw_fingerprint(hasher, ydata, "y")
+        self._update_markevery_fingerprint(
+            hasher, self.target.get_markevery()
+        )
+        self._update_line_context_fingerprint(hasher)
         return id(xdata), id(ydata), hasher.digest()[:16]
 
     def validate_rigid_rotation_plan_source(self, plan: RigidRotationPlan) -> None:
         if plan.source_fingerprint != self.rigid_rotation_source_fingerprint():
             raise UnsupportedArtistError(
-                "Line2D raw coordinate storage changed after rigid-rotation "
-                "preflight; discard the stale plan and start a new gesture"
+                "Line2D coordinates, markevery, transform, or viewport changed "
+                "after rigid-rotation preflight; discard the stale plan and "
+                "start a new gesture"
             )
 
     def _atomic_set_raw_data(self, xdata, ydata, *, recache: bool = False) -> None:

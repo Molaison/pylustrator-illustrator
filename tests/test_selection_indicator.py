@@ -4747,9 +4747,23 @@ def test_large_selection_uses_constant_overlay_items_and_fast_warm_reselect() ->
     assert overlay_items[2].path().elementCount() == 5
     assert overlay_items[2].pen().width() == 5
 
-    start = perf_counter()
-    manager.select_elements_in_bbox(*fig.bbox.extents)
-    assert perf_counter() - start < 0.050
+    # Measure the warm selection algorithm, not a generation-2 collection of
+    # cyclic Matplotlib/Qt objects accumulated by unrelated earlier tests.
+    # This mirrors the smart-guide performance harness: collect outside the
+    # timed region and restore the caller's GC policy without relaxing the
+    # latency budget.
+    gc.collect()
+    gc_was_enabled = gc.isenabled()
+    if gc_was_enabled:
+        gc.disable()
+    try:
+        start = perf_counter()
+        manager.select_elements_in_bbox(*fig.bbox.extents)
+        warm_elapsed = perf_counter() - start
+    finally:
+        if gc_was_enabled:
+            gc.enable()
+    assert warm_elapsed < 0.050
 
     manager.selection.update_selection_rectangles(target_indices=(0, len(texts) - 1))
     manager.selection.refresh_targets_after_draw((0, len(texts) - 1))

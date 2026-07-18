@@ -3041,6 +3041,121 @@ def test_float_markevery_vertex_switch_rejects_rigid_rotation_atomically() -> No
         plt.close(fig)
 
 
+def test_float_markevery_endpoint_tie_rejects_rigid_rotation_atomically() -> None:
+    fig, ax = plt.subplots(figsize=(5.3, 3.7), dpi=113)
+    tracker = RecordingChangeTracker()
+    fig.change_tracker = tracker
+    target = Line2D(
+        [0.0, 200.0],
+        [0.0, 0.0],
+        linestyle="none",
+        marker="o",
+        transform=IdentityTransform(),
+        clip_on=False,
+    )
+    ax.add_line(target)
+    fig.canvas.draw()
+    axes_bounds = ax.transAxes.transform([[0.0, 0.0], [1.0, 1.0]])
+    axes_diagonal = np.hypot(*(axes_bounds[1] - axes_bounds[0]))
+    target.set_markevery((0.0, 200.0 / axes_diagonal))
+    adapter = get_artist_adapter(target)
+    before = adapter.snapshot()
+    recording_before = tracker.capture_recording_state()
+
+    try:
+        assert adapter.capabilities.can_rigid_rotate
+        with pytest.raises(UnsupportedArtistError, match="sequence endpoint"):
+            adapter.plan_rigid_rotation(31.0, (-400.0, 275.0))
+        assert semantic_equal(before, adapter.snapshot())
+        assert tracker.capture_recording_state() == recording_before
+    finally:
+        plt.close(fig)
+
+
+def test_float_markevery_strict_resolution_has_linear_memory() -> None:
+    count = 20_000
+    points = np.column_stack(
+        (np.arange(count, dtype=float), np.zeros(count, dtype=float))
+    )
+    fig, ax = plt.subplots(figsize=(5.3, 3.7), dpi=113)
+    target = Line2D(
+        points[:, 0],
+        points[:, 1],
+        linestyle="none",
+        marker="o",
+        markevery=(0.002345, 0.01337),
+        transform=IdentityTransform(),
+        clip_on=False,
+    )
+    ax.add_line(target)
+    adapter = get_artist_adapter(target)
+
+    gc.collect()
+    tracemalloc.start()
+    started = time.perf_counter()
+    try:
+        resolved = adapter._marker_display_positions(points, strict=True)
+        elapsed = time.perf_counter() - started
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+        plt.close(fig)
+
+    assert len(resolved) > 1_000
+    assert elapsed < 1.0
+    assert peak < 8 * 1024 * 1024
+
+
+@pytest.mark.parametrize(
+    "stale_kind",
+    ["markevery", "markevery_in_place", "transform", "axes_bbox", "dpi"],
+)
+def test_line_rigid_plan_rejects_stale_marker_and_display_context(
+    stale_kind,
+) -> None:
+    fig, ax = plt.subplots(figsize=(5.3, 3.7), dpi=113)
+    tracker = RecordingChangeTracker()
+    fig.change_tracker = tracker
+    markevery = [0] if stale_kind == "markevery_in_place" else (0.07, 10.0)
+    target = Line2D(
+        [0.0, 100.0],
+        [0.0, 0.0],
+        linestyle="none",
+        marker="o",
+        markevery=markevery,
+        transform=IdentityTransform(),
+        clip_on=False,
+    )
+    ax.add_line(target)
+    fig.canvas.draw()
+    adapter = get_artist_adapter(target)
+    plan = adapter.plan_rigid_rotation(90.0, (0.0, 0.0))
+
+    if stale_kind == "markevery":
+        target.set_markevery((0.17, 10.0))
+    elif stale_kind == "markevery_in_place":
+        markevery[0] = 1
+    elif stale_kind == "transform":
+        target.set_transform(Affine2D().translate(5.0, -3.0))
+    elif stale_kind == "axes_bbox":
+        ax.set_position((0.2, 0.18, 0.55, 0.62))
+        fig.canvas.draw()
+    else:
+        fig.set_dpi(157)
+        fig.canvas.draw()
+
+    before = adapter.snapshot()
+    tracker_before = tracker.capture_recording_state()
+    try:
+        assert plan.source_fingerprint != adapter.rigid_rotation_source_fingerprint()
+        with pytest.raises(UnsupportedArtistError, match="changed after"):
+            adapter.apply_rigid_rotation_plan(plan)
+        assert semantic_equal(before, adapter.snapshot())
+        assert tracker.capture_recording_state() == tracker_before
+    finally:
+        plt.close(fig)
+
+
 def test_mixed_circle_marker_and_patch_q_share_one_absolute_plan() -> None:
     fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
     tracker = RecordingChangeTracker()
