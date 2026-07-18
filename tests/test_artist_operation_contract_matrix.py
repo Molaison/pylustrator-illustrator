@@ -22,7 +22,9 @@ from matplotlib.lines import Line2D
 from matplotlib.markers import MarkerStyle
 from matplotlib.path import Path
 from matplotlib.patches import (
+    Arc,
     Circle,
+    CirclePolygon,
     ConnectionPatch,
     Ellipse,
     FancyArrowPatch,
@@ -38,10 +40,13 @@ from matplotlib.transforms import Affine2D, IdentityTransform, Transform
 
 from pylustrator.artist_adapters import (
     AnnotationAdapter,
+    ArcAdapter,
     ArtistAdapter,
     ArtistCapabilities,
     AxesAdapter,
     AxesImageAdapter,
+    CircleAdapter,
+    CirclePolygonAdapter,
     ConnectionPatchAdapter,
     EditorGroupAdapter,
     EllipseAdapter,
@@ -205,6 +210,35 @@ def _rectangle(_fig, ax):
 
 def _ellipse(_fig, ax):
     return ax.add_patch(Ellipse((0.42, 0.52), 0.36, 0.24, label="qa-ellipse"))
+
+
+def _arc(_fig, ax):
+    return ax.add_patch(
+        Arc(
+            (0.42, 0.52),
+            0.36,
+            0.24,
+            angle=17.0,
+            theta1=20.0,
+            theta2=290.0,
+            label="qa-arc",
+        )
+    )
+
+
+def _circle(_fig, ax):
+    return ax.add_patch(Circle((0.42, 0.52), 0.16, label="qa-circle"))
+
+
+def _circle_polygon(_fig, ax):
+    return ax.add_patch(
+        CirclePolygon(
+            (0.42, 0.52),
+            radius=0.16,
+            resolution=12,
+            label="qa-circle-polygon",
+        )
+    )
 
 
 def _arrow(_fig, ax):
@@ -388,6 +422,27 @@ ARTIST_CASES = (
         EllipseAdapter,
         (True, True, True, True, True, False, True, False),
         _ellipse,
+    ),
+    ArtistCase(
+        "Arc",
+        Arc,
+        ArcAdapter,
+        (True, True, False, True, True, False, False, False),
+        _arc,
+    ),
+    ArtistCase(
+        "Circle",
+        Circle,
+        CircleAdapter,
+        (True, True, False, True, True, False, False, False),
+        _circle,
+    ),
+    ArtistCase(
+        "CirclePolygon",
+        CirclePolygon,
+        CirclePolygonAdapter,
+        (True, True, False, True, True, False, False, False),
+        _circle_polygon,
     ),
     ArtistCase(
         "FancyArrowPatch",

@@ -41,6 +41,9 @@ from matplotlib.legend import Legend
 from matplotlib.lines import Line2D, _mark_every_path  # ty: ignore[unresolved-import]
 from matplotlib.path import Path, get_path_collection_extents
 from matplotlib.patches import (
+    Arc,
+    Circle,
+    CirclePolygon,
     ConnectionPatch,
     Ellipse,
     FancyArrowPatch,
@@ -2831,6 +2834,108 @@ class EllipseAdapter(PatchAdapter):
         )
 
 
+class _CenterOnlyPatchAdapter(PatchAdapter):
+    """Conservative contract for semantic patches positioned by a center."""
+
+    default_capabilities = ArtistCapabilities(
+        can_select=True,
+        can_translate=True,
+        can_snapshot=True,
+        can_serialize=True,
+    )
+    unsupported_operation_reasons = {
+        TransformOperation.TRANSLATE: (
+            "Semantic patch translation requires an invertible affine "
+            "transform and independent layout ownership"
+        ),
+        TransformOperation.RESIZE_GEOMETRY: (
+            "Semantic patch resize requires a type-specific size contract"
+        ),
+        TransformOperation.ROTATE: (
+            "Semantic patch rotation requires a type-specific angle contract"
+        ),
+        TransformOperation.RIGID_ROTATE: (
+            "Semantic patch common-pivot rotation has not been validated"
+        ),
+    }
+
+    @classmethod
+    def capabilities_for(cls, target) -> ArtistCapabilities:
+        transform = target.get_data_transform()
+        movable = bool(
+            transform.is_affine
+            and getattr(transform, "has_inverse", True)
+            and legend_owner_for_artist(target) is None
+            and container_owner_for_artist(target) is None
+            and active_layout_owner_for_artist(target) is None
+        )
+        if movable:
+            try:
+                transform.inverted()
+            except (
+                TypeError,
+                ValueError,
+                NotImplementedError,
+                RuntimeError,
+                np.linalg.LinAlgError,
+            ):
+                movable = False
+        return ArtistCapabilities(
+            can_select=True,
+            can_translate=movable,
+            can_snapshot=movable,
+            can_serialize=True,
+        )
+
+    def native_control_points(self):
+        return [np.asarray(self.target.center, dtype=float)]
+
+    def _apply_native_control_points(self, points) -> None:
+        self.target.set_center(tuple(float(value) for value in points[0]))
+
+    def serialize_changes(self):
+        return (
+            ChangeRecord.command_change(
+                self.target,
+                f".set_center({replay_literal(tuple(self.target.center))})",
+            ),
+        )
+
+
+class ArcAdapter(_CenterOnlyPatchAdapter):
+    """Translate Arc centers without rewriting its ellipse/angle semantics."""
+
+    unsupported_operation_reasons = {
+        **_CenterOnlyPatchAdapter.unsupported_operation_reasons,
+        TransformOperation.RESIZE_GEOMETRY: (
+            "Arc resize must preserve width, height, and angular span semantics"
+        ),
+        TransformOperation.ROTATE: (
+            "Arc rotation must update its semantic angle contract"
+        ),
+        TransformOperation.RIGID_ROTATE: (
+            "Arc common-pivot rotation has not been validated"
+        ),
+    }
+
+
+class CircleAdapter(_CenterOnlyPatchAdapter):
+    """Translate Circle centers without stretching its radius semantics."""
+
+    unsupported_operation_reasons = {
+        **_CenterOnlyPatchAdapter.unsupported_operation_reasons,
+        TransformOperation.RESIZE_GEOMETRY: (
+            "Circle resize must update one semantic radius without stretching"
+        ),
+        TransformOperation.ROTATE: (
+            "Circle native rotation has no independently saveable visual effect"
+        ),
+        TransformOperation.RIGID_ROTATE: (
+            "Circle common-pivot rotation has not been validated"
+        ),
+    }
+
+
 class FancyArrowPatchAdapter(PatchAdapter):
     default_capabilities = ArtistCapabilities(
         can_select=True,
@@ -2934,6 +3039,30 @@ class RegularPolygonAdapter(PatchAdapter):
                 self.target, f".xy = {replay_literal(self.target.xy)}"
             ),
         )
+
+
+class CirclePolygonAdapter(RegularPolygonAdapter):
+    """Exact, translation-only contract for CirclePolygon."""
+
+    unsupported_operation_reasons = {
+        TransformOperation.TRANSLATE: (
+            "CirclePolygon translation requires an invertible affine "
+            "transform and independent layout ownership"
+        ),
+        TransformOperation.RESIZE_GEOMETRY: (
+            "CirclePolygon resize must update its semantic radius"
+        ),
+        TransformOperation.ROTATE: (
+            "CirclePolygon rotation must update its semantic orientation"
+        ),
+        TransformOperation.RIGID_ROTATE: (
+            "CirclePolygon common-pivot rotation has not been validated"
+        ),
+    }
+
+    @classmethod
+    def capabilities_for(cls, target) -> ArtistCapabilities:
+        return _CenterOnlyPatchAdapter.capabilities_for(target)
 
 
 class WedgeAdapter(PatchAdapter):
@@ -6431,10 +6560,13 @@ _BUILTIN_ADAPTER_REGISTRATIONS = (
     (AxesImage, AxesImageAdapter),
     (Rectangle, RectangleAdapter),
     (Ellipse, EllipseAdapter),
+    (Arc, ArcAdapter),
+    (Circle, CircleAdapter),
     (FancyArrowPatch, FancyArrowPatchAdapter),
     (ConnectionPatch, ConnectionPatchAdapter),
     (FancyBboxPatch, FancyBboxPatchAdapter),
     (RegularPolygon, RegularPolygonAdapter),
+    (CirclePolygon, CirclePolygonAdapter),
     (Wedge, WedgeAdapter),
     (Polygon, PolygonAdapter),
     (PathPatch, PathPatchAdapter),
@@ -6458,6 +6590,7 @@ __all__ = [
     "AdapterInheritancePolicy",
     "AdapterRegistration",
     "AnnotationAdapter",
+    "ArcAdapter",
     "AppearanceScalePlan",
     "ArtistAdapter",
     "ArtistAdapterRegistry",
@@ -6465,6 +6598,8 @@ __all__ = [
     "AxesAdapter",
     "AxesImageAdapter",
     "ChangeRecord",
+    "CircleAdapter",
+    "CirclePolygonAdapter",
     "CollectionAdapter",
     "ConnectionPatchAdapter",
     "EllipseAdapter",

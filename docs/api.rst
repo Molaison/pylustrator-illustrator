@@ -59,6 +59,11 @@ geometry, snapshot, and replay contracts, it can explicitly opt in:
     class MyArtistHierarchyAdapter(ArtistAdapter):
         ...
 
+Known Matplotlib semantic subclasses are registered individually after their
+contracts are verified.  For example, Arc, Circle, and CirclePolygon expose
+translation-only adapters that preserve their center/radius semantics instead
+of inheriting every Ellipse or RegularPolygon mutation.
+
 Adapters that support saving should also set ``can_serialize=True`` and return
 ``ChangeRecord`` objects from ``serialize_changes``.  Resize capability should
 only be enabled when the committed native state can exactly reproduce the
