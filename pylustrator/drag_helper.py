@@ -3228,6 +3228,9 @@ class DragManager:
         selected = getattr(signals, "figure_element_selected", None)
         emit = getattr(selected, "emit", None)
         if callable(emit):
+            self._selection_notification_revision = (
+                int(getattr(self, "_selection_notification_revision", 0)) + 1
+            )
             self.figure.no_figure_dragger_selection_update = True
             try:
                 emit(element)
@@ -3282,7 +3285,7 @@ class DragManager:
         self._update_interaction_controls()
         return result
 
-    def enter_isolation(self, element: Artist) -> bool:
+    def enter_isolation(self, element: Artist, *, notify: bool = True) -> bool:
         if hasattr(self, "selection"):
             self._cancel_active_pointer_transform()
         entered = self._ensure_selection_kernel().enter_isolation(element)
@@ -3291,7 +3294,8 @@ class DragManager:
             self.selection.clear_targets()
             self.selected_element = None
             self.on_select(None, None)
-            self._notify_selected_element_changed()
+            if notify:
+                self._notify_selected_element_changed()
             self._update_interaction_controls()
             self.figure.canvas.draw_idle()
             schedule_smart_guide_warmup(self)
@@ -4890,10 +4894,12 @@ class DragManager:
                 self.selection.set_alignment_key(picked_element)
 
             if event.dblclick and picked_element is not None:
-                if self.enter_isolation(picked_element):
+                if self.enter_isolation(picked_element, notify=False):
                     inner = kernel.resolve(hit_stack).target
                     if inner is not None:
                         self.select_element(inner, event)
+                    else:
+                        self._notify_selected_element_changed()
                     return
 
             # if the element is a grabber, store it
@@ -4914,7 +4920,6 @@ class DragManager:
                     else (remaining[-1] if remaining else None)
                 )
                 self.select_elements(remaining, primary=primary)
-                self._notify_selected_element_changed()
                 return
             elif (
                 isinstance(picked_element, Axes)
@@ -5051,21 +5056,33 @@ class DragManager:
         if self._cancel_active_pointer_transform():
             return
         print("back edit")
+        notification_revision = int(
+            getattr(self, "_selection_notification_revision", 0)
+        )
         self.figure.change_tracker.backEdit()
         current = [target.target for target in self.selection.targets]
         self.selected_element = current[-1] if current else None
         self._update_interaction_controls()
-        self._notify_selected_element_changed()
+        if int(getattr(self, "_selection_notification_revision", 0)) == (
+            notification_revision
+        ):
+            self._notify_selected_element_changed()
 
     def redo(self):
         if self._cancel_active_pointer_transform():
             return
         print("forward edit")
+        notification_revision = int(
+            getattr(self, "_selection_notification_revision", 0)
+        )
         self.figure.change_tracker.forwardEdit()
         current = [target.target for target in self.selection.targets]
         self.selected_element = current[-1] if current else None
         self._update_interaction_controls()
-        self._notify_selected_element_changed()
+        if int(getattr(self, "_selection_notification_revision", 0)) == (
+            notification_revision
+        ):
+            self._notify_selected_element_changed()
 
     def _cancel_active_pointer_transform(self) -> bool:
         """Rollback an in-flight move/resize and keep the selection intact."""

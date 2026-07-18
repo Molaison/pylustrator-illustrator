@@ -455,17 +455,21 @@ def test_double_click_enters_legend_isolation_and_escape_exits_one_scope() -> No
     manager = attach_drag_manager(fig)
     text = legend.get_texts()[0]
     event = _center_event(fig, text, dblclick=True)
+    fig.signals.selected.clear()
 
     manager.button_press_event0(event)
 
     assert manager.isolation_breadcrumbs == ("Legend",)
     assert manager.selected_element is text
     assert [target.target for target in manager.selection.targets] == [text]
+    assert fig.signals.selected == [text]
 
+    fig.signals.selected.clear()
     manager.key_press_event(KeyEvent("key_press_event", fig.canvas, "escape"))
     assert manager.isolation_breadcrumbs == ()
     assert manager.selected_element is legend
     assert [target.target for target in manager.selection.targets] == [legend]
+    assert fig.signals.selected == [legend]
 
     manager.selection.clear_targets()
     plt.close(fig)
@@ -565,6 +569,7 @@ def test_shift_click_selected_member_toggles_without_starting_drag() -> None:
     manager.select_elements([first, second], primary=second)
     manager.selection.set_alignment_reference("key_object", key=second)
     press = _center_event(fig, first, key="shift")
+    fig.signals.selected.clear()
 
     manager.button_press_event0(press)
 
@@ -573,6 +578,7 @@ def test_shift_click_selected_member_toggles_without_starting_drag() -> None:
     assert manager.selection.alignment_reference_mode == "selection"
     assert manager.selection.alignment_key is None
     assert not manager.selection.got_artist
+    assert fig.signals.selected == [second]
     manager.button_release_event0(press)
     assert [target.target for target in manager.selection.targets] == [second]
     manager.selection.clear_targets()
@@ -786,15 +792,19 @@ def test_undo_redo_preserves_selection_and_isolation_scope() -> None:
     manager.selection.end_move()
     assert len(tracker.edits) == 1
 
+    fig.signals.selected.clear()
     manager.undo()
     assert manager.isolation_breadcrumbs == ("Legend",)
     assert manager.selected_element is text
     assert [target.target for target in manager.selection.targets] == [text]
+    assert fig.signals.selected == [text]
 
+    fig.signals.selected.clear()
     manager.redo()
     assert manager.isolation_breadcrumbs == ("Legend",)
     assert manager.selected_element is text
     assert [target.target for target in manager.selection.targets] == [text]
+    assert fig.signals.selected == [text]
 
     manager.selection.clear_targets()
     plt.close(fig)
@@ -4496,6 +4506,34 @@ def test_backspace_deletes_selected_object() -> None:
     fig.change_tracker.edits[0][0]()
     assert ax.get_visible()
     assert [target.target for target in manager.selection.targets] == [ax]
+    plt.close(fig)
+    assert app is not None
+
+
+def test_delete_undo_redo_emit_one_final_selection_refresh() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 2), dpi=100)
+    rectangle = ax.add_patch(Rectangle((0.2, 0.3), 0.25, 0.2))
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    _install_real_history_tracker(fig)
+    manager.select_element(rectangle)
+
+    fig.signals.selected.clear()
+    manager.selection.delete_targets()
+    assert fig.signals.selected == [None]
+
+    fig.signals.selected.clear()
+    manager.undo()
+    assert rectangle.get_visible()
+    assert fig.signals.selected == [rectangle]
+
+    fig.signals.selected.clear()
+    manager.redo()
+    assert not rectangle.get_visible()
+    assert fig.signals.selected == [None]
+
+    manager.selection.clear_targets()
     plt.close(fig)
     assert app is not None
 
