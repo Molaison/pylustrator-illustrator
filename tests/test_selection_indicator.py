@@ -4801,6 +4801,105 @@ def test_draw_invalidation_releases_externally_removed_artist_rosters() -> None:
     assert app is not None
 
 
+def test_delaxes_prunes_axes_descendants_and_releases_strong_references() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, axes = plt.subplots(figsize=(4, 3), dpi=100)
+    (line,) = axes.plot([0.2, 0.8], [0.3, 0.7])
+    text = axes.text(0.5, 0.5, "detached")
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    references = tuple(weakref.ref(artist) for artist in (axes, line, text))
+    detached_ids = {id(axes), id(line), id(text)}
+
+    assert all(manager._is_artist_attached(artist) for artist in (axes, line, text))
+    fig.delaxes(axes)
+    assert axes.figure is fig
+    assert line.figure is fig
+    assert not manager._is_artist_attached(axes)
+    assert not manager._is_artist_attached(line)
+    assert not manager._is_artist_attached(text)
+
+    manager.invalidate_geometry_cache()
+
+    assert detached_ids.isdisjoint(manager._interaction_artist_ids)
+    assert detached_ids.isdisjoint(manager._selectable_artist_ids)
+    assert detached_ids.isdisjoint(manager.editor_scene._known_artists)
+    assert detached_ids.isdisjoint(manager._selection_parent_by_id)
+    event = MouseEvent("button_press_event", fig.canvas, 200, 150, button=1)
+    assert not detached_ids.intersection(
+        id(artist) for artist in manager.get_hit_stack(event).artists
+    )
+
+    del axes, line, text
+    gc.collect()
+    assert all(reference() is None for reference in references)
+    plt.close(fig)
+    assert app is not None
+
+
+def test_child_and_subfigure_axes_follow_their_live_owner_inventory() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig = plt.figure(figsize=(6, 3), dpi=100)
+    left, _right = fig.subfigures(1, 2)
+    axes = left.subplots()
+    child = axes.inset_axes([0.2, 0.2, 0.4, 0.4])
+    child_text = child.text(0.5, 0.5, "inset")
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+
+    assert axes.figure is left
+    assert axes in left.axes
+    assert child not in fig.axes
+    assert child in axes.child_axes
+    assert manager._is_artist_attached(axes)
+    assert manager._is_artist_attached(child)
+    assert manager._is_artist_attached(child_text)
+    manager.invalidate_geometry_cache()
+    assert axes in manager._selectable_artists
+    assert child in manager._selectable_artists
+
+    left.delaxes(axes)
+    assert axes.figure is left
+    assert child.figure is left
+    assert child in axes.child_axes
+    assert not manager._is_artist_attached(axes)
+    assert not manager._is_artist_attached(child)
+    assert not manager._is_artist_attached(child_text)
+    manager.invalidate_geometry_cache()
+    assert axes not in manager._interaction_artists
+    assert child not in manager._interaction_artists
+    assert child_text not in manager._interaction_artists
+    plt.close(fig)
+    assert app is not None
+
+
+def test_undoable_hidden_axes_remain_attached_and_in_rosters() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, axes = plt.subplots(figsize=(4, 3), dpi=100)
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_element(axes)
+
+    assert manager.set_selection_visible(False)
+    undo = fig.change_tracker.edit[0]
+    manager.invalidate_geometry_cache()
+
+    assert axes in fig.axes
+    assert manager._is_artist_attached(axes)
+    assert axes in manager._interaction_artists
+    assert axes in manager._selectable_artists
+    assert not axes.get_visible()
+
+    undo()
+    manager.invalidate_geometry_cache()
+    assert axes.get_visible()
+    assert manager._is_artist_attached(axes)
+    assert axes in manager._selectable_roster_snapshot().artists
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
 def test_marquee_reuses_nested_legend_child_geometry_per_action() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     fig, ax = plt.subplots(figsize=(4, 3), dpi=100)

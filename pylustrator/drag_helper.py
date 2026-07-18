@@ -4349,6 +4349,27 @@ class DragManager:
         parent_map = getattr(self, "_selection_parent_by_id", {})
         while current is not None and id(current) not in seen:
             seen.add(id(current))
+            if isinstance(current, Axes):
+                owner = parent_map.get(id(current))
+                if isinstance(owner, Axes):
+                    if not any(child is current for child in owner.child_axes):
+                        return False
+                elif isinstance(owner, (Figure, SubFigure)):
+                    if not any(axes is current for axes in owner.axes):
+                        return False
+                else:
+                    figure = getattr(current, "figure", None)
+                    if not isinstance(figure, (Figure, SubFigure)):
+                        return False
+                    live = any(axes is current for axes in figure.axes)
+                    if not live:
+                        live = any(
+                            child is current
+                            for axes in figure.axes
+                            for child in axes.child_axes
+                        )
+                    if not live:
+                        return False
             if isinstance(current, Legend):
                 axes = current.axes
                 if axes is not None:
