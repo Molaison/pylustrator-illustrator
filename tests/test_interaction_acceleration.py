@@ -132,6 +132,125 @@ def test_display_index_build_failure_is_atomic_and_fails_open() -> None:
     ) == (0, 1, 2)
 
 
+def test_incremental_index_is_conservative_without_pointer_side_measurement() -> None:
+    artists = tuple(Artist() for _ in range(4))
+    source_ids = tuple(id(artist) for artist in artists)
+    index = DisplaySpaceHitIndex(cell_size=10)
+    build = index.begin_incremental_build(
+        artists, revision=7, source_ids=source_ids
+    )
+    assert build is not None
+    assert build.add_bounds((0, 0, 5, 5))
+    assert build.add_bounds((20, 20, 25, 25))
+
+    provider_calls = 0
+
+    def pointer_must_not_measure(_artist):
+        nonlocal provider_calls
+        provider_calls += 1
+        raise AssertionError("pointer query performed a synchronous scene build")
+
+    # Measured remote entries may be pruned, while every not-yet-measured
+    # entry remains a conservative native-hit candidate.
+    assert tuple(
+        index.candidate_indices(
+            2,
+            2,
+            artists,
+            revision=7,
+            bounds_provider=pointer_must_not_measure,
+            source_ids=source_ids,
+        )
+    ) == (0, 2, 3)
+    assert provider_calls == 0
+
+    assert build.add_bounds(None)
+    assert build.add_bounds((0, 0, 5, 5))
+    assert build.finish()
+    assert index.is_current(revision=7, source_ids=source_ids)
+    assert tuple(
+        index.candidate_indices(
+            2,
+            2,
+            artists,
+            revision=7,
+            bounds_provider=pointer_must_not_measure,
+            source_ids=source_ids,
+        )
+    ) == (0, 2, 3)
+    assert provider_calls == 0
+
+
+def test_incremental_index_cancels_stale_revision_and_roster_builds() -> None:
+    original = tuple(Artist() for _ in range(3))
+    original_ids = tuple(id(artist) for artist in original)
+    index = DisplaySpaceHitIndex(cell_size=10)
+    invalidated = index.begin_incremental_build(
+        original, revision=1, source_ids=original_ids
+    )
+    assert invalidated is not None
+    assert invalidated.add_bounds((0, 0, 5, 5))
+
+    index.invalidate()
+    assert not invalidated.active
+    assert not invalidated.add_bounds((10, 10, 15, 15))
+    assert not invalidated.finish()
+    assert index.built_revision is None
+    assert index._cells == {}
+
+    superseded = index.begin_incremental_build(
+        original, revision=2, source_ids=original_ids
+    )
+    assert superseded is not None
+    assert superseded.add_bounds((50, 50, 55, 55))
+    replacement = tuple(Artist() for _ in range(2))
+    replacement_ids = tuple(id(artist) for artist in replacement)
+    current = index.begin_incremental_build(
+        replacement, revision=3, source_ids=replacement_ids
+    )
+    assert current is not None
+    assert not superseded.active
+    assert not superseded.finish()
+
+    provider_calls = 0
+
+    def stale_sync_build_must_not_run(_artist):
+        nonlocal provider_calls
+        provider_calls += 1
+        raise AssertionError("replacement query reused stale staging cells")
+
+    # The old three-item roster cannot leak through the replacement's partial
+    # query; both not-yet-measured replacement Artists remain conservative.
+    assert tuple(
+        index.candidate_indices(
+            2,
+            2,
+            replacement,
+            revision=3,
+            bounds_provider=stale_sync_build_must_not_run,
+            source_ids=replacement_ids,
+        )
+    ) == (0, 1)
+    assert provider_calls == 0
+
+    assert current.add_bounds((0, 0, 5, 5))
+    assert current.add_bounds((20, 20, 25, 25))
+    assert current.finish()
+    assert index.is_current(revision=3, source_ids=replacement_ids)
+    assert not index.is_current(revision=2, source_ids=original_ids)
+    assert tuple(
+        index.candidate_indices(
+            2,
+            2,
+            replacement,
+            revision=3,
+            bounds_provider=stale_sync_build_must_not_run,
+            source_ids=replacement_ids,
+        )
+    ) == (0,)
+    assert provider_calls == 0
+
+
 def test_bbox_query_is_conservative_and_keeps_unknown_envelopes() -> None:
     artists = tuple(Artist() for _ in range(6))
     bounds = (

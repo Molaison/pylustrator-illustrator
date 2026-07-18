@@ -104,6 +104,10 @@ class _PendingSceneGuideCapture:
     inventory_ids: tuple[int, ...]
     semantic_key: tuple[str, tuple[int, ...]]
     artists: tuple[tuple[int, Artist], ...]
+    capture_guides: bool
+    hit_artists: tuple[Artist, ...]
+    hit_inventory_ids: tuple[int, ...]
+    hit_build: object | None
     next_index: int = 0
     entries: list[_SceneGuideEntry] = field(default_factory=list)
 
@@ -210,7 +214,9 @@ def _capture_scene_guides(manager) -> _SceneGuideCache:
     # A synchronous caller supersedes any incomplete idle capture.  This path
     # is retained for tests and non-Qt embedders; normal pointer handling only
     # consumes a completed idle cache and otherwise keeps the legacy snaps.
-    manager._smart_guide_pending_capture = None
+    _cancel_pending_capture(
+        manager, getattr(manager, "_smart_guide_pending_capture", None)
+    )
     artists = tuple(_logical_source_artists(manager, artists))
     renderer = manager.figure.canvas.get_renderer()
     geometry = manager._ensure_display_geometry_cache()
@@ -246,29 +252,61 @@ def _cached_scene_guides(manager) -> _SceneGuideCache | None:
 
 
 def schedule_smart_guide_warmup(manager, *, batch_budget_ms: float = 4.0) -> bool:
-    """Measure one scene in small Qt-idle slices without delaying pointer input."""
+    """Warm guide geometry and the hit index in bounded Qt-idle slices."""
 
     if not bool(getattr(manager, "_smart_guide_idle_warmup_enabled", True)):
-        return False
-    if _cached_scene_guides(manager) is not None:
         return False
     if QtWidgets.QApplication.instance() is None:
         return False
     artists, revision, inventory_ids, semantic_key = _scene_state(manager)
+    guides_current = _cache_matches(
+        getattr(manager, "_smart_guide_scene_cache", None),
+        revision,
+        inventory_ids,
+        semantic_key,
+    )
+    hit_roster, _editable, _order = manager._interaction_roster_snapshot()
+    hit_index = manager._ensure_interaction_index()
+    hit_current = hit_index.is_current(
+        revision=revision, source_ids=hit_roster.source_ids
+    )
+    if guides_current and hit_current:
+        return False
     pending = getattr(manager, "_smart_guide_pending_capture", None)
     if (
         isinstance(pending, _PendingSceneGuideCapture)
         and pending.revision == revision
         and pending.inventory_ids is inventory_ids
         and pending.semantic_key == semantic_key
+        and pending.hit_inventory_ids is hit_roster.source_ids
     ):
         return False
-    logical = tuple(enumerate(_logical_source_artists(manager, artists)))
+    _cancel_pending_capture(manager, pending)
+    logical = (
+        ()
+        if guides_current
+        else tuple(enumerate(_logical_source_artists(manager, artists)))
+    )
+    hit_build = (
+        None
+        if hit_current
+        else hit_index.begin_incremental_build(
+            hit_roster.artists,
+            revision=revision,
+            source_ids=hit_roster.source_ids,
+        )
+    )
+    if guides_current and hit_build is None:
+        return False
     pending = _PendingSceneGuideCapture(
-        revision,
-        inventory_ids,
-        semantic_key,
-        logical,
+        revision=revision,
+        inventory_ids=inventory_ids,
+        semantic_key=semantic_key,
+        artists=logical,
+        capture_guides=not guides_current,
+        hit_artists=hit_roster.artists,
+        hit_inventory_ids=hit_roster.source_ids,
+        hit_build=hit_build,
     )
     manager._smart_guide_pending_capture = pending
     budget = max(float(batch_budget_ms), 0.25) / 1000.0
@@ -283,17 +321,21 @@ def schedule_smart_guide_warmup(manager, *, batch_budget_ms: float = 4.0) -> boo
         ):
             # Never measure deferred preview geometry.  Release/draw schedules
             # a fresh idle capture from the committed or restored scene.
-            manager._smart_guide_pending_capture = None
+            _cancel_pending_capture(manager, pending)
             return
         _, current_revision, current_ids, current_key = _scene_state(
             manager
+        )
+        current_hit_roster, _editable, _order = (
+            manager._interaction_roster_snapshot()
         )
         if (
             current_revision != pending.revision
             or current_ids is not pending.inventory_ids
             or current_key != pending.semantic_key
+            or current_hit_roster.source_ids is not pending.hit_inventory_ids
         ):
-            manager._smart_guide_pending_capture = None
+            _cancel_pending_capture(manager, pending)
             return
         renderer = manager.figure.canvas.get_renderer()
         geometry = manager._ensure_display_geometry_cache()
@@ -301,26 +343,69 @@ def schedule_smart_guide_warmup(manager, *, batch_budget_ms: float = 4.0) -> boo
         scope_id = f"figure:{id(manager.figure)}"
         deadline = perf_counter() + budget
         with geometry.snapshot():
-            while pending.next_index < len(pending.artists):
-                order, artist = pending.artists[pending.next_index]
-                pending.next_index += 1
-                entry = _measure_scene_guide(
-                    manager, scene, renderer, geometry, scope_id, order, artist
-                )
-                if entry is not None:
-                    pending.entries.append(entry)
+            while True:
+                worked = False
+                hit_build = pending.hit_build
+                if (
+                    hit_build is not None
+                    and hit_build.active
+                    and not hit_build.complete
+                ):
+                    hit_artist = pending.hit_artists[hit_build.next_index]
+                    try:
+                        bounds = manager._interaction_index_bounds(
+                            hit_artist, geometry
+                        )
+                    except Exception:
+                        # Keep pointer handling fail-open if an unusual Artist
+                        # cannot be measured safely during idle work.
+                        hit_build.cancel()
+                        pending.hit_build = None
+                    else:
+                        hit_build.add_bounds(bounds)
+                    worked = True
+                if (
+                    pending.capture_guides
+                    and pending.next_index < len(pending.artists)
+                ):
+                    order, artist = pending.artists[pending.next_index]
+                    pending.next_index += 1
+                    entry = _measure_scene_guide(
+                        manager,
+                        scene,
+                        renderer,
+                        geometry,
+                        scope_id,
+                        order,
+                        artist,
+                    )
+                    if entry is not None:
+                        pending.entries.append(entry)
+                    worked = True
+                if not worked:
+                    break
                 if perf_counter() >= deadline:
                     break
-        if pending.next_index < len(pending.artists):
+        hit_build = pending.hit_build
+        if hit_build is not None and hit_build.active and hit_build.complete:
+            if hit_build.finish():
+                pending.hit_build = None
+        if (
+            pending.capture_guides
+            and pending.next_index == len(pending.artists)
+        ):
+            result = _SceneGuideCache(
+                pending.revision,
+                pending.inventory_ids,
+                pending.semantic_key,
+                tuple(pending.entries),
+            )
+            manager._smart_guide_scene_cache = result
+            pending.capture_guides = False
+        hit_pending = hit_build is not None and hit_build.active
+        if pending.capture_guides or hit_pending:
             QtCore.QTimer.singleShot(0, step)
             return
-        result = _SceneGuideCache(
-            pending.revision,
-            pending.inventory_ids,
-            pending.semantic_key,
-            tuple(pending.entries),
-        )
-        manager._smart_guide_scene_cache = result
         manager._smart_guide_pending_capture = None
 
     QtCore.QTimer.singleShot(0, step)
@@ -330,8 +415,21 @@ def schedule_smart_guide_warmup(manager, *, batch_budget_ms: float = 4.0) -> boo
 def invalidate_smart_guide_cache(manager) -> None:
     """Drop measured scene guides after a renderer/inventory revision."""
 
+    _cancel_pending_capture(
+        manager, getattr(manager, "_smart_guide_pending_capture", None)
+    )
     setattr(manager, "_smart_guide_scene_cache", None)
-    setattr(manager, "_smart_guide_pending_capture", None)
+
+
+def _cancel_pending_capture(manager, pending) -> None:
+    """Cancel both halves of an unpublished idle capture."""
+
+    if isinstance(pending, _PendingSceneGuideCapture):
+        hit_build = pending.hit_build
+        if hit_build is not None and hit_build.active:
+            hit_build.cancel()
+    if getattr(manager, "_smart_guide_pending_capture", None) is pending:
+        manager._smart_guide_pending_capture = None
 
 
 def _logical_source_artists(manager, artists: Iterable[Artist]) -> list[Artist]:
