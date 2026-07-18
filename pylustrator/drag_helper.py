@@ -461,9 +461,15 @@ class GrabbableRectangleSelection(GrabFunctions):
         if not getattr(self, "_batch_add_targets", False):
             self._clear_custom_rotation_pivot()
 
-        new_points = np.array(target.get_selection_points())
-        if len(new_points) == 0:
+        new_points = np.asarray(target.get_selection_points(), dtype=float)
+        if (
+            new_points.ndim != 2
+            or new_points.shape[0] == 0
+            or new_points.shape[1] < 2
+            or not np.all(np.isfinite(new_points[:, :2]))
+        ):
             return
+        new_points = new_points[:, :2]
 
         self.targets.append(target)
 

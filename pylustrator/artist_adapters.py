@@ -6,10 +6,12 @@ between those two worlds.  Every editable artist is resolved to one adapter
 which owns its geometry, capabilities, mutations, undo snapshots, and change
 records.
 
-The registry deliberately resolves by MRO specificity.  That makes subclass
-semantics explicit: for example, ``Annotation`` is handled before ``Text`` and
-``ConnectionPatch`` before ``FancyArrowPatch`` without depending on a fragile
-order of ``isinstance`` branches.
+The registry deliberately resolves by MRO specificity while making inheritance
+an explicit contract.  Registrations match their exact Artist type by default;
+an adapter must opt in before subclasses may inherit its mutation semantics.
+That keeps semantic subclasses such as Matplotlib's 3D artists from silently
+using incompatible 2D writers while still allowing explicitly validated
+extension hierarchies.
 """
 
 from __future__ import annotations
@@ -19,11 +21,13 @@ from copy import copy, deepcopy
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
+from enum import Enum
 from numbers import Integral, Real
 from threading import RLock
 from typing import Iterable, Optional, Sequence
 
 import matplotlib as mpl
+import matplotlib.collections as mpl_collections
 import numpy as np
 from matplotlib.artist import Artist
 
@@ -655,6 +659,12 @@ class ArtistCapabilities:
 
     @property
     def editable(self) -> bool:
+        """Backward-compatible shorthand for directly movable selections.
+
+        Use ``can_select`` for selection admission and the individual
+        operation fields for actions; a selectable Artist need not move.
+        """
+
         return self.can_select and self.can_translate
 
 
@@ -863,7 +873,14 @@ class ArtistAdapter:
 
     @property
     def supported(self) -> bool:
-        return self.capabilities.editable
+        """Whether the Artist may enter selection.
+
+        Selection is intentionally independent from translation.  Property-
+        only and layout-managed Artists still need an honest selection box;
+        each mutation checks its own semantic operation at gesture start.
+        """
+
+        return self.capabilities.can_select
 
     def operation_support(
         self, operation: TransformOperation | str
@@ -2108,12 +2125,78 @@ class ArtistAdapter:
         ]
 
 
+class AdapterInheritancePolicy(str, Enum):
+    """Whether one adapter registration may serve Artist subclasses.
+
+    ``EXACT`` is the safe default: only the registered concrete Artist type is
+    accepted.  ``VALIDATED`` is an explicit assertion by the adapter author
+    that every subclass covered by that registration preserves the adapter's
+    geometry, mutation, snapshot, and serialization contracts.
+    """
+
+    EXACT = "exact"
+    VALIDATED = "validated"
+
+    @classmethod
+    def coerce(
+        cls, value: "AdapterInheritancePolicy | str"
+    ) -> "AdapterInheritancePolicy":
+        if isinstance(value, cls):
+            return value
+        try:
+            return cls(str(value).lower())
+        except ValueError as error:
+            choices = ", ".join(policy.value for policy in cls)
+            raise ValueError(
+                f"inheritance_policy must be one of: {choices}"
+            ) from error
+
+
+class UnsupportedSubclassAdapter(ArtistAdapter):
+    """Fail-closed adapter for a subclass without an inheritance contract."""
+
+    def __init__(
+        self,
+        target: Artist,
+        *,
+        blocked_registration: "AdapterRegistration | None" = None,
+    ):
+        super().__init__(target)
+        self.blocked_registration = blocked_registration
+
+    def operation_support(
+        self, operation: TransformOperation | str
+    ) -> OperationSupport:
+        operation = TransformOperation.coerce(operation)
+        registration = self.blocked_registration
+        if registration is None:  # pragma: no cover - registry always supplies it
+            reason = (
+                f"{type(self.target).__name__} has no validated adapter "
+                "inheritance contract"
+            )
+        else:
+            reason = (
+                f"{type(self.target).__name__} is a subclass of registered "
+                f"{registration.artist_type.__name__}, but "
+                f"{registration.adapter_type.__name__} is exact-only; register "
+                "this concrete Artist type or explicitly use validated "
+                "inheritance"
+            )
+        return OperationSupport.denied(operation, reason)
+
 @dataclass(frozen=True)
 class AdapterRegistration:
     artist_type: type
     adapter_type: type[ArtistAdapter]
     priority: int
     order: int
+    inheritance_policy: AdapterInheritancePolicy = AdapterInheritancePolicy.EXACT
+
+    def accepts(self, concrete: type) -> bool:
+        return concrete is self.artist_type or (
+            self.inheritance_policy is AdapterInheritancePolicy.VALIDATED
+            and issubclass(concrete, self.artist_type)
+        )
 
 
 class ArtistAdapterRegistry:
@@ -2122,6 +2205,7 @@ class ArtistAdapterRegistry:
     def __init__(self):
         self._registrations: list[AdapterRegistration] = []
         self._cache: dict[type, type[ArtistAdapter]] = {}
+        self._blocked_cache: dict[type, AdapterRegistration] = {}
         self._lock = RLock()
         self._next_order = 0
 
@@ -2132,6 +2216,9 @@ class ArtistAdapterRegistry:
         *,
         priority: int = 0,
         replace: bool = False,
+        inheritance_policy: AdapterInheritancePolicy | str = (
+            AdapterInheritancePolicy.EXACT
+        ),
     ) -> type[ArtistAdapter]:
         if not isinstance(artist_type, type) or not issubclass(artist_type, Artist):
             raise TypeError("artist_type must be an Artist subclass")
@@ -2139,6 +2226,7 @@ class ArtistAdapterRegistry:
             adapter_type, ArtistAdapter
         ):
             raise TypeError("adapter_type must be an ArtistAdapter subclass")
+        inheritance_policy = AdapterInheritancePolicy.coerce(inheritance_policy)
         with self._lock:
             if replace:
                 self._registrations = [
@@ -2148,11 +2236,16 @@ class ArtistAdapterRegistry:
                 ]
             self._registrations.append(
                 AdapterRegistration(
-                    artist_type, adapter_type, int(priority), self._next_order
+                    artist_type,
+                    adapter_type,
+                    int(priority),
+                    self._next_order,
+                    inheritance_policy,
                 )
             )
             self._next_order += 1
             self._cache.clear()
+            self._blocked_cache.clear()
         return adapter_type
 
     def unregister(
@@ -2170,6 +2263,7 @@ class ArtistAdapterRegistry:
                 )
             ]
             self._cache.clear()
+            self._blocked_cache.clear()
 
     def registrations(self) -> tuple[AdapterRegistration, ...]:
         with self._lock:
@@ -2184,38 +2278,62 @@ class ArtistAdapterRegistry:
             # MRO matches more specific.
             return len(concrete.mro()) + 1
 
+    def _registration_rank(
+        self, concrete: type, registration: AdapterRegistration
+    ) -> tuple[int, int, int]:
+        return (
+            self._mro_distance(concrete, registration.artist_type),
+            -registration.priority,
+            -registration.order,
+        )
+
+    def _resolve_uncached(self, concrete: type) -> type[ArtistAdapter]:
+        candidates = [
+            item
+            for item in self._registrations
+            if issubclass(concrete, item.artist_type)
+        ]
+        if not candidates:
+            raise LookupError(f"No artist adapter registered for {concrete!r}")
+        selected = min(
+            candidates,
+            key=lambda item: self._registration_rank(concrete, item),
+        )
+        if selected.accepts(concrete):
+            adapter_type = selected.adapter_type
+        else:
+            adapter_type = UnsupportedSubclassAdapter
+            self._blocked_cache[concrete] = selected
+        self._cache[concrete] = adapter_type
+        return adapter_type
+
     def resolve_type(self, target_or_type) -> type[ArtistAdapter]:
         concrete = target_or_type if isinstance(target_or_type, type) else type(target_or_type)
         with self._lock:
             cached = self._cache.get(concrete)
             if cached is not None:
                 return cached
-            matches = [
-                item
-                for item in self._registrations
-                if issubclass(concrete, item.artist_type)
-            ]
-            if not matches:
-                raise LookupError(f"No artist adapter registered for {concrete!r}")
-            selected = min(
-                matches,
-                key=lambda item: (
-                    self._mro_distance(concrete, item.artist_type),
-                    -item.priority,
-                    -item.order,
-                ),
-            )
-            self._cache[concrete] = selected.adapter_type
-            return selected.adapter_type
+            return self._resolve_uncached(concrete)
 
     def create(self, target: Artist) -> ArtistAdapter:
-        return self.resolve_type(target)(target)
+        with self._lock:
+            concrete = type(target)
+            adapter_type = self._cache.get(concrete)
+            if adapter_type is None:
+                adapter_type = self._resolve_uncached(concrete)
+            blocked_registration = self._blocked_cache.get(concrete)
+        if blocked_registration is not None:
+            return UnsupportedSubclassAdapter(
+                target,
+                blocked_registration=blocked_registration,
+            )
+        return adapter_type(target)
 
     def capabilities_for(self, target: Artist) -> ArtistCapabilities:
         return self.resolve_type(target).capabilities_for(target)
 
     def supports(self, target: Artist) -> bool:
-        return self.capabilities_for(target).editable
+        return self.capabilities_for(target).can_select
 
 
 class PatchAdapter(ArtistAdapter):
@@ -6266,13 +6384,25 @@ def register_artist_adapter(
     *,
     priority: int = 0,
     replace: bool = False,
+    inheritance_policy: AdapterInheritancePolicy | str = (
+        AdapterInheritancePolicy.EXACT
+    ),
     registry: ArtistAdapterRegistry = artist_adapter_registry,
 ):
-    """Decorator for built-in or third-party adapter registration."""
+    """Decorator for built-in or third-party adapter registration.
+
+    Registrations are exact-only unless the adapter author explicitly sets
+    ``inheritance_policy=AdapterInheritancePolicy.VALIDATED`` after validating
+    the full subclass geometry, mutation, snapshot, and replay contract.
+    """
 
     def decorator(adapter_type: type[ArtistAdapter]):
         registry.register(
-            artist_type, adapter_type, priority=priority, replace=replace
+            artist_type,
+            adapter_type,
+            priority=priority,
+            replace=replace,
+            inheritance_policy=inheritance_policy,
         )
         return adapter_type
 
@@ -6285,8 +6415,13 @@ def get_artist_adapter(target: Artist) -> ArtistAdapter:
 
 # Registration order is intentionally not semantic.  Resolution uses MRO
 # distance, then priority and only then registration order for true ties.
-for _artist_type, _adapter_type in (
-    (Artist, ArtistAdapter),
+artist_adapter_registry.register(
+    Artist,
+    ArtistAdapter,
+    inheritance_policy=AdapterInheritancePolicy.VALIDATED,
+)
+
+_BUILTIN_ADAPTER_REGISTRATIONS = (
     (EditorGroup, EditorGroupAdapter),
     (Axes, AxesAdapter),
     (Text, TextAdapter),
@@ -6306,11 +6441,21 @@ for _artist_type, _adapter_type in (
     (PathCollection, PathCollectionAdapter),
     (LineCollection, LineCollectionAdapter),
     (PolyCollection, PolyCollectionAdapter),
-):
+)
+_fill_between_type = getattr(
+    mpl_collections, "FillBetweenPolyCollection", None
+)
+if _fill_between_type is not None:
+    _BUILTIN_ADAPTER_REGISTRATIONS += (
+        (_fill_between_type, PolyCollectionAdapter),
+    )
+
+for _artist_type, _adapter_type in _BUILTIN_ADAPTER_REGISTRATIONS:
     artist_adapter_registry.register(_artist_type, _adapter_type)
 
 
 __all__ = [
+    "AdapterInheritancePolicy",
     "AdapterRegistration",
     "AnnotationAdapter",
     "AppearanceScalePlan",
@@ -6338,6 +6483,7 @@ __all__ = [
     "RigidRotationPlan",
     "TextAdapter",
     "UnsupportedArtistError",
+    "UnsupportedSubclassAdapter",
     "WedgeAdapter",
     "artist_adapter_registry",
     "active_layout_owner_for_artist",

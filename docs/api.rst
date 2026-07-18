@@ -42,12 +42,32 @@ Third-party Matplotlib artists can opt in without modifying Pylustrator:
         def _apply_native_control_points(self, points):
             self.target.position = points[0]
 
+Registrations match only the exact Artist type by default.  This prevents a
+semantic subclass (for example a 3D Artist inheriting a 2D Matplotlib class)
+from reusing incompatible mutation code.  When an extension owns an entire
+class hierarchy and has validated that every descendant preserves the same
+geometry, snapshot, and replay contracts, it can explicitly opt in:
+
+.. code-block:: python
+
+    from pylustrator import AdapterInheritancePolicy
+
+    @register_artist_adapter(
+        MyArtist,
+        inheritance_policy=AdapterInheritancePolicy.VALIDATED,
+    )
+    class MyArtistHierarchyAdapter(ArtistAdapter):
+        ...
+
 Adapters that support saving should also set ``can_serialize=True`` and return
 ``ChangeRecord`` objects from ``serialize_changes``.  Resize capability should
 only be enabled when the committed native state can exactly reproduce the
 display-space preview.
 
 .. autoclass:: pylustrator.ArtistCapabilities
+   :members:
+
+.. autoclass:: pylustrator.AdapterInheritancePolicy
    :members:
 
 .. autoclass:: pylustrator.ArtistAdapter

@@ -10,6 +10,7 @@ import matplotlib
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
+import matplotlib.collections as mpl_collections
 import matplotlib.patheffects as path_effects
 import numpy as np
 import pytest
@@ -304,6 +305,16 @@ def _poly_collection(_fig, ax):
     return target
 
 
+def _fill_between_poly_collection(_fig, ax):
+    return ax.fill_between(
+        [0.12, 0.4, 0.78],
+        [0.24, 0.52, 0.34],
+        [0.14, 0.2, 0.18],
+        color="tab:blue",
+        alpha=0.5,
+    )
+
+
 # Capability tuple order follows ArtistCapabilities field order:
 # select, translate, resize, snapshot, serialize, fixed_aspect, rotate,
 # rigid_rotate.
@@ -450,6 +461,17 @@ ARTIST_CASES = (
     ),
 )
 
+if hasattr(mpl_collections, "FillBetweenPolyCollection"):
+    ARTIST_CASES += (
+        ArtistCase(
+            "FillBetweenPolyCollection",
+            mpl_collections.FillBetweenPolyCollection,
+            PolyCollectionAdapter,
+            (True, True, False, True, True, False, False, True),
+            _fill_between_poly_collection,
+        ),
+    )
+
 
 def _build_case(spec: ArtistCase) -> BuiltArtistCase:
     fig, ax = plt.subplots(figsize=(5, 4), dpi=100)
@@ -555,6 +577,7 @@ SEMANTIC_OPERATION_SUPPORT = {
         "PathCollection",
         "LineCollection",
         "PolyCollection",
+        "FillBetweenPolyCollection",
     },
     TransformOperation.REFLOW_LAYOUT: {"Legend"},
 }
@@ -586,6 +609,8 @@ APPEARANCE_CASE_NAMES = (
     "LineCollection",
     "PolyCollection",
 )
+if hasattr(mpl_collections, "FillBetweenPolyCollection"):
+    APPEARANCE_CASE_NAMES += ("FillBetweenPolyCollection",)
 
 
 @pytest.fixture(params=APPEARANCE_CASE_NAMES)
@@ -2609,6 +2634,7 @@ def test_direct_editor_group_rigid_failure_rolls_back_members_and_records() -> N
         owner=ax,
     )
     fig.canvas.draw()
+    artist_adapter_registry.register(FailingGroupPolygon, PolygonAdapter)
     adapter = get_artist_adapter(group)
     members = [get_artist_adapter(target) for target in (first, second)]
     before = [member.snapshot() for member in members]
@@ -2629,6 +2655,7 @@ def test_direct_editor_group_rigid_failure_rolls_back_members_and_records() -> N
         )
         assert tracker.capture_recording_state() == recording_before
     finally:
+        artist_adapter_registry.unregister(FailingGroupPolygon, PolygonAdapter)
         plt.close(fig)
 
 
@@ -3908,6 +3935,7 @@ def test_singular_collection_offset_transform_fails_capability_preflight(kind) -
         assert not adapter.capabilities.can_translate
         assert not adapter.capabilities.can_snapshot
         assert adapter.capabilities.can_serialize
+        assert TargetWrapper.supports_target(target)
         assert len(adapter.selection_points())
         with pytest.raises(UnsupportedArtistError):
             adapter.translate(TRANSLATION)
@@ -4457,6 +4485,9 @@ def test_failed_multi_artist_rotation_rolls_back_native_angles() -> None:
     second = ax.add_patch(FailingRotationRectangle((0.6, 0.25), 0.2, 0.3))
     second.fail_rotation = True
     fig.canvas.draw()
+    artist_adapter_registry.register(
+        FailingRotationRectangle, RectangleAdapter
+    )
 
     try:
         plan = TransformPlan.preflight(
@@ -4467,6 +4498,9 @@ def test_failed_multi_artist_rotation_rolls_back_native_angles() -> None:
         assert first.get_angle() == pytest.approx(0.0)
         assert second.get_angle() == pytest.approx(0.0)
     finally:
+        artist_adapter_registry.unregister(
+            FailingRotationRectangle, RectangleAdapter
+        )
         plt.close(fig)
 
 
@@ -4491,6 +4525,7 @@ def test_failed_rigid_rotation_rolls_back_geometry_and_recording() -> None:
         )
     )
     fig.canvas.draw()
+    artist_adapter_registry.register(FailingRigidPolygon, PolygonAdapter)
     adapters = [get_artist_adapter(target) for target in (first, second)]
     before = [adapter.snapshot() for adapter in adapters]
     bounds = np.array(
@@ -4520,6 +4555,7 @@ def test_failed_rigid_rotation_rolls_back_geometry_and_recording() -> None:
         )
         assert tracker.capture_recording_state() == recording_before
     finally:
+        artist_adapter_registry.unregister(FailingRigidPolygon, PolygonAdapter)
         plt.close(fig)
 
 

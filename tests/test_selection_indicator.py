@@ -30,7 +30,9 @@ from matplotlib.transforms import IdentityTransform
 from qtpy import QtCore, QtGui, QtWidgets
 
 from pylustrator.artist_adapters import (
+    PolygonAdapter,
     UnsupportedArtistError,
+    artist_adapter_registry,
     selection_geometry_snapshot,
 )
 from pylustrator.components.plot_layout import (
@@ -3572,7 +3574,9 @@ def test_escape_cancels_native_rotation_preview_without_recording() -> None:
     assert app is not None
 
 
-def test_rigid_preview_rollback_continues_after_one_target_restore_fails() -> None:
+def test_rigid_preview_rollback_continues_after_one_target_restore_fails(
+    request,
+) -> None:
     class PersistentFailurePolygon(Polygon):
         def __init__(self, *args, **kwargs):
             self.set_xy_calls = 0
@@ -3596,6 +3600,12 @@ def test_rigid_preview_rollback_continues_after_one_target_restore_fails() -> No
         )
     )
     artists = [first, second]
+    artist_adapter_registry.register(PersistentFailurePolygon, PolygonAdapter)
+    request.addfinalizer(
+        lambda: artist_adapter_registry.unregister(
+            PersistentFailurePolygon, PolygonAdapter
+        )
+    )
     fig.canvas.draw()
     manager = attach_drag_manager(fig)
     fig.signals.figure_selection_property_changed = Signal()
