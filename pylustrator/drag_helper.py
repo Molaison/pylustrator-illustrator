@@ -2567,6 +2567,7 @@ class DragManager:
             is_group=self._interaction_is_group,
             label_of=self._interaction_label,
         )
+        self._selection_semantic_mode = SelectionMode.OBJECT
 
         self.figure.canvas.mpl_disconnect(
             self.figure.canvas.manager.key_press_handler_id
@@ -2960,10 +2961,50 @@ class DragManager:
         if callable(emit):
             emit(element)
 
+    def _reconcile_selection_for_mode(self) -> bool:
+        """Make the retained selection obey the active tool's object policy.
+
+        Tool changes must not leave a logical group draggable by Direct
+        Selection, or a direct group member draggable as though Object
+        Selection were still active. Programmatic mode changes are uncommon,
+        so this work only rebuilds overlays when semantic targets differ.
+        """
+
+        selection = getattr(self, "selection", None)
+        if selection is None:
+            return False
+        current = [target.target for target in selection.targets]
+        if not current:
+            if self.selected_element is None:
+                return False
+            self.selected_element = None
+            self._notify_selected_element_changed()
+            return True
+
+        kernel = self._ensure_selection_kernel()
+        mapped = kernel.map_artists(current)
+        mapped_primary = kernel.map_artists(
+            [] if self.selected_element is None else [self.selected_element]
+        )
+        primary = mapped_primary[-1] if mapped_primary else None
+        if primary is None and mapped:
+            primary = mapped[-1]
+        unchanged = len(current) == len(mapped) and all(
+            before is after for before, after in zip(current, mapped)
+        )
+        if unchanged and self.selected_element is primary:
+            return False
+
+        self.select_elements(mapped, primary=primary)
+        self._notify_selected_element_changed()
+        return True
+
     def set_selection_mode(self, mode: SelectionMode | str) -> SelectionMode:
         if hasattr(self, "selection"):
             self._cancel_active_pointer_transform()
         result = self._ensure_selection_kernel().set_mode(mode)
+        self._reconcile_selection_for_mode()
+        self._selection_semantic_mode = result
         invalidate_smart_guide_cache(self)
         schedule_smart_guide_warmup(self)
         self._update_interaction_controls()
@@ -4241,30 +4282,35 @@ class DragManager:
             return
         if event.button == 1:
             self._hide_preselection()
+            if (
+                getattr(self, "_selection_semantic_mode", None)
+                is not self.selection_mode
+            ):
+                self._reconcile_selection_for_mode()
+                self._selection_semantic_mode = self.selection_mode
+            selected = [target.target for target in self.selection.targets]
             last = (
-                self.selection.targets[-1].target
-                if len(self.selection.targets)
-                else None
-            )
-            contained = np.any(
-                [t.target.contains(event)[0] for t in self.selection.targets]
+                self.selected_element
+                if any(target is self.selected_element for target in selected)
+                else (selected[-1] if selected else None)
             )
 
             hit_stack = self.get_hit_stack(event)
-            # Keep the exact-leaf API active so unsupported foreground objects
-            # retain their blocking semantics.
-            raw_picked, _ = self.get_picked_element(event)
             click_through = _event_has_modifier(
                 event, "alt"
             ) or _event_has_modifier(event, "option")
+            shift = _event_has_modifier(event, "shift")
             kernel = self._ensure_selection_kernel()
-            picked_element = kernel.pick(
+            resolution = kernel.resolve(
                 hit_stack,
                 cycle_from=last if click_through else None,
                 wrap=click_through,
             )
-            if kernel.mode is SelectionMode.DIRECT and picked_element is None:
-                picked_element = raw_picked
+            picked_element = resolution.target
+            self._last_pick_blocked = resolution.blocked
+            picked_is_selected = any(
+                target is picked_element for target in selected
+            )
 
             if (
                 self.selection.alignment_reference_mode == "key_object"
@@ -4276,16 +4322,15 @@ class DragManager:
             if (
                 self.selection.alignment_reference_mode == "key_object"
                 and len(self.selection.targets) >= 2
-                and picked_element
-                in [target.target for target in self.selection.targets]
+                and picked_is_selected
                 and not click_through
-                and not _event_has_modifier(event, "shift")
+                and not shift
             ):
                 self.selection.set_alignment_key(picked_element)
 
             if event.dblclick and picked_element is not None:
                 if self.enter_isolation(picked_element):
-                    inner = kernel.pick(hit_stack)
+                    inner = kernel.resolve(hit_stack).target
                     if inner is not None:
                         self.select_element(inner, event)
                     return
@@ -4296,31 +4341,49 @@ class DragManager:
                 return
             if isinstance(picked_element, GrabberGeneric):
                 self.grab_element = picked_element
+            elif shift and picked_is_selected:
+                remaining = [
+                    target for target in selected if target is not picked_element
+                ]
+                primary = (
+                    self.selected_element
+                    if any(
+                        target is self.selected_element for target in remaining
+                    )
+                    else (remaining[-1] if remaining else None)
+                )
+                self.select_elements(remaining, primary=primary)
+                self._notify_selected_element_changed()
+                return
             elif (
                 isinstance(picked_element, Axes)
-                and not contained
+                and not picked_is_selected
                 and not event.dblclick
             ):
                 self._start_marquee_selection(event, click_element=picked_element)
                 return
-            elif picked_element is None and not contained:
+            elif picked_element is None:
                 self._start_marquee_selection(event)
                 return
-            # if not, we want to keep our selected element, if the click was in the area of the selected element
+            # Keep a multi-selection only when the resolved target is one of
+            # its members. An overlapped old selection cannot suppress the
+            # visually foreground target.
             elif (
-                len(self.selection.targets) == 0
-                or not contained
+                not picked_is_selected
                 or event.dblclick
                 or click_through
             ):
                 self.select_element(picked_element, event)
-                contained = True
+                picked_is_selected = any(
+                    target.target is picked_element
+                    for target in self.selection.targets
+                )
 
             # if we have a grabber, notify it
             if self.grab_element:
                 self.grab_element.button_press_event(event)
             # if not, notify the selected element
-            elif contained and self.selection.operation_support(
+            elif picked_is_selected and self.selection.operation_support(
                 TransformOperation.TRANSLATE
             ).supported:
                 self.selection.button_press_event(event)
@@ -4357,6 +4420,7 @@ class DragManager:
         )
 
         current = [target.target for target in self.selection.targets]
+        self._selection_semantic_mode = self.selection_mode
         if primary == self.selected_element and current == elements:
             return elements
 

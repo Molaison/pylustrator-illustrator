@@ -318,6 +318,48 @@ def test_hit_stack_is_front_to_back_and_exposes_all_overlapping_candidates() -> 
     assert app is not None
 
 
+def test_pointer_press_uses_one_resolution_and_foreground_wins_old_selection() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    lower = ax.add_patch(Rectangle((0.2, 0.2), 0.6, 0.6, zorder=2))
+    upper = ax.add_patch(Rectangle((0.2, 0.2), 0.6, 0.6, zorder=5))
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_element(lower)
+    x, y = ax.transData.transform((0.5, 0.5))
+    press = MouseEvent("button_press_event", fig.canvas, x, y, button=1)
+    release = MouseEvent("button_release_event", fig.canvas, x, y, button=1)
+
+    calls = {"hit_stack": 0, "lower_contains": 0}
+    original_get_hit_stack = manager.get_hit_stack
+    original_lower_contains = lower.contains
+
+    def counted_hit_stack(event):
+        calls["hit_stack"] += 1
+        return original_get_hit_stack(event)
+
+    def counted_lower_contains(event):
+        calls["lower_contains"] += 1
+        return original_lower_contains(event)
+
+    def forbidden_legacy_pick(*_args, **_kwargs):
+        raise AssertionError("pointer press must not perform a second raw-leaf lookup")
+
+    manager.get_hit_stack = counted_hit_stack
+    manager.get_picked_element = forbidden_legacy_pick
+    lower.contains = counted_lower_contains
+
+    manager.button_press_event0(press)
+
+    assert calls == {"hit_stack": 1, "lower_contains": 1}
+    assert manager.selected_element is upper
+    assert [target.target for target in manager.selection.targets] == [upper]
+    manager.button_release_event0(release)
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
 def test_hover_preselection_and_candidate_entries_use_same_resolver() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
@@ -437,6 +479,88 @@ def test_logical_group_selects_as_one_object_but_direct_tool_reaches_member() ->
     manager.set_selection_mode(SelectionMode.DIRECT)
     assert manager.get_hit_candidates(event)[0] is first
 
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_v_a_switch_reconciles_group_and_leaf_selection_semantics() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    first = ax.add_patch(Rectangle((0.15, 0.2), 0.25, 0.3, zorder=3))
+    second = ax.add_patch(Rectangle((0.55, 0.2), 0.25, 0.3, zorder=3))
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_elements([first, second], primary=second)
+    group = manager.group_selection("Pair")
+
+    manager.key_press_event(KeyEvent("key_press_event", fig.canvas, "a"))
+
+    assert manager.selection_mode is SelectionMode.DIRECT
+    assert manager.selection.targets == []
+    assert manager.selected_element is None
+
+    press = _center_event(fig, first)
+    manager.button_press_event0(press)
+    manager.button_release_event0(press)
+    assert [target.target for target in manager.selection.targets] == [first]
+
+    manager.key_press_event(KeyEvent("key_press_event", fig.canvas, "v"))
+
+    assert manager.selection_mode is SelectionMode.OBJECT
+    assert [target.target for target in manager.selection.targets] == [group]
+    assert manager.selected_element is group
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_direct_isolation_never_falls_back_to_leaf_outside_scope() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    first = ax.add_patch(Rectangle((0.1, 0.2), 0.2, 0.25, zorder=3))
+    second = ax.add_patch(Rectangle((0.4, 0.2), 0.2, 0.25, zorder=3))
+    outside = ax.add_patch(Rectangle((0.72, 0.65), 0.18, 0.2, zorder=8))
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_elements([first, second], primary=second)
+    group = manager.group_selection("Isolated pair")
+    assert manager.enter_isolation(group)
+    manager.set_selection_mode(SelectionMode.DIRECT)
+    press = _center_event(fig, outside)
+
+    manager.button_press_event0(press)
+
+    assert manager.marquee_start is not None
+    assert manager.selected_element is None
+    assert manager.selection.targets == []
+    manager.button_release_event0(press)
+    assert outside not in [target.target for target in manager.selection.targets]
+    manager.selection.clear_targets()
+    plt.close(fig)
+    assert app is not None
+
+
+def test_shift_click_selected_member_toggles_without_starting_drag() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    first = ax.add_patch(Rectangle((0.12, 0.2), 0.18, 0.2))
+    second = ax.add_patch(Rectangle((0.64, 0.58), 0.16, 0.17))
+    fig.canvas.draw()
+    manager = attach_drag_manager(fig)
+    manager.select_elements([first, second], primary=second)
+    manager.selection.set_alignment_reference("key_object", key=second)
+    press = _center_event(fig, first, key="shift")
+
+    manager.button_press_event0(press)
+
+    assert [target.target for target in manager.selection.targets] == [second]
+    assert manager.selected_element is second
+    assert manager.selection.alignment_reference_mode == "selection"
+    assert manager.selection.alignment_key is None
+    assert not manager.selection.got_artist
+    manager.button_release_event0(press)
+    assert [target.target for target in manager.selection.targets] == [second]
     manager.selection.clear_targets()
     plt.close(fig)
     assert app is not None

@@ -50,7 +50,13 @@ from .artist_adapters import (
     get_artist_adapter,
     register_artist_adapter,
 )
-from .interaction import HitCandidate, HitStack, SelectionKernel, SelectionMode
+from .interaction import (
+    HitCandidate,
+    HitResolution,
+    HitStack,
+    SelectionKernel,
+    SelectionMode,
+)
 from .legend_replay import UnsupportedLegendEntry, register_legend_entry_serializer
 from .legend_layout import (
     LegendLayoutError,
@@ -114,6 +120,7 @@ __all__ = [
     "plan_legend_layout",
     "reflow_legend_layout",
     "HitCandidate",
+    "HitResolution",
     "HitStack",
     "SelectionKernel",
     "SelectionMode",
