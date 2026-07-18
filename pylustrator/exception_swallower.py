@@ -24,6 +24,9 @@ from matplotlib.axes._base import _AxesBase
 from matplotlib.axis import Axis
 
 
+_exception_swallower_installed = False
+
+
 class Dummy:
     """a dummy object that provides dummy attributes, dummy items and dummy returns"""
 
@@ -109,9 +112,14 @@ def get_axes(self):
 def return_save_list(func):
     """a decorator to wrap the output of a function as a SaveList"""
 
+    if getattr(func, "_pylustrator_safe_list_wrapper", False):
+        return func
+
     def wrap(*args, **kwargs):
         return SaveList(func(*args, **kwargs))
 
+    wrap._pylustrator_safe_list_wrapper = True
+    wrap._pylustrator_original = func
     return wrap
 
 
@@ -120,6 +128,10 @@ def swallow_get_exceptions():
     this is to ensure that the pylustrator generated code does not fail, even if the user removes some elements
     from the figure.
     """
+    global _exception_swallower_installed
+    if _exception_swallower_installed:
+        return
+
     Figure._get_axes = get_axes  # ty:ignore[unresolved-attribute]
     Figure.axes = property(fget=get_axes)  # ty:ignore[invalid-assignment]
     Figure.ax_dict = SaveListDescriptor("ax_dict")  # ty:ignore[unresolved-attribute]
@@ -128,12 +140,16 @@ def swallow_get_exceptions():
     _AxesBase.patches = SaveListDescriptor("patches")  # ty:ignore[invalid-assignment]
     Axis.get_minor_ticks = return_save_list(Axis.get_minor_ticks)
     Axis.get_major_ticks = return_save_list(Axis.get_major_ticks)
-    get_legend_orig = _AxesBase.get_legend
+    if not getattr(_AxesBase.get_legend, "_pylustrator_safe_legend_wrapper", False):
+        get_legend_orig = _AxesBase.get_legend
 
-    def get_legend(*args, **kwargs):
-        leg = get_legend_orig(*args, **kwargs)
-        if leg is None:
-            return Dummy()
-        return leg
+        def get_legend(*args, **kwargs):
+            leg = get_legend_orig(*args, **kwargs)
+            if leg is None:
+                return Dummy()
+            return leg
 
-    _AxesBase.get_legend = get_legend  # ty:ignore[invalid-assignment]
+        get_legend._pylustrator_safe_legend_wrapper = True
+        get_legend._pylustrator_original = get_legend_orig
+        _AxesBase.get_legend = get_legend  # ty:ignore[invalid-assignment]
+    _exception_swallower_installed = True

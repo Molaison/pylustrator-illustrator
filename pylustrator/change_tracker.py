@@ -1443,6 +1443,7 @@ class ChangeTracker:
             )
             print("\n" + "\n".join(output) + "\n")
         self.saved = True
+        self.changeCountChanged()
 
 
 def getTextFromFile(block_id: str, stack_pos: traceback.FrameSummary):

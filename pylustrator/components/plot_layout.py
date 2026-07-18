@@ -136,6 +136,10 @@ class Canvas(QtWidgets.QWidget):
         self.signals = signals
         self.fitted_to_view = False
         self._last_ruler_state = None
+        self._figure_canvases = {}
+        self._source_canvases = {}
+        self._canvas_connections = {}
+        self._scene_roots = {}
 
         self.layout = QtWidgets.QHBoxLayout(self)
         self.layout.setContentsMargins(0, 0, 0, 0)
@@ -235,27 +239,49 @@ class Canvas(QtWidgets.QWidget):
     def setFigure(self, figure):
         if self.canvas is not None:
             self.canvas_wrapper_layout.removeWidget(self.canvas)
-            del self.canvas
+            self.canvas.hide()
+        for root in self._scene_roots.values():
+            root.setVisible(False)
 
-        self.canvas = MatplotlibWidget(self, figure=figure)
+        canvas = self._figure_canvases.get(figure)
+        if canvas is None:
+            self._source_canvases[figure] = figure.canvas
+            canvas = MatplotlibWidget(self, figure=figure)
+            self._figure_canvases[figure] = canvas
+            root = QtWidgets.QGraphicsRectItem(
+                0, 0, 0, 0, self.selections_scene_origin
+            )
+            root.view = self.selections_view
+            self._scene_roots[figure] = root
+
+            manager = getattr(canvas, "manager", None)
+            key_handler = getattr(manager, "key_press_handler_id", None)
+            if key_handler is not None:
+                canvas.mpl_disconnect(key_handler)
+            self._canvas_connections[canvas] = (
+                canvas.mpl_connect("scroll_event", self.scroll_event),
+                canvas.mpl_connect("key_press_event", self.canvas_key_press),
+                canvas.mpl_connect("key_release_event", self.canvas_key_release),
+                canvas.mpl_connect("button_press_event", self.button_press_event),
+                canvas.mpl_connect("motion_notify_event", self.mouse_move_event),
+                canvas.mpl_connect(
+                    "button_release_event", self.button_release_event
+                ),
+            )
+        else:
+            figure.set_canvas(canvas)
+
+        self.canvas = canvas
         self.canvas.window_pylustrator = self
         self.canvas_wrapper_layout.addWidget(self.canvas)
+        self.canvas.show()
 
         self.selections_view.canvas_canvas = self.canvas
 
         self.fig = self.canvas.figure
         self.fig.widget = self.canvas
 
-        self.fig.canvas.mpl_disconnect(self.fig.canvas.manager.key_press_handler_id)
-
-        self.fig.canvas.mpl_connect("scroll_event", self.scroll_event)
-        self.fig.canvas.mpl_connect("key_press_event", self.canvas_key_press)
-        self.fig.canvas.mpl_connect("key_release_event", self.canvas_key_release)
         self.control_modifier = False
-
-        self.fig.canvas.mpl_connect("button_press_event", self.button_press_event)
-        self.fig.canvas.mpl_connect("motion_notify_event", self.mouse_move_event)
-        self.fig.canvas.mpl_connect("button_release_event", self.button_release_event)
         self.drag = None
 
         self.signals.canvas_changed.emit(self.canvas)
@@ -263,7 +289,53 @@ class Canvas(QtWidgets.QWidget):
         self._centerFigureCanvas()
         self._last_ruler_state = None
 
-        figure._pyl_scene = self.selections_scene_origin
+        scene_root = self._scene_roots[figure]
+        scene_root.setVisible(True)
+        figure._pyl_scene = scene_root
+
+    def has_figure(self, figure) -> bool:
+        return figure in self._figure_canvases
+
+    def release_figures(self) -> None:
+        """Disconnect embedded canvases and restore their original canvases."""
+
+        for figure, canvas in tuple(self._figure_canvases.items()):
+            for connection in self._canvas_connections.pop(canvas, ()):
+                canvas.mpl_disconnect(connection)
+            timer = getattr(canvas, "timer", None)
+            if timer is not None:
+                timer.stop()
+            if getattr(figure, "canvas", None) is canvas:
+                source_canvas = self._source_canvases.get(figure)
+                if source_canvas is not None:
+                    figure.set_canvas(source_canvas)
+            if getattr(figure, "widget", None) is canvas:
+                figure.widget = None
+            if getattr(figure, "_pyl_scene", None) is self._scene_roots.get(
+                figure
+            ):
+                figure._pyl_scene = None
+            canvas.window_pylustrator = None
+            toolbar = getattr(canvas, "pyl_toolbar", None)
+            if toolbar is not None:
+                toolbar.setParent(None)
+                toolbar.deleteLater()
+                canvas.pyl_toolbar = None
+            self.canvas_wrapper_layout.removeWidget(canvas)
+            canvas.setParent(None)
+            canvas.deleteLater()
+
+        for root in tuple(self._scene_roots.values()):
+            try:
+                root.setParentItem(None)
+                self.selections_scene.removeItem(root)
+            except RuntimeError:
+                pass
+        self._figure_canvases.clear()
+        self._source_canvases.clear()
+        self._scene_roots.clear()
+        self.canvas = None
+        self.fig = None
 
     def setFooters(self, footer, footer2):
         self.footer_label = footer
@@ -732,3 +804,9 @@ class PlotLayout(QtWidgets.QWidget):
         self.layout_plot.addWidget(self.toolbar)
 
         self.layout_plot.addLayout(self.footer_layout)
+
+    def release_figures(self) -> None:
+        if self.toolbar is not None:
+            self.layout_plot.removeWidget(self.toolbar)
+            self.toolbar = None
+        self.canvas_canvas.release_figures()

@@ -2550,6 +2550,9 @@ class DragManager:
 
     def __init__(self, figure: Figure, no_save):
         self.figure = figure
+        previous = getattr(figure, "figure_dragger", None)
+        if previous is not None and previous is not self:
+            previous.deactivate(redraw=False)
         self.figure.figure_dragger = self
         self._selectable_artists = []
         self._selectable_artist_ids = set()
@@ -2593,6 +2596,7 @@ class DragManager:
         self.editor_scene.restore_persisted_state()
         self._sync_editor_groups()
         self.selection = GrabbableRectangleSelection(figure, figure._pyl_scene)
+        self._selection_callback_canvas = figure.canvas
         self.figure.selection = self.selection
         self.change_tracker = ChangeTracker(figure, no_save)
         self.figure.change_tracker = self.change_tracker
@@ -2835,22 +2839,34 @@ class DragManager:
 
     def activate(self):
         """activate the interaction callbacks from the figure"""
-        self.c3 = self.figure.canvas.mpl_connect(
+        if getattr(self, "_interaction_active", False):
+            return False
+        canvas = self.figure.canvas
+        self._callback_canvas = canvas
+        self.c3 = canvas.mpl_connect(
             "button_release_event", self.button_release_event0
         )
-        self.c2 = self.figure.canvas.mpl_connect(
+        self.c2 = canvas.mpl_connect(
             "button_press_event", self.button_press_event0
         )
-        self.c4 = self.figure.canvas.mpl_connect(
+        self.c4 = canvas.mpl_connect(
             "key_press_event", self.key_press_event
         )
-        self.c5 = self.figure.canvas.mpl_connect(
+        self.c5 = canvas.mpl_connect(
             "motion_notify_event", self.motion_notify_event0
         )
-        self.c6 = self.figure.canvas.mpl_connect(
+        self.c6 = canvas.mpl_connect(
             "draw_event", self.invalidate_geometry_cache
         )
+        selection = getattr(self, "selection", None)
+        if selection is not None and getattr(selection, "c4", None) is None:
+            selection.c4 = canvas.mpl_connect(
+                "key_press_event", selection.keyPressEvent
+            )
+            self._selection_callback_canvas = canvas
         self._selection_refresh_on_draw = True
+        self._interaction_active = True
+        return True
 
     def _post_draw_selection_indices(self) -> tuple[int, ...]:
         """Return selected targets whose geometry can settle during draw."""
@@ -2972,7 +2988,11 @@ class DragManager:
         selected = getattr(signals, "figure_element_selected", None)
         emit = getattr(selected, "emit", None)
         if callable(emit):
-            emit(element)
+            self.figure.no_figure_dragger_selection_update = True
+            try:
+                emit(element)
+            finally:
+                self.figure.no_figure_dragger_selection_update = False
 
     def _reconcile_selection_for_mode(self) -> bool:
         """Make the retained selection obey the active tool's object policy.
@@ -3009,7 +3029,6 @@ class DragManager:
             return False
 
         self.select_elements(mapped, primary=primary)
-        self._notify_selected_element_changed()
         return True
 
     def set_selection_mode(self, mode: SelectionMode | str) -> SelectionMode:
@@ -3032,6 +3051,7 @@ class DragManager:
             self.selection.clear_targets()
             self.selected_element = None
             self.on_select(None, None)
+            self._notify_selected_element_changed()
             self._update_interaction_controls()
             self.figure.canvas.draw_idle()
             schedule_smart_guide_warmup(self)
@@ -3680,21 +3700,40 @@ class DragManager:
         self.refresh_selection_geometry(post_draw=True)
         schedule_smart_guide_warmup(self)
 
-    def deactivate(self):
+    def deactivate(self, *, redraw: bool = True):
         """deactivate the interaction callbacks from the figure"""
+        if not getattr(self, "_interaction_active", False):
+            return False
         self._cancel_active_pointer_transform()
         invalidate_smart_guide_cache(self)
-        self.figure.canvas.mpl_disconnect(self.c3)
-        self.figure.canvas.mpl_disconnect(self.c2)
-        self.figure.canvas.mpl_disconnect(self.c4)
-        self.figure.canvas.mpl_disconnect(self.c5)
-        self.figure.canvas.mpl_disconnect(self.c6)
+        session = getattr(self, "_active_smart_guide_session", None)
+        if session is not None:
+            session.close()
+        canvas = getattr(self, "_callback_canvas", self.figure.canvas)
+        for name in ("c3", "c2", "c4", "c5", "c6"):
+            connection = getattr(self, name, None)
+            if connection is not None:
+                canvas.mpl_disconnect(connection)
+            setattr(self, name, None)
+        selection = getattr(self, "selection", None)
+        if selection is not None:
+            selection_connection = getattr(selection, "c4", None)
+            if selection_connection is not None:
+                selection_canvas = getattr(
+                    self, "_selection_callback_canvas", canvas
+                )
+                selection_canvas.mpl_disconnect(selection_connection)
+                selection.c4 = None
         self._selection_refresh_on_draw = False
+        self._interaction_active = False
 
         self.selection.clear_targets()
         self.selected_element = None
         self.on_select(None, None)
-        self.figure.canvas.draw()
+        self._notify_selected_element_changed()
+        if redraw:
+            self.figure.canvas.draw_idle()
+        return True
 
     def make_draggable(self, target: Artist, parent: Artist = None):
         """make an artist draggable"""
@@ -4678,6 +4717,7 @@ class DragManager:
             )
         else:
             self.selection._notify_alignment_state_changed()
+        self._notify_selected_element_changed()
         return elements
 
     def on_deselect(self, event: MouseEvent):
@@ -4800,6 +4840,7 @@ class DragManager:
             self.selection.clear_targets()
             self.selected_element = None
             self.on_select(None, None)
+            self._notify_selected_element_changed()
             self.figure.canvas.draw()
 
 
