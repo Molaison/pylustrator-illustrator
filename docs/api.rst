@@ -114,6 +114,11 @@ Semantic transforms and replay
 ``OperationSupport`` distinguishes geometry resize from appearance scaling,
 layout reflow, rotation, and point editing.  ``TransformPlan`` preflights every
 target before mutation and rolls back earlier targets if an adapter fails.
+Translation, resize, and native rotation use immutable
+``GeometryTransformPlan``/``NativeRotationPlan`` destinations. Commit
+revalidates source geometry, storage identity, group membership, transforms,
+viewports, clipping, and layout before taking a rollback snapshot; a changed
+source raises ``StaleTransformPlanError`` without mutating an Artist or history.
 Appearance scaling uses a frozen ``AppearanceScalePlan`` and an independent
 appearance state/restore path; it does not enlarge geometry snapshots or emit
 geometry serialization records.
@@ -144,6 +149,15 @@ accepted during replay and rewritten through the public migration helpers.
    :members:
 
 .. autoclass:: pylustrator.TransformPlan
+   :members:
+
+.. autoclass:: pylustrator.GeometryTransformPlan
+   :members:
+
+.. autoclass:: pylustrator.NativeRotationPlan
+   :members:
+
+.. autoclass:: pylustrator.StaleTransformPlanError
    :members:
 
 .. autoclass:: pylustrator.RigidRotationPlan

@@ -1,7 +1,7 @@
 # Artist operation support matrix
 
 This document is an independent QA audit of the adapter contract on
-`main`, updated 2026-07-17. It treats the
+`main`, updated 2026-07-18. It treats the
 registry and `ArtistCapabilities`/`OperationSupport` as executable promises,
 not merely implementation metadata.
 
@@ -41,6 +41,14 @@ built-in adapter.
 contract. `DENIED` means the absence of edit support is deliberate and the
 denial contract passes.
 
+Concrete adapter registrations are exact-only by default. An unregistered
+subclass of one of those semantic types therefore resolves to a fail-closed
+adapter with a typed reason rather than silently inheriting its parent's
+geometry and replay assumptions. Subclass inheritance is allowed only when a
+registration explicitly declares the `VALIDATED` policy after checking the
+complete mutation, snapshot, and replay contract. The generic `Artist` fallback
+is validated only as a deliberately uneditable denial contract.
+
 `R` is deliberately a native property contract, not by itself permission to
 show a direct-manipulation handle. The handle/toolbar additionally requires
 `native_rotation_handle_support()`: complete visible geometry must rotate
@@ -62,20 +70,24 @@ Anchor-mode Text and ordinary similarity Patches use Q preferentially.
 | `Text` | `TextAdapter` | S M R Q A N C conditionally | Axes/data/figure/display transforms; visible text bounds; M; native R; anchor-mode Q; point-font A preview/commit/Undo/Redo/replay; complete N; real replay; Axis-owned property edits | **PASS** | A is limited to visible ordinary point Text with an invertible affine transform; Annotation, Legend/layout-owned, wrapped, bbox, TeX, filtered, sketched, or path-effect Text rejects. Q retains its stricter anchor-mode contract. Geometry resize remains denied. |
 | `Annotation` | `AnnotationAdapter` | S M R N C | Mixed data/axes endpoint coordinates; text and arrow-stroke bounds; two control points; M; R; complete N; real replay | **PASS** | Geometry resize is explicitly denied. |
 | `Legend` | `LegendAdapter` | S M L N C conditionally | Visible handles/text/title union; `frameon=False/True`; M; logical-owner persistence; current/extra/Figure L through frozen plans; six-field layout Undo/Redo; Matplotlib-only replay; N; real replay | **PASS** | L preserves Legend/frame/handle/Text/title/DrawingArea/TextArea identity and replaces only verified standard HPacker/VPacker nodes. `mode="expand"`, custom packers/state, detached owners, and Legend/descendant co-selection reject. Explicit composite handlers can use L even when full Legend reconstruction/replay remains unavailable. Geometry resize remains denied. |
-| `Line2D` | `Line2DAdapter` | S M Q A N C conditionally | Data/log transforms; visible line, marker-path, and marker-edge bounds; M; affine shared-pivot Q with marker-aware `markevery`; linewidth/markersize/markeredgewidth A; appearance-only Undo/Redo and replay; N; real `.set_data` replay | **PASS** | A requires actual visible line segments or painted marker paths and rejects Legend/layout ownership, pixel markers, filters, path/sketch effects, invalid dimensions, and paint-free/degenerate paths. Q accepts marker-free/invisible-marker lines and centered canonical circle paths whose rendered anisotropy/offset error is at most 0.25 px; other visible glyphs, changed float-`markevery` identities, invalid rendered dimensions, and partial clips reject atomically. Original MaskedArray container/mask data is not yet retained by geometry replay; its numeric NaN/index geometry is. Geometry resize remains denied. |
+| `Line2D` | `Line2DAdapter` | S M Q A N C conditionally | Data/log transforms; visible line, marker-path, and marker-edge bounds; M; affine shared-pivot Q with marker-aware `markevery`; linewidth/markersize/markeredgewidth A; appearance-only Undo/Redo and replay; N; lossless ndarray/MaskedArray `.set_data` replay | **PASS** | Raw ndarray and independent MaskedArray x/y semantics—including hidden payloads, masks, dtype/shape, fill value, and hard-mask state—survive geometry plans, replay, and Undo/Redo. Categorical and datetime replay is lossless; arbitrary custom-unit object values deny serialization until a semantic codec exists. A and Q retain the ownership, paint, marker, clip, and transform preflight limits described below. Geometry resize remains denied. |
 | `AxesImage` | `AxesImageAdapter` | S M Z N C | M/Z preview/commit; extent replay; N; x/y viewport and Axes position invariance | **PASS** | R is explicitly unsupported. Moving or resizing the image does not autoscale the camera. |
 | `Rectangle` | `RectangleAdapter` | S M Z R Q N C conditionally | Visible-stroke bounds; fixed-stroke M/Z; native R; common-pivot Q under similarity/reflection transforms; rotated M; rotated-resize denial; N; replay | **PASS** | Q additionally requires `rotation_point` `xy`/`center`, no hatch/effect, and no Legend/container owner. Tuple pivots need a richer plan. Z is only advertised at angles equivalent to 0 degrees modulo 360. |
 | `Ellipse` | `EllipseAdapter` | S M Z R Q N C conditionally | Visible-stroke bounds; fixed-stroke M/Z; native R; common-pivot Q under similarity/reflection transforms; rotated M; rotated-resize denial; N; replay | **PASS** | Q denies non-similarity transforms, hatch/effects, and Legend/container owners. Z is disabled for rotated ellipses. |
+| `Arc` | `ArcAdapter` | S M N C conditionally | Visible-stroke bounds; affine center M; preview/commit; N; `.set_center` replay | **PASS** | Translation preserves width, height, angle, and angular span. Non-affine or owner-managed targets reject; semantic resize and rotation remain denied. |
+| `Circle` | `CircleAdapter` | S M N C conditionally | Visible-stroke bounds; affine center M; preview/commit; N; `.set_center` replay | **PASS** | Translation preserves one semantic radius without stretching. Non-affine or owner-managed targets reject; resize and rotation remain denied. |
 | `FancyArrowPatch` | `FancyArrowPatchAdapter` | S M N C | Visible-stroke bounds; endpoint M; rendered preview/commit; N; real `.set_positions` replay | **PASS** | Z/R are explicitly denied. |
 | `ConnectionPatch` | `ConnectionPatchAdapter` | none | Specific MRO resolution; all operation descriptors; direct M/Z/R/N rejection and zero mutation | **DENIED** | Deliberately blocked because its endpoints can occupy unrelated coordinate systems. |
 | `FancyBboxPatch` | `FancyBboxPatchAdapter` | S M N C when affine | Visible-stroke bounds; affine M/N/replay; non-affine denial and zero mutation | **PASS** | Geometry resize is unsupported. A non-affine data transform disables the editable contract. |
 | `RegularPolygon` | `RegularPolygonAdapter` | S M N C | Visible-stroke bounds; center M; preview/commit; N; `.xy` replay | **PASS** | Z is denied until it changes semantic radius rather than stretching its center point. |
+| `CirclePolygon` | `CirclePolygonAdapter` | S M N C conditionally | Visible-stroke bounds; affine center M; preview/commit; N; `.xy` replay | **PASS** | Translation preserves radius, orientation, and resolution. Non-affine or owner-managed targets reject; semantic resize and rotation remain denied. |
 | `Wedge` | `WedgeAdapter` | S M N C | Visible-stroke bounds; center M; preview/commit; N; `.set_center` replay | **PASS** | Z/R are explicitly unsupported. |
 | `Polygon` | `PolygonAdapter` | S M Z Q N C conditionally | Visible-stroke bounds; fixed-stroke vertex M/Z; affine vertex Q; preview/commit; N; `.set_xy` replay | **PASS** | Native R is unsupported; Q requires invertible affine geometry with no hatch/effect or Legend owner. |
 | `PathPatch` | `PathPatchAdapter` | S M Z Q N C conditionally | Visible-stroke bounds; fixed-stroke path/codes M/Z; affine control-path Q; preview/commit; N; `Path` replay | **PASS** | Native R is unsupported; Q requires invertible affine geometry with no hatch/effect or Legend owner. |
 | `PathCollection` | `PathCollectionAdapter` | S M A N C conditionally | Renderer item-count semantics; per-item marker-path/size/stroke envelopes; masked offsets; affine/log offset M; marker-area × factor² and linewidth × factor A; appearance-only Undo/Redo/replay; N; `.set_offsets` replay | **PASS** | A requires a visible fill with non-zero path area or a visible strokable edge; hatch/effects/Legend/layout ownership reject. A remains valid when geometry cannot be snapshotted because its transaction stores appearance only. Z remains denied. |
 | `LineCollection` | `LineCollectionAdapter` | S M Q A N C conditionally | Per-segment linewidth envelopes; NaN path-break preservation; affine/log multi-segment and explicit-offset M; non-offset affine Q; linewidth A; appearance-only Undo/Redo/replay; N; path/offset replay | **PASS** | A requires a visible strokable rendered path and rejects hatch/effects/Legend/layout ownership. Q retains its non-offset affine contract. Z remains denied. |
 | `PolyCollection` | `PolyCollectionAdapter` | S M Q A N C conditionally | Per-polygon visible-edge envelopes; affine/log multi-path and explicit-offset M; non-offset affine Q; visible-edge linewidth A; appearance-only Undo/Redo/replay; N; path/offset replay | **PASS** | A scales only visible stroked edges; face-only polygons have no supported appearance dimension in v1. Q retains its strict non-offset/affine/no-effect/no-owner contract. Z remains denied. |
+| `FillBetweenPolyCollection` (when provided by Matplotlib) | `PolyCollectionAdapter` | S M Q A N C conditionally | Exact concrete registration; the complete PolyCollection bounds, transform, appearance, snapshot, denial, and replay contract | **PASS** | It does not inherit PolyCollection mutation semantics implicitly. Real destinations remain subject to the same clip and offset preflight. |
 
 Patch adapters share one common-stroke envelope implementation. Resizable
 patches additionally separate transformable geometry from fixed display-space
@@ -87,11 +99,20 @@ the committed visible box remains at the preview handle position.
 The following behavior passes for every type that advertises it:
 
 - Registry resolution selects the exact most-specific adapter, including
-  `Annotation` before `Text` and `ConnectionPatch` before `FancyArrowPatch`.
+  `Annotation` before `Text`, `ConnectionPatch` before `FancyArrowPatch`, and
+  exact `Arc`, `Circle`, and `CirclePolygon` adapters rather than their broader
+  Patch ancestors. Unvalidated semantic subclasses—including Matplotlib's 3D
+  Line, Text, and Collection variants—fail closed before selection or mutation.
 - Display-space translation moves control points and final selection bounds by
   the preview delta within 0.25 px.  The selected object is the object mutated;
   parent Axes and unrelated figure-level sentinel text do not move. Generated
   tick-label Text explicitly denies translation because its Axis owns position.
+- Translation, geometry resize, and native rotation freeze immutable absolute
+  destinations. Before any snapshot, tracker write, or Artist mutation, commit
+  revalidates every source geometry, adapter storage token, group membership,
+  transform, viewport, clip, layout, and destination mapping. A stale member
+  rejects the complete mixed plan through `StaleTransformPlanError`; zero
+  translation, identity resize, and 360-degree rotation record nothing.
 - Geometry resize matches preview controls and final visible bounds within
   0.25 px for EditorGroup, Axes, AxesImage, Rectangle, Ellipse, Polygon, and
   PathPatch. Thick patch strokes remain fixed in display pixels; both direct
@@ -225,16 +246,17 @@ native destination and applies it directly. This rejects numerically singular
 coordinate systems by measured error rather than a fragile global condition-
 number cutoff.
 
-Line2D plans preserve NaN slots (including masked values after Matplotlib's
-numeric conversion) for marker selection while stroke bounds include only
-vertices belonging to a real finite segment, not isolated MOVETO points across
-a gap. The original MaskedArray container and hidden underlying values remain a
-separate snapshot/replay gap. Coordinate conversion is vectorized, rotation
-gestures reuse their immutable source geometry, and large plan arrays are
-backed by immutable bytes instead of per-point Python tuples. In the 100k-point
-probe this reduced one plan from roughly 1.3 s to 55--64 ms; the 10k-point case
-fell to about 6--8 ms. Capability checks remain about 2--4 ms at 100k points and do
-not run the potentially expensive float-distance marker resolver.
+Line2D plans preserve NaN and masked slots for marker selection while stroke
+bounds include only vertices belonging to a real finite segment, not isolated
+MOVETO points across a gap. The raw-data codec separately preserves the original
+MaskedArray containers, hidden underlying values, independent masks, dtype,
+shape, fill value, and hard-mask state through snapshot/replay. Coordinate
+conversion is vectorized, rotation gestures reuse their immutable source
+geometry, and large plan arrays are backed by immutable bytes instead of
+per-point Python tuples. In the 100k-point probe this reduced one plan from
+roughly 1.3 s to 55--64 ms; the 10k-point case fell to about 6--8 ms. Capability
+checks remain about 2--4 ms at 100k points and do not run the potentially
+expensive float-distance marker resolver.
 
 Semantic ownership is checked independently from geometric representability.
 Every recursive Legend descendant—including nested errorbar, stem, and tuple
@@ -405,11 +427,17 @@ No confirmed product defect remains hidden behind a strict xfail.
 Explicitly unsupported and tested:
 
 - all operations on fallback Artist and ConnectionPatch;
-- text/annotation geometry resize and appearance scaling;
+- independent geometry transforms for Figure/SubFigure/Axes background patches,
+  auto-positioned Axes and super titles, Axis offset text, active-layout bbox
+  extras and labels, and invisible layout-only Legend geometry;
+- geometry resize for Text and Annotation; appearance scaling for Annotation
+  and unsupported Text variants;
 - legend geometry resize; Legend layout reflow for expand/custom/detached trees;
 - Line2D resize without affine preflight;
-- FancyArrowPatch, FancyBboxPatch, RegularPolygon, and Wedge resize;
-- resize and appearance scaling for all three collection adapters;
+- Arc, Circle, CirclePolygon, FancyArrowPatch, FancyBboxPatch, RegularPolygon,
+  and Wedge semantic resize;
+- geometry resize for all three collection adapters, plus appearance variants
+  that lack a lossless executor;
 - native rotation for every type without a saveable angle property;
 - rigid rotation for Axes, AxesImage, Legend, Annotation, ConnectionPatch,
   FancyArrowPatch/FancyBboxPatch, PathCollection, RegularPolygon, Wedge,
@@ -424,8 +452,8 @@ Fixture/test limitations, not confirmed implementation defects:
   mouse-hit path or replace manual Fig2 testing.
 - Native R and rigid Q have separate preview strategies. The audit covers the
   off-object handle, toolbar actions, Shift snapping, Escape cancellation, and
-  mixed-type shared-pivot transactions; freely draggable custom pivots remain
-  future work.
+  mixed-type shared-pivot transactions, including freely draggable custom
+  pivots and reset through the 3x3 reference locator.
 - Arbitrary third-party Matplotlib subclasses are outside the built-in matrix;
   one temporary custom adapter is used only to inject an atomic group failure.
 - Exotic custom transforms beyond data, axes, figure, display identity, mixed
@@ -438,8 +466,9 @@ Fixture/test limitations, not confirmed implementation defects:
   as future paint-envelope policy, not claimed as exact coverage here.
 - Generated blocks saved from this version replay NaN/Inf safely. A historical
   source block that already contains bare `nan`/`inf` can fail before runtime
-  migration starts and needs a future offline source migration/doctor. The
-  formal Fig2 contains no such token.
+  migration starts; the offline `pylustrator-source` doctor diagnoses and can
+  atomically migrate that block without importing it. The formal Fig2 contains
+  no such token.
 
 ## Reproduction commands
 
@@ -449,11 +478,12 @@ QT_QPA_PLATFORM=offscreen uv run pytest tests -q
 uv run ruff check .
 ```
 
-After the rigid-rotation follow-up, the dedicated contract file reports 466
-passed, 147 explicitly skipped branches, and no xfails. The skips are branch
-accounting, not missing Artist types: supported-operation tests skip denied
-types, while rejection tests skip supported types. Registry equality guarantees
-that all 20 built-in registrations are present in the matrix.
+The current full suite reports 1,187 passed and 178 skipped tests, with no strict
+xfails. Within the dedicated matrix, supported-operation tests skip denied types
+while rejection tests skip supported types; those skips are branch accounting,
+not missing Artist coverage. Registry equality covers all 23 always-present
+registrations and the exact `FillBetweenPolyCollection` registration when the
+Matplotlib version exposes that concrete type.
 
 ## Real Fig2 audit appendix
 
@@ -523,9 +553,10 @@ The real figure contains 483 selectable and serializable instances, resolving
 | RegularPolygon | 10 | RegularPolygonAdapter |
 | Text | 122 | TextAdapter |
 
-EditorGroup, Ellipse, FancyArrowPatch, ConnectionPatch, FancyBboxPatch, Wedge,
-Polygon, and the fallback Artist adapter have no selectable instance in this
-specific figure. They remain covered by the synthetic 20-type matrix.
+EditorGroup, Ellipse, Arc, Circle, CirclePolygon, FancyArrowPatch,
+ConnectionPatch, FancyBboxPatch, Wedge, Polygon, and the fallback Artist adapter
+have no selectable instance in this specific figure. They remain covered by the
+synthetic per-registration matrix.
 
 The earlier native-operation audit found that all 483 Fig2 instances advertise
 and pass finite selection bounds, translate,
@@ -594,9 +625,9 @@ The visible-bounds follow-up repeats the same 6,279 exhaustive checks and 70
 representative workflows in
 `artifacts/adapter_p1_visible_bounds_contract.json`: all 483/483 references
 resolve, all operations/replays pass, and the formal Fig2 hash is unchanged.
-The current full headless suite reports 693 passed, 147 explicit
-capability-branch skips, no xfails, four pre-existing log-limit warnings, and
-two expected masked-array conversion warnings. Ruff passes.
+At that visible-bounds milestone, the full headless suite reported 693 passed,
+147 explicit capability-branch skips, no xfails, four pre-existing log-limit
+warnings, and two expected masked-array conversion warnings. Ruff passes.
 
 Do not reuse the parent-project legacy audit's rotation section until it is
 migrated to the Q/native-handle split described above. The package-level

@@ -41,7 +41,9 @@ the user-facing interaction rules shared.
 - **Artist adapter architecture.** Each supported Matplotlib artist resolves
   to a specific adapter that owns its visible bounds, hit testing,
   capabilities, display-space transforms, snapshots, mutations, undo state,
-  and reproducible replay commands.
+  and reproducible replay commands. Concrete registrations are exact-only by
+  default; a subclass inherits mutation semantics only after its adapter opts
+  into an explicitly validated inheritance contract.
 - **Unified selection model.** Object Selection and Direct Selection consume
   the same ordered hit stack used by hover, click-through, candidate menus,
   and marquee selection. Containers are excluded from marquee selection by
@@ -53,7 +55,9 @@ the user-facing interaction rules shared.
   shared-pivot rotation, property editing, alignment, and replay are explicit
   capabilities. A mixed selection is fully preflighted before any target is
   mutated, and controls are exposed only when the complete selection supports
-  the operation.
+  the operation. Translation, resize, and rotation plans freeze one absolute
+  destination; a changed source, coordinate system, clip, layout, or group
+  membership rejects the stale plan before any target or history state changes.
 - **Atomic transactions and replay.** One gesture produces one reversible undo
   item. Failed or cancelled gestures restore artist geometry, generated-change
   bookkeeping, selection state, and interaction scope; semantic and
@@ -63,7 +67,9 @@ the user-facing interaction rules shared.
 
 - Selection indicators, drag previews, alignment, and committed positions use
   the same artist-aware visible geometry, including clipping, stroke width,
-  markers, transformed paths, and renderer-managed collection offsets.
+  markers, transformed paths, and renderer-managed collection offsets. Hit
+  testing, marquee selection, overlays, and Smart Guides reuse one revisioned
+  display-geometry service instead of measuring the same scene independently.
 - Alignment supports selection bounds, the canvas/artboard, and an explicit
   key object without allowing stale key-object mode to intercept ordinary
   single-object drags.
@@ -87,7 +93,10 @@ the user-facing interaction rules shared.
   verified standard HPacker/VPacker structure is replaced.
 - Axis labels and formatter-owned tick labels are edited through their semantic
   axis owner, allowing content and font properties to be changed without
-  accidentally moving the containing axes.
+  accidentally moving the containing axes. Auto-positioned titles, offset text,
+  constrained-layout labels, layout-only Legend geometry, and container
+  backgrounds reject independent transforms that Matplotlib would overwrite on
+  draw; manually positioned and out-of-layout artwork remains editable.
 - Line2D keeps its original ndarray/MaskedArray data semantics through
   movement, rotation plans, replay, and Undo/Redo, including hidden masked
   values, independent masks, dtype/shape, fill value, and hard-mask state.
@@ -96,9 +105,16 @@ the user-facing interaction rules shared.
 - Pointer hit testing uses a conservative display-space index while native
   artist containment remains authoritative. Smart Guides add deterministic
   edge, center, baseline, insertion-anchor, cross-feature, and equal-gap
-  snapping. Scene geometry is prepared in bounded idle batches; an unfinished
-  cache keeps the legacy snap path, so mouse press never performs a blocking
-  full-scene measurement.
+  snapping. Bounded idle batches publish the hit index atomically before
+  finishing Smart Guide capture; an unfinished index keeps unmeasured Artists
+  in the conservative native-hit path, so mouse press never performs a blocking
+  full-scene measurement or loses a selectable object.
+- Bring Forward/Backward and Send to Front/Back operate on Matplotlib's actual
+  stable paint order, update hit ordering immediately, and undo atomically.
+- Editor windows can be closed and reopened without accumulating hidden Qt
+  managers, top-level windows, timers, callbacks, or duplicate Matplotlib key
+  handling. Each Figure retains isolated history UI and source key bindings are
+  suspended only while that Figure is attached to the editor.
 - Large Line2D drag previews use contiguous buffers rather than one allocation
   per vertex. Interaction-scoped geometry and legend discovery caches reduce
   repeated renderer work, while source-only saves avoid replaying unrelated
@@ -120,14 +136,15 @@ and the extension API is introduced in the [API documentation](docs/api.rst).
 
 ### Validation Status
 
-At the current fork milestone on 2026-07-17:
+At the current fork milestone on 2026-07-18:
 
-- the full test suite passed with **1,019 passed and 147 skipped**;
+- the full test suite passed with **1,187 passed and 178 skipped**;
 - Ruff and Ty completed successfully, with an explicit incremental type-check
   baseline for the dynamic Matplotlib/Qt interaction modules; and
 - the real multi-panel Fig2 workflow was used to validate selection, movement,
   resize, rotation, alignment references, Smart Guides, legends, masked Line2D
-  replay, axis-label editing, save/replay, and undo/redo behavior. The formal
+  replay, axis-label editing, true paint-order stacking, window close/reopen,
+  cold and warm hit latency, save/replay, and undo/redo behavior. The formal
   editable Fig2 remained byte-identical during fork-based validation.
 
 ### Supported Runtime
