@@ -104,10 +104,21 @@ class ChangeTracker:
         self.change_count = 0
         self.edits = []
         self.changes = []
+        self.last_edit = -1
+        self.saved = True
 
     def addEdit(self, edit):
         self.edit = edit
         self.edits.append(edit)
+        self.last_edit = len(self.edits) - 1
+
+    def capture_recording_state(self):
+        return list(self.changes), bool(self.saved)
+
+    def restore_recording_state(self, state):
+        changes, saved = state
+        self.changes = list(changes)
+        self.saved = bool(saved)
 
     def addNewLegendChange(self, target):
         self.legend_change_count += 1
@@ -4467,8 +4478,13 @@ def test_backspace_deletes_selected_object() -> None:
         KeyEvent("key_press_event", fig.canvas, "backspace")
     )
 
-    assert fig.change_tracker.removed is ax
     assert not ax.get_visible()
+    assert len(fig.change_tracker.edits) == 1
+    assert fig.change_tracker.edits[0][2] == "Delete object"
+
+    fig.change_tracker.edits[0][0]()
+    assert ax.get_visible()
+    assert [target.target for target in manager.selection.targets] == [ax]
     plt.close(fig)
     assert app is not None
 

@@ -73,11 +73,32 @@ def _is_axis_label(artist: Artist) -> bool:
 
 def _remove_owned_changes(tracker, artist: Artist) -> None:
     changes = getattr(tracker, "changes", None)
-    if not isinstance(changes, dict):
-        raise TypeError("Atomic delete requires dictionary-backed change recording")
-    for key in list(changes):
-        if isinstance(key, tuple) and key and key[0] is artist:
-            del changes[key]
+    if isinstance(changes, dict):
+        for key in list(changes):
+            if isinstance(key, tuple) and key and key[0] is artist:
+                del changes[key]
+        return
+    if isinstance(changes, list):
+        changes[:] = [
+            item
+            for item in changes
+            if not (isinstance(item, tuple) and item and item[0] is artist)
+        ]
+        return
+    raise TypeError("Atomic delete requires mutable change recording")
+
+
+def _created_by_editor(tracker, artist: Artist) -> bool:
+    changes = getattr(tracker, "changes", ())
+    if isinstance(changes, dict):
+        return (artist, ".new") in changes
+    return any(
+        isinstance(item, tuple)
+        and len(item) >= 2
+        and item[0] is artist
+        and item[1] == ".new"
+        for item in changes
+    )
 
 
 def _capture_history(tracker):
@@ -123,7 +144,7 @@ def delete_selection(manager, targets: Iterable[Artist]) -> bool:
             visible=bool(artist.get_visible()),
             text=artist.get_text() if isinstance(artist, Text) else None,
             axis_label=_is_axis_label(artist),
-            created_by_editor=(artist, ".new") in tracker.changes,
+            created_by_editor=_created_by_editor(tracker, artist),
         )
         for artist in artists
     )
