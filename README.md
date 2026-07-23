@@ -1,279 +1,328 @@
-<h1 align="center">
-<img alt="docs/images/logo.png" src="docs/images/logo.png" width="300">
-</h1><br>
+<p align="center">
+  <img src="docs/assets/pylustrator-forge-logo.png" alt="Pylustrator Forge logo" width="220">
+</p>
 
+<h1 align="center">Pylustrator Forge</h1>
 
-[![DOC](https://readthedocs.org/projects/pylustrator/badge/)](https://pylustrator.readthedocs.io)
-[![PyTest](https://github.com/Molaison/pylustrator-illustrator/actions/workflows/pytest.yml/badge.svg)](https://github.com/Molaison/pylustrator-illustrator/actions/workflows/pytest.yml)
-[![License](https://img.shields.io/badge/License-GPLv3-blue.svg)](http://www.gnu.org/licenses/gpl-3.0.html)
-[![DOI](https://img.shields.io/badge/DOI-10.21105/joss.01989-blue.svg)](https://doi.org/10.21105/joss.01989)
+<p align="center">
+  <strong>Illustrator-like control. Matplotlib-native semantics. Reproducible Python.</strong>
+</p>
 
+<p align="center">
+  <a href="https://github.com/Molaison/pylustrator-illustrator/actions/workflows/pytest.yml"><img alt="PyTest" src="https://github.com/Molaison/pylustrator-illustrator/actions/workflows/pytest.yml/badge.svg"></a>
+  <a href="https://pylustrator.readthedocs.io"><img alt="Upstream documentation" src="https://readthedocs.org/projects/pylustrator/badge/"></a>
+  <a href="LICENSE"><img alt="License: GPLv3" src="https://img.shields.io/badge/License-GPLv3-blue.svg"></a>
+  <a href="https://doi.org/10.21105/joss.01989"><img alt="Original Pylustrator paper DOI" src="https://img.shields.io/badge/DOI-10.21105%2Fjoss.01989-blue.svg"></a>
+</p>
 
+<p align="center">
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#what-forge-adds">What changed</a> ·
+  <a href="#validation-snapshot">Validation</a> ·
+  <a href="docs/artist_operation_support_matrix.md">Support matrix</a>
+</p>
 
-Pylustrator is a software to prepare your figures for publication in a reproducible way. This means you receive a figure
-representing your data and alongside a generated code file that can exactly reproduce the figure as you put them in the
-publication, without the need to readjust things in external programs.
+Build the plot in Python. Finish the figure by direct manipulation. Save the
+result back to reproducible Python.
 
-Pylustrator offers an interactive interface to find the best way to present your data in a figure for publication.
-Added formatting and styling can be saved by automatically generated code. To compose multiple figures to panels,
-pylustrator can compose different subfigures to a single figure.
+**Pylustrator Forge** is a deeply tested downstream fork of
+[`rgerum/pylustrator`](https://github.com/rgerum/pylustrator) for researchers
+who compose multi-panel publication figures and still want the precision of a
+visual editor. It keeps Pylustrator's source-generating workflow, then rebuilds
+the interaction layer around live Matplotlib objects, visible artwork, atomic
+edits, and explicit capability checks.
 
-## About This Fork
+> The user-facing brand is **Pylustrator Forge**. The package and import name
+> remain `pylustrator` for compatibility.
 
-This repository is a downstream fork of
-[`rgerum/pylustrator`](https://github.com/rgerum/pylustrator). It keeps
-Pylustrator's reproducible, source-generating workflow while rebuilding its
-direct-manipulation layer around a more predictable, Adobe Illustrator-style
-interaction model.
+## Why this exists
 
-The refactor was motivated by a fundamental mismatch in the original editor:
-Matplotlib artists can look alike on screen while using very different
-coordinate systems, ownership rules, mutation APIs, and serialization paths.
-Treating every artist as a generic rectangle made selection, dragging,
-alignment, resize, undo, and the generated source behave inconsistently across
-objects such as text, axes labels, legends, patches, lines, and collections.
+Adobe Illustrator is powerful for final figure assembly, but it creates a
+fragile round trip. Change one source plot and you may need to export it again,
+replace it, and repair the surrounding layout. Imported plots can also carry
+clipping boxes, invisible frames, or container bounds that make “aligned”
+objects look visually misaligned.
 
-This fork makes those differences explicit at the artist boundary and keeps
-the user-facing interaction rules shared.
+The original Pylustrator introduced a better premise: edit a live Matplotlib
+figure and write the result back into the plotting script. In day-to-day use on
+complex scientific figures, however, the original direct-manipulation model
+still exposed many edge cases. Text, legends, lines, patches, collections, and
+axes can look similar on screen while following different coordinate systems,
+ownership rules, mutation APIs, and replay paths.
 
-### Major Architectural Changes
+This fork grew out of a month of intensive dogfooding, edge-case testing, and
+Codex-assisted refactoring. At the current comparison point it is **111 commits
+ahead of upstream**, changing **79 files** with roughly **54k additions and 6k
+deletions**. The goal is not to imitate every Illustrator operation. It is to
+make the operations that can be represented in Matplotlib predictable,
+reversible, and reproducible—and to reject the rest before they damage the
+figure.
 
-- **Artist adapter architecture.** Each supported Matplotlib artist resolves
-  to a specific adapter that owns its visible bounds, hit testing,
-  capabilities, display-space transforms, snapshots, mutations, undo state,
-  and reproducible replay commands. Concrete registrations are exact-only by
-  default; a subclass inherits mutation semantics only after its adapter opts
-  into an explicitly validated inheritance contract.
-- **Unified selection model.** Object Selection and Direct Selection consume
-  the same ordered hit stack used by hover, click-through, candidate menus,
-  and marquee selection. Containers are excluded from marquee selection by
-  default and remain available through explicit selection modes.
-- **Logical editor groups.** Editor grouping and selection scope are separate
-  from Matplotlib's implementation ownership, so selecting a child no longer
-  implies that dragging must transform its parent axes, legend, or container.
-- **Semantic operation contracts.** Move, resize, native rotation,
-  shared-pivot rotation, property editing, alignment, and replay are explicit
-  capabilities. A mixed selection is fully preflighted before any target is
-  mutated, and controls are exposed only when the complete selection supports
-  the operation. Translation, resize, and rotation plans freeze one absolute
-  destination; a changed source, coordinate system, clip, layout, or group
-  membership rejects the stale plan before any target or history state changes.
-- **Atomic transactions and replay.** One gesture produces one reversible undo
-  item. Failed or cancelled gestures restore artist geometry, generated-change
-  bookkeeping, selection state, and interaction scope; semantic and
-  floating-point no-ops are dropped.
+## What Forge adds
 
-### Interaction and Geometry Improvements
+### Align what the reader sees
 
-- Selection indicators, drag previews, alignment, and committed positions use
-  the same artist-aware visible geometry, including clipping, stroke width,
-  markers, transformed paths, and renderer-managed collection offsets. Hit
-  testing, marquee selection, overlays, and Smart Guides reuse one revisioned
-  display-geometry service instead of measuring the same scene independently.
-- Deferred translation can show a renderer-faithful cached content ghost while
-  the semantic Artist remains untouched until commit. Captures run only from
-  idle work, retain an explicit memory/source/complexity budget, and validate a
-  renderer/revision/source token on activation. Unsupported, clipped,
-  canvas-edge, oversized, or non-translation cases automatically keep the
-  existing analytic outline rather than showing a misleading bitmap.
-- The display-geometry service also exposes opt-in, revision-bound Agg paint
-  envelopes with explicit exact/conservative/unavailable states. Capture draws
-  only audited disposable clones; pending or open-ended visual state stays
-  conservative, and pointer cache misses never invoke a renderer.
-- Alignment supports selection bounds, the canvas/artboard, and an explicit
-  key object without allowing stale key-object mode to intercept ordinary
-  single-object drags.
-- Resize and rotation use preflighted transform plans and stable pivots;
-  multi-object rotation uses one shared pivot rather than unrelated local
-  angle changes. When every selected object supports exact rigid rotation, the
-  on-canvas pivot can be dragged anywhere on or beyond the artboard; native-only
-  rotation keeps the object's real fixed pivot. Line2D circle/dot markers use
-  their actual `markevery` subset at the destination, so marker-only and mixed
-  selections preview, commit, and undo around that same pivot.
-- The Align panel separates geometry scale from explicit appearance scale.
-  `A+`/`A−` change supported font, stroke, and marker dimensions without moving
-  coordinates or reflowing layout; mixed selections are preflighted and undo
-  as one command.
-- Legends have stable logical ownership across selection, frame changes,
-  movement, undo/redo, and source replay. Their selection bounds follow visible
-  handles, labels, title, and frame rather than invisible layout boxes.
-- The six core Legend layout controls reflow the existing OffsetBox tree rather
-  than rebuilding the Legend. Legend, frame, handle, Text, title, DrawingArea,
-  and TextArea identities survive column/spacing changes and Undo/Redo; only
-  verified standard HPacker/VPacker structure is replaced.
-- Axis labels and formatter-owned tick labels are edited through their semantic
-  axis owner, allowing content and font properties to be changed without
-  accidentally moving the containing axes. Auto-positioned titles, offset text,
-  constrained-layout labels, layout-only Legend geometry, and container
-  backgrounds reject independent transforms that Matplotlib would overwrite on
-  draw; manually positioned and out-of-layout artwork remains editable.
-- Line2D keeps its original ndarray/MaskedArray data semantics through
-  movement, rotation plans, replay, and Undo/Redo, including hidden masked
-  values, independent masks, dtype/shape, fill value, and hard-mask state.
-  Categorical and datetime data retain appearance editing and lossless replay
-  while unsupported geometry operations return an explicit reason.
-- Pointer hit testing uses a conservative display-space index while native
-  artist containment remains authoritative. Smart Guides add deterministic
-  edge, center, baseline, insertion-anchor, cross-feature, and equal-gap
-  snapping. Bounded idle batches publish the hit index atomically before
-  finishing Smart Guide capture; an unfinished index keeps unmeasured Artists
-  in the conservative native-hit path, so mouse press never performs a blocking
-  full-scene measurement or loses a selectable object. Ordinary hover and
-  click stream only to the first conclusive foreground hit; Alt click-through,
-  candidate menus, double-click isolation, and ambiguous Direct Selection
-  group shells retain the complete hit-stack oracle.
-- Bring Forward/Backward and Send to Front/Back operate on Matplotlib's actual
-  stable paint order, update hit ordering immediately, and undo atomically.
-- Editor windows can be closed and reopened without accumulating hidden Qt
-  managers, top-level windows, timers, callbacks, or duplicate Matplotlib key
-  handling. Each Figure retains isolated history UI and source key bindings are
-  suspended only while that Figure is attached to the editor.
-- Large Line2D drag previews use contiguous buffers rather than one allocation
-  per vertex. Interaction-scoped geometry and legend discovery caches reduce
-  repeated renderer work, while source-only saves avoid replaying unrelated
-  figure exports.
-- Rigid-rotation commits rebuild a live candidate from the same planner used by
-  preview, verify its native/display and paint/clip destination, and prepare
-  every selected object before the first mutation. Pointer previews use the
-  just-built trusted plan without repeating that commit-only `O(N)` work.
+Selection boxes, drag previews, alignment, Smart Guides, and committed
+positions share artist-aware display geometry. Where supported, that geometry
+accounts for clipping, stroke width, markers, transformed paths, collection
+offsets, and visible legend contents instead of trusting an invisible
+container rectangle.
 
-### Explicit Capability Boundaries
+Align to:
 
-Not every Matplotlib artist can safely support every operation. This fork
-rejects an unsupported transform before mutation instead of applying a visual
-approximation that cannot be undone or reproduced. For example, some
-layout-owned legend children and formatter-owned tick labels are selectable and
-property-editable but intentionally not independently movable or resizable.
+- the current selection;
+- the canvas/artboard; or
+- an explicit key object.
 
-The current per-type guarantees and deliberate limitations are documented in
-the [artist operation support matrix](docs/artist_operation_support_matrix.md).
-The longer-term design and remaining productivity work are tracked in the
-[Illustrator-style interaction roadmap](docs/illustrator_interaction_roadmap.md),
-and the extension API is introduced in the [API documentation](docs/api.rst).
+Distribution and fixed-spacing operations use the same frozen geometry as
+Undo/Redo.
 
-### Validation Status
+### Select and transform predictably
 
-At the current fork milestone on 2026-07-18:
+- **Object Selection (`V`)** selects the logical object or group.
+- **Direct Selection (`A`)** reaches the exact Matplotlib artist.
+- Hover, click, Alt/Option click-through, candidate menus, and marquee
+  selection share one ordered hit-resolution model.
+- Containers stay out of ordinary marquee selection unless container mode is
+  explicitly requested.
+- Grouping, isolation, visibility, locking, and paint-order commands are editor
+  concepts rather than accidental Matplotlib parent/child mutations.
 
-- the full test suite passed with **1,299 passed and 178 skipped**;
-- Ruff and Ty completed successfully, with an explicit incremental type-check
-  baseline for the dynamic Matplotlib/Qt interaction modules; and
-- the real multi-panel Fig2 workflow was used to validate selection, movement,
-  resize, rotation, alignment references, Smart Guides, legends, masked Line2D
-  replay, axis-label editing, true paint-order stacking, window close/reopen,
-  cold and warm hit latency, cached content previews, save/replay, and
-  undo/redo behavior. On the current real-case fork, cached-ghost activation
-  stayed below 0.46 ms p95 and motion below 0.03 ms p95; warm ordinary top-hit
-  resolution stayed below 1.57 ms p95. The formal editable Fig2 remained
-  byte-identical during fork-based validation.
+Move, resize, native rotation, shared-pivot rotation, appearance scaling,
+alignment, and property edits are separate operations. A mixed selection is
+fully preflighted before the first artist changes.
 
-### Supported Runtime
+### Get Illustrator-like feedback without flattening the figure
 
-The supported Python and direct-dependency contract reflects versions
-exercised by the complete automated suite, rather than the much older inherited
-package metadata:
+- Smart Guides snap edges, centers, baselines, anchors, cross-features, and
+  equal gaps.
+- Multi-object rotation uses one shared pivot; the pivot is draggable when
+  every target supports exact rigid rotation.
+- `A+` / `A−` scale supported fonts, strokes, and markers without pretending
+  appearance is geometry.
+- Cached content ghosts and an indexed hit path keep large figures responsive
+  while the live Matplotlib artists remain untouched until commit.
+- Bring Forward/Backward and Send to Front/Back follow actual stable paint
+  order and update hit ordering atomically.
 
-| Runtime | Dependency set | CI contract |
-|---|---|---|
-| Python 3.11 | Every declared direct dependency at its lower bound | Minimum-supported lane |
-| Python 3.12 | Versions resolved by `uv.lock` | Locked lane |
-| Python 3.13 | Versions resolved by `uv.lock` | Locked lane |
+### Preserve semantic Matplotlib structures
 
-The minimum lane currently exercises natsort 4.0.0, NumPy 1.23.5, Matplotlib
-3.8.4, PyQt5 5.15.2, qtawesome 0.5.0, scikit-image 0.21.0, qtpy 2.4.3,
-and pytest 7.2.0 in one environment.
+- Legends retain logical ownership through selection, movement, frame changes,
+  layout reflow, Undo/Redo, and source replay.
+- Six core legend layout controls reflow the existing packing tree without
+  replacing handles, labels, or title artists.
+- Formatter-owned tick labels and axis labels edit through their semantic axis
+  owner instead of accidentally moving the containing axes.
+- `Line2D` movement and rotation preserve ndarray/MaskedArray dtype, shape,
+  masks, fill values, categorical data, and datetime semantics.
+- Editor windows can close and reopen without accumulating hidden Qt managers,
+  timers, callbacks, or duplicate key handling.
 
-Python 3.9 and Matplotlib 2.x are not compatible with the current editor
-architecture. Python 3.10 is outside the supported matrix because the rollback
-diagnostic contract uses Python 3.11 exception notes. Environments outside the
-table may work, but are not part of the tested compatibility promise.
+### Make each gesture one transaction
 
-Please refer to the upstream
-[Pylustrator documentation](https://pylustrator.readthedocs.io) for the base
-application and usage guide. Fork-specific architecture and behavior are
-documented in this repository.
+One gesture creates one reversible history item. A cancelled or failed
+operation restores artist geometry, generated-change bookkeeping, selection,
+and scope. Semantic and floating-point no-ops are dropped.
 
-## Installation
+Transform plans freeze an absolute destination and revalidate their source,
+coordinate system, clip, layout, and group membership at commit. A stale plan
+fails before mutation instead of committing a different result from the one
+previewed.
 
-This fork deliberately does not publish a package under the upstream
-`pylustrator` distribution name. Running `pip install pylustrator` installs the
-upstream project, not the interaction architecture described above.
+## Workflow comparison
 
-Install this fork directly from GitHub:
+| Workflow | What you edit | After a source panel changes | Alignment basis |
+|---|---|---|---|
+| Illustrator after export | Detached vector/raster objects | Re-export, replace, and often repair layout | Imported object/frame bounds, depending on content |
+| Upstream Pylustrator | Live Matplotlib figures plus generated source | Rerun the plotting script | Original Pylustrator interaction model |
+| Pylustrator Forge | Live Matplotlib artists plus semantic commands | Rerun source and replay the generated block | Visible paint geometry where the operation is validated |
+
+## Quick start
+
+### Install this fork
+
+This fork is not published under the upstream `pylustrator` distribution name.
+`pip install pylustrator` installs the upstream project, not the interaction
+architecture described here.
+
+Install Forge directly from GitHub:
 
 ```bash
-python -m pip install "pylustrator @ git+https://github.com/Molaison/pylustrator-illustrator.git@main"
+python -m pip install \
+  "pylustrator @ git+https://github.com/Molaison/pylustrator-illustrator.git@main"
 ```
 
 With `uv`:
 
 ```bash
-uv pip install "pylustrator @ git+https://github.com/Molaison/pylustrator-illustrator.git@main"
+uv pip install \
+  "pylustrator @ git+https://github.com/Molaison/pylustrator-illustrator.git@main"
 ```
 
-For reproducible environments, replace `main` with a release tag or a full
-commit SHA. The import name remains unchanged:
+For a reproducible environment, replace `main` with a release tag or full
+commit SHA.
+
+### Edit an existing Matplotlib script
+
+Call `pylustrator.start()` before creating the figure, then write ordinary
+Matplotlib code:
 
 ```python
+import matplotlib.pyplot as plt
 import pylustrator
+
+pylustrator.start()
+
+fig, ax = plt.subplots()
+ax.plot([0, 1, 2], [0, 1, 0], marker="o")
+ax.set(xlabel="Time", ylabel="Response")
+
+plt.show()
 ```
 
-For development, clone the fork and install all test and documentation
-dependencies:
+Edit the live figure, then press `Ctrl+S`. Pylustrator inserts or updates a
+generated code block immediately before the `plt.show()` call, so rerunning the
+script reproduces the edited figure.
+
+### Compose multiple figure sources
+
+`pylustrator.load()` can assemble trusted Python plot scripts, raster images,
+and supported SVG content into one figure:
+
+```python
+import matplotlib.pyplot as plt
+import pylustrator
+
+pylustrator.load("panel_a.py")
+pylustrator.load("panel_b.py", offset=[1, 0])
+
+plt.show()
+```
+
+Python inputs are executed. Load only files you trust. See the upstream
+[composition guide](https://pylustrator.readthedocs.io/en/latest/composing.html)
+for offsets, physical units, caching, and supported formats.
+
+### Core controls
+
+| Action | Control |
+|---|---|
+| Object Selection | `V` |
+| Direct Selection | `A` |
+| Add/remove from selection | `Shift` + click |
+| Cycle overlapping candidates | `Alt` / `Option` + click |
+| Group / Ungroup | `Ctrl+G` / `Ctrl+Shift+G` |
+| Undo / Redo | `Ctrl+Z` / `Ctrl+Y` or `Ctrl+Shift+Z` |
+| Delete selection | `Delete` or `Backspace` |
+| Save generated source | `Ctrl+S` |
+
+## Correctness before approximation
+
+Not every Matplotlib artist can safely support every operation. Forge treats
+that as a contract, not an invitation to guess.
+
+For example, layout-owned legend children, formatter-owned tick labels,
+auto-positioned titles, and constrained-layout labels may remain selectable
+and property-editable while deliberately rejecting independent transforms that
+Matplotlib would overwrite on the next draw. A mixed selection is supported
+only when the complete selection can perform the requested operation.
+
+See:
+
+- [artist operation support matrix](docs/artist_operation_support_matrix.md)
+  for current per-type guarantees and deliberate limitations;
+- [interaction roadmap](docs/illustrator_interaction_roadmap.md) for the
+  implemented architecture and remaining productivity work;
+- [extension API](docs/api.rst) for custom artist adapters and legend entry
+  serializers.
+
+## Validation snapshot
+
+At the 2026-07-18 fork milestone:
+
+- the full suite passed with **1,299 tests passed and 178 skipped**, with no
+  strict xfails;
+- Ruff and Ty completed successfully with an explicit baseline for dynamic
+  Matplotlib/Qt modules;
+- CI exercised Python 3.11 at every declared lower dependency bound, plus
+  locked Python 3.12 and 3.13 environments; and
+- a real multi-panel scientific figure was used to validate selection,
+  movement, resize, rotation, alignment references, Smart Guides, legends,
+  masked `Line2D` replay, axis-label editing, paint-order stacking, window
+  close/reopen, save/replay, and Undo/Redo.
+
+The tested runtime contract is:
+
+| Python | Dependency set |
+|---|---|
+| 3.11 | Every declared direct dependency at its lower bound |
+| 3.12 | Versions resolved by `uv.lock` |
+| 3.13 | Versions resolved by `uv.lock` |
+
+Python 3.9, Python 3.10, and Matplotlib 2.x are outside the supported matrix.
+Other environments may work, but they are not part of the tested promise.
+
+## Offline generated-source doctor
+
+Historical generated blocks can fail before Pylustrator starts—for example,
+when an old block contains bare `nan` or `inf`. Forge includes a read-only-by-
+default doctor that inspects Python source without importing or executing it:
+
+```bash
+# Diagnose one file or recursively scan a directory.
+pylustrator-source path/to/figure.py
+pylustrator-source path/to/figures/
+
+# Preview exact changes, then explicitly request an atomic write.
+pylustrator-source --diff path/to/figure.py
+pylustrator-source --write path/to/figure.py
+```
+
+It recognizes exact Pylustrator marker comments, preserves source encoding,
+newlines, and file mode, and fails closed on malformed or future schemas. See
+the [source doctor reference](docs/source_doctor.rst) for the full safety
+contract.
+
+## Architecture in one screen
+
+- [`artist_adapters.py`](pylustrator/artist_adapters.py) defines visible
+  geometry, hit testing, capabilities, snapshots, mutations, and replay at the
+  artist boundary.
+- [`interaction.py`](pylustrator/interaction.py) and
+  [`interaction_index.py`](pylustrator/interaction_index.py) provide one
+  selection and hit-resolution model.
+- [`display_geometry.py`](pylustrator/display_geometry.py) shares revisioned
+  geometry between selection, marquee, previews, alignment, and Smart Guides.
+- [`transform_engine.py`](pylustrator/transform_engine.py),
+  [`commands.py`](pylustrator/commands.py), and
+  [`property_transactions.py`](pylustrator/property_transactions.py) enforce
+  preflighted, atomic, replayable operations.
+
+## Development
 
 ```bash
 git clone https://github.com/Molaison/pylustrator-illustrator.git
 cd pylustrator-illustrator
 uv sync --locked --all-extras --dev
+uv run pytest
+uv run ruff check .
+uv run ty check
 ```
 
-## Offline Generated-Source Doctor
-
-Historical generated blocks can fail before Pylustrator starts—for example, an
-old block containing bare `nan` or `inf` cannot be repaired by a runtime
-migration because Python evaluates that block first. The fork therefore ships
-an offline doctor that reads Python source without importing or executing it:
-
-```bash
-# Diagnose one file or recursively scan a directory; never writes by default.
-pylustrator-source path/to/figure.py
-pylustrator-source path/to/figures/
-
-# Preview the exact changes, then opt in to an atomic migration.
-pylustrator-source --diff path/to/figure.py
-pylustrator-source --write path/to/figure.py
-```
-
-The doctor recognizes only exact Pylustrator marker comments, leaves user code
-outside those blocks byte-for-byte unchanged, and handles schema versions,
-legacy indexed Legend proxy locators, and non-finite NumPy literals. It
-preserves the source encoding, newline style, and file mode; refuses to replace
-symbolic links, break hardlinks, or overwrite a concurrently changed file; and
-never partially writes a file containing an unknown future schema or malformed
-block. `--json` provides
-machine-readable diagnostics. Exit status is `0` when clean (or fully
-migrated), `1` when source diagnostics remain, and `2` for an operational or
-usage error. See the [source doctor reference](docs/source_doctor.rst) for the
-full safety contract.
-
-## Issues, Questions, and Suggestions
-
-Please submit your questions, suggestions, and bug reports to the
+Bug reports and feature proposals belong in the
 [fork issue tracker](https://github.com/Molaison/pylustrator-illustrator/issues).
-Issues that also reproduce in unmodified upstream Pylustrator can be reported
-to the [upstream issue tracker](https://github.com/rgerum/pylustrator/issues).
+If a problem also reproduces in unmodified upstream Pylustrator, please consider
+reporting it to the
+[upstream issue tracker](https://github.com/rgerum/pylustrator/issues) as well.
 
+## Upstream, citation, and license
 
-## Contributing
+Pylustrator Forge exists because Richard Gerum and the upstream contributors
+built the original Pylustrator project and its reproducible source-generation
+workflow. Read the [upstream documentation](https://pylustrator.readthedocs.io)
+and cite the [original JOSS paper](https://doi.org/10.21105/joss.01989) when
+Pylustrator contributes to published work.
 
-You want to contribute? Great!
-Contributing works best if you creat a pull request with your changes.
-
-1. Fork the project.
-2. Create a branch for your feature: `git checkout -b cool-new-feature`
-3. Commit your changes: `git commit -am 'My new feature'`
-4. Push to the branch: `git push origin cool-new-feature`
-5. Submit a pull request!
-
-If you are unfamilar with pull requests, you find more information on pull requests in the
- [github help](https://help.github.com/en/github/collaborating-with-issues-and-pull-requests/about-pull-requests)
+This downstream fork remains licensed under the
+[GNU General Public License v3.0 or later](LICENSE). The Forge name and fork-
+specific changes do not imply endorsement by the upstream maintainers.
