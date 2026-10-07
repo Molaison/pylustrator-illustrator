@@ -587,6 +587,20 @@ class PlotWindow(QtWidgets.QWidget):
             file_menu.addAction(action)
             return action
 
+        interaction_action(
+            "Select Same Type", "", lambda dragger: dragger.select_same("type")
+        )
+        interaction_action(
+            "Select Same Color", "", lambda dragger: dragger.select_same("color")
+        )
+        interaction_action(
+            "Copy Style", "Ctrl+Alt+C", lambda dragger: dragger.copy_style()
+        )
+        interaction_action(
+            "Paste Style", "Ctrl+Alt+V", lambda dragger: dragger.paste_style()
+        )
+        file_menu.addSeparator()
+
         interaction_action("Group", "Ctrl+G", lambda dragger: dragger.group_selection())
         interaction_action(
             "Ungroup", "Ctrl+Shift+G", lambda dragger: dragger.ungroup_selection()

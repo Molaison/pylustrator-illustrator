@@ -637,7 +637,25 @@ preview/commit/Undo geometry within ``0.25 px``.
 ## P2: workflow breadth
 
 - True paint-order Send to Front/Back and Bring Forward/Backward are complete.
-- Duplicate/copy/paste, Select Same, and style copy remain to be implemented.
+- Select Same Type/Color and bounded Copy/Paste Style are available in Edit.
+  Select Same uses the primary object, concrete Artist type or normalized scalar
+  RGBA (including opacity), and the current selection mode/isolation scope.
+  Color arrays are not reduced to their first entry. Hidden/locked objects,
+  hidden ancestors, and out-of-scope group members are excluded.
+- Copy Style (Ctrl+Alt+C) captures values from the primary object in a
+  figure-local clipboard. Paste Style (Ctrl+Alt+V) requires a homogeneous,
+  editable selection of exactly the same concrete type and commits one atomic,
+  replayable Undo/Redo step. Repeated identical pastes add no history entry.
+  The initial whitelist is deliberately narrow: Text color/font size/style/weight;
+  Line2D color/stroke width/opacity/marker size/marker edge width. Font families,
+  text opacity, line dash definitions, marker shapes and marker-color settings are retained
+  on the destination, as are text/data, positions, transforms, visibility,
+  ownership, and editor metadata. Subclasses and unsupported selections are
+  rejected before mutation. Existing Text opacity/family/zorder/label replay is
+  retained; other independent Text replay commands are rejected by Paste Style
+  until they have an explicit preservation contract. This avoids lossy
+  getter/setter or replay contracts.
+- Semantic duplicate/copy/paste of objects remains to be implemented.
 - Rulers, guides, grids, familiar zoom/pan shortcuts, and panel templates.
 - Scientific roles and protection for panels, labels, legends, annotations, and
   data marks.

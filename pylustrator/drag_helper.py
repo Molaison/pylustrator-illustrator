@@ -3499,6 +3499,21 @@ class DragManager:
             schedule_smart_guide_warmup(self)
         return exited
 
+    def select_same(self, criterion: str = "type") -> list[Artist]:
+        from .style_tools import select_same
+
+        return select_same(self, criterion)
+
+    def copy_style(self):
+        from .style_tools import copy_style
+
+        return copy_style(self)
+
+    def paste_style(self) -> bool:
+        from .style_tools import paste_style
+
+        return paste_style(self)
+
     def _selected_artists(self) -> list[Artist]:
         return [target.target for target in self.selection.targets]
 
