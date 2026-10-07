@@ -17,6 +17,7 @@ from pylustrator.components.qitem_properties import TextPropertiesWidget
 from pylustrator.property_transactions import (
     PropertyPlan,
     PropertyPreflightError,
+    TEXT_INDEPENDENT_SETTERS,
 )
 
 
@@ -392,4 +393,134 @@ def test_history_rollback_failure_is_attached_to_original_setter_error() -> None
     assert len(failures) == 1
     assert failures[0][0] is second
     assert "injected undo rollback failure" in str(failures[0][1])
+    plt.close(fig)
+
+
+_INDEPENDENT_TEXT_CASES = [
+    ("alpha", 0.25, 0.7),
+    ("fontfamily", ["serif", "sans-serif"], ["monospace", "serif"]),
+    ("family", ["serif", "sans-serif"], ["monospace", "serif"]),
+    ("zorder", 8, 12),
+    ("label", "first-label", "second-label"),
+]
+
+
+@pytest.mark.parametrize("property_name, first_value, _second_value", _INDEPENDENT_TEXT_CASES)
+def test_text_snapshot_preserves_independent_recordings_and_sorted_replay(
+    property_name, first_value, _second_value,
+) -> None:
+    fig, ax = plt.subplots()
+    text = ax.text(0.25, 0.5, "text", color="blue")
+    fig.canvas.draw()
+    tracker = install_tracker(fig)
+    canonical = TEXT_INDEPENDENT_SETTERS[f".set_{property_name}"]
+    getter = getattr(text, f"get_{canonical}")
+    baseline = getter()
+    assert PropertyPlan.for_targets((text,), {property_name: first_value}).commit()
+    recording_before = tracker.capture_recording_state()
+    assert PropertyPlan.for_targets((text,), {"color": "red"}).commit()
+    recording_after = tracker.capture_recording_state()
+    assert (text, f".set_{canonical}") in tracker.changes
+    commands = tracker.sorted_changes()
+    snapshot_index = next(i for i, command in enumerate(commands) if ".set(" in command)
+    independent_index = next(
+        i for i, command in enumerate(commands) if f".set_{canonical}(" in command
+    )
+    assert snapshot_index < independent_index
+
+    tracker.backEdit()
+    assert tracker.capture_recording_state() == recording_before
+    assert getter() == first_value
+    assert text.get_color() == "blue"
+    tracker.forwardEdit()
+    assert tracker.capture_recording_state() == recording_after
+    assert getter() == first_value
+    assert text.get_color() == "red"
+
+    # Replay from the original input state, not the already-edited canvas.
+    getattr(text, f"set_{canonical}")(baseline)
+    text.set_color("blue")
+    for command in commands:
+        exec(command, {"plt": plt})
+    assert getter() == first_value
+    assert text.get_color() == "red"
+    plt.close(fig)
+
+
+@pytest.mark.parametrize("property_name, first_value, second_value", _INDEPENDENT_TEXT_CASES)
+@pytest.mark.parametrize("independent_first", [False, True])
+def test_combined_text_snapshot_uses_current_independent_values_in_either_order(
+    property_name, first_value, second_value, independent_first,
+) -> None:
+    fig, ax = plt.subplots()
+    text = ax.text(0.25, 0.5, "text", color="blue")
+    fig.canvas.draw()
+    tracker = install_tracker(fig)
+    canonical = TEXT_INDEPENDENT_SETTERS[f".set_{property_name}"]
+    getter = getattr(text, f"get_{canonical}")
+    baseline = getter()
+    assert PropertyPlan.for_targets((text,), {property_name: first_value}).commit()
+    recording_before = tracker.capture_recording_state()
+    changes = (
+        {property_name: second_value, "color": "red"}
+        if independent_first
+        else {"color": "red", property_name: second_value}
+    )
+    assert PropertyPlan.for_targets((text,), changes).commit()
+    recording_after = tracker.capture_recording_state()
+    commands = tracker.sorted_changes()
+    assert getter() == second_value
+    tracker.backEdit()
+    assert tracker.capture_recording_state() == recording_before
+    assert getter() == first_value
+    tracker.forwardEdit()
+    assert tracker.capture_recording_state() == recording_after
+    assert getter() == second_value
+
+    getattr(text, f"set_{canonical}")(baseline)
+    text.set_color("blue")
+    for command in commands:
+        exec(command, {"plt": plt})
+    assert getter() == second_value
+    assert text.get_color() == "red"
+    plt.close(fig)
+
+
+def test_text_snapshot_does_not_replay_stale_family_over_new_fontname() -> None:
+    fig, ax = plt.subplots()
+    text = ax.text(0.25, 0.5, "text")
+    fig.canvas.draw()
+    tracker = install_tracker(fig)
+    assert PropertyPlan.for_targets(
+        (text,), {"fontfamily": ["serif", "sans-serif"]}
+    ).commit()
+    assert PropertyPlan.for_targets((text,), {"fontname": "DejaVu Sans Mono"}).commit()
+    expected = text.get_fontfamily()
+    commands = tracker.sorted_changes()
+    text.set_fontfamily(["serif", "sans-serif"])
+    for command in commands:
+        exec(command, {"plt": plt})
+    assert text.get_fontfamily() == expected == ["DejaVu Sans Mono"]
+    plt.close(fig)
+
+
+@pytest.mark.parametrize("suppression", [{"visible": False}, {"text": ""}])
+def test_suppressed_new_text_does_not_keep_dangling_independent_setters(
+    suppression,
+) -> None:
+    fig, ax = plt.subplots()
+    text = ax.text(0.25, 0.5, "new text")
+    fig.canvas.draw()
+    tracker = install_tracker(fig)
+    text.is_new_text = True
+    tracker.addNewTextChange(text)
+    assert PropertyPlan.for_targets((text,), {"alpha": 0.25}).commit()
+    recording_before = tracker.capture_recording_state()
+    assert (text, ".new") in tracker.changes
+    assert PropertyPlan.for_targets((text,), suppression).commit()
+    assert tracker.changes == {}
+    tracker.backEdit()
+    assert tracker.capture_recording_state() == recording_before
+    tracker.forwardEdit()
+    assert tracker.changes == {}
     plt.close(fig)
