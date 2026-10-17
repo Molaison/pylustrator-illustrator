@@ -1771,6 +1771,15 @@ class GrabbableRectangleSelection(GrabFunctions):
                     continue
                 display_delta = np.zeros(2, dtype=float)
                 display_delta[axis] = delta
+                support = target.operation_support("translate")
+                if "annotated_point_within_owning_axes" in support.constraints:
+                    # Alignment is atomic: reject an annotation whose point
+                    # would leave its owning Axes before starting any move.
+                    adapter = target.adapter
+                    candidate = adapter.point_array(adapter.control_points())
+                    adapter.validate_native_control_points(
+                        adapter.display_to_native(candidate + display_delta)
+                    )
                 target.preflight_rigid_visible_translation(display_delta)
                 vectors.append((target, display_delta))
 

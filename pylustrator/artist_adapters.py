@@ -4506,7 +4506,7 @@ class AnnotationAdapter(TextAdapter):
             try:
                 arrow_adapter = get_artist_adapter(arrow)
                 point_sets.append(
-                    cached_selection_points(arrow, arrow_adapter.selection_points)
+                    _clip_selection_points(arrow, arrow_adapter.selection_points())
                 )
             except (AttributeError, TypeError, ValueError, RuntimeError):
                 pass

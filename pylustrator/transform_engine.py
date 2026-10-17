@@ -452,18 +452,25 @@ def _geometry_source_fingerprint(
     )
 
 
-def _validate_display_round_trip(expected, actual, *, operation: str) -> None:
-    expected = np.asarray(expected, dtype=float)
-    actual = np.asarray(actual, dtype=float)
+def _same_point_structure(expected: np.ndarray, actual: np.ndarray) -> bool:
+    """Require the same shape and finite/non-finite coordinate inventory."""
+
     expected_finite = np.isfinite(expected)
     actual_finite = np.isfinite(actual)
-    structure_matches = bool(
+    return bool(
         expected.shape == actual.shape
         and np.array_equal(expected_finite, actual_finite)
         and np.array_equal(np.isnan(expected), np.isnan(actual))
         and np.array_equal(np.isposinf(expected), np.isposinf(actual))
         and np.array_equal(np.isneginf(expected), np.isneginf(actual))
     )
+
+
+def _validate_display_round_trip(expected, actual, *, operation: str) -> None:
+    expected = np.asarray(expected, dtype=float)
+    actual = np.asarray(actual, dtype=float)
+    structure_matches = _same_point_structure(expected, actual)
+    expected_finite = np.isfinite(expected)
     if expected.shape == actual.shape and np.any(expected_finite):
         error = float(
             np.max(np.abs(expected[expected_finite] - actual[expected_finite]))
@@ -751,11 +758,13 @@ def _prepare_point_edit_plan(plan: PointEditPlan) -> PreparedPointEditPlan:
             representable,
             operation=f"{type(target).__name__} frozen point preview",
         )
-        _validate_display_round_trip(
-            plan.selection_array(),
-            selection,
-            operation=f"{type(target).__name__} frozen point selection",
-        )
+        # The selection envelope can change when the arrow is recomputed at
+        # commit. Only edited anchors have a frozen pixel destination; the
+        # envelope must retain its structural/finite representation.
+        if not _same_point_structure(plan.selection_array(), selection):
+            raise UnsupportedArtistError(
+                f"{type(target).__name__} frozen point selection changed structure"
+            )
         _validate_display_round_trip(
             plan.destination_array(),
             representable[np.asarray(plan.point_keys, dtype=int)],
