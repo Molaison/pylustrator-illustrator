@@ -629,6 +629,7 @@ OPERATION_CAPABILITY = {
     TransformOperation.RESIZE_GEOMETRY: "can_resize",
     TransformOperation.ROTATE: "can_rotate",
     TransformOperation.RIGID_ROTATE: "can_rigid_rotate",
+    TransformOperation.EDIT_POINTS: "can_edit_points",
     TransformOperation.SNAPSHOT: "can_snapshot",
     TransformOperation.SERIALIZE: "can_serialize",
 }

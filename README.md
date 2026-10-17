@@ -82,6 +82,11 @@ Undo/Redo.
 
 - **Object Selection (`V`)** selects the logical object or group.
 - **Direct Selection (`A`)** reaches the exact Matplotlib artist.
+  Adapter-owned path anchors support batched polygon vertices, linear PathPatch
+  anchors, Line2D endpoints, and Annotation text/data anchors without synthetic
+  Matplotlib Artists. Preview, typed preflight, and commit share one contract;
+  unsupported curves, layout-owned leaves, and unrepresentable storage reject
+  with typed reasons before mutation.
 - Hover, click, Alt/Option click-through, candidate menus, and marquee
   selection share one ordered hit-resolution model.
 - Containers stay out of ordinary marquee selection unless container mode is
@@ -114,6 +119,9 @@ fully preflighted before the first artist changes.
   replacing handles, labels, or title artists.
 - Formatter-owned tick labels and axis labels edit through their semantic axis
   owner instead of accidentally moving the containing axes.
+- **Semantic inline text editing.** Enter/double-click opens a draft overlay for
+  Text, Annotation, axis labels, tick labels, and Legend text. Ctrl/Cmd+Enter
+  or focus commits; Escape cancels. Formatter-owned ticks commit through Axis.
 - `Line2D` movement and rotation preserve ndarray/MaskedArray dtype, shape,
   masks, fill values, categorical data, and datetime semantics.
 - Editor windows can close and reopen without accumulating hidden Qt managers,

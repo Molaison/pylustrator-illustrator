@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from numbers import Number
+from threading import RLock
 from types import MethodType
 from typing import Any, Optional
 
 import numpy as np
 from matplotlib.artist import Artist
+from matplotlib.lines import Line2D
 
 from .editor_model import EditorGroup, EditorScene
 from .legend_replay import axes_handles_reproduce_legend
@@ -17,6 +19,176 @@ from .source_migration import (
     migrate_generated_command,
     migrate_generated_source,
 )
+
+
+_LINE_ENDPOINT_REPLAY_ATTR = "_pylustrator_set_line_endpoints"
+_LINE_ENDPOINT_REPLAY_MARKER = "_pylustrator_line_endpoint_replay"
+_LINE_ENDPOINT_REPLAY_LOCK = RLock()
+_MISSING = object()
+
+
+class LineEndpointReplayConflictError(RuntimeError):
+    """A third-party attribute prevents safe, instance-local line replay."""
+
+    def __init__(self, target: Line2D, *, scope: str, owner: object) -> None:
+        self.target = target
+        self.scope = scope
+        self.owner = owner
+        owner_name = (
+            f"{owner.__module__}.{owner.__qualname__}"
+            if isinstance(owner, type)
+            else type(owner).__name__
+        )
+        super().__init__(
+            f"Cannot enable compact Line2D endpoint replay: {scope} "
+            f"attribute {_LINE_ENDPOINT_REPLAY_ATTR!r} is already owned by "
+            f"{owner_name}"
+        )
+
+
+def _set_line_endpoints(self, keys, values):
+    from .artist_adapters import Line2DAdapter, get_artist_adapter
+
+    adapter = get_artist_adapter(self)
+    if not isinstance(adapter, Line2DAdapter):
+        raise TypeError(
+            "_pylustrator_set_line_endpoints requires a supported Line2D"
+        )
+    adapter.apply_replayed_endpoints(keys, values)
+    return self
+
+
+setattr(_set_line_endpoints, _LINE_ENDPOINT_REPLAY_MARKER, True)
+
+
+def _owned_line_endpoint_replay(value) -> bool:
+    function = getattr(value, "__func__", value)
+    if function is _set_line_endpoints:
+        return True
+    return bool(
+        getattr(function, _LINE_ENDPOINT_REPLAY_MARKER, False)
+        and getattr(function, "__module__", None) == __name__
+        and getattr(function, "__qualname__", "")
+        in {
+            "_set_line_endpoints",
+            "install_line_endpoint_replay_api.<locals>.set_endpoints",
+        }
+    )
+
+
+def _line_endpoint_class_attribute(target: Line2D):
+    for owner in type(target).__mro__:
+        namespace = vars(owner)
+        if _LINE_ENDPOINT_REPLAY_ATTR in namespace:
+            return owner, namespace[_LINE_ENDPOINT_REPLAY_ATTR]
+    return None, None
+
+
+def line_endpoint_replay_conflict(
+    target: Line2D,
+) -> LineEndpointReplayConflictError | None:
+    """Return the collision blocking instance-local endpoint replay, if any."""
+
+    if not isinstance(target, Line2D):
+        raise TypeError("Line endpoint replay can only be installed on Line2D")
+    owner, class_value = _line_endpoint_class_attribute(target)
+    if owner is not None and not _owned_line_endpoint_replay(class_value):
+        return LineEndpointReplayConflictError(
+            target,
+            scope="class",
+            owner=owner,
+        )
+    instance_value = vars(target).get(_LINE_ENDPOINT_REPLAY_ATTR, _MISSING)
+    if instance_value is not _MISSING and not (
+        isinstance(instance_value, MethodType)
+        and instance_value.__self__ is target
+        and _owned_line_endpoint_replay(instance_value)
+    ):
+        return LineEndpointReplayConflictError(
+            target,
+            scope="instance",
+            owner=target,
+        )
+    return None
+
+
+def _install_line_endpoint_replay_bindings(targets) -> None:
+    """Validate first, then bind a compact replay method to each target."""
+
+    unique_targets = []
+    seen_ids = set()
+    for target in targets:
+        if id(target) not in seen_ids:
+            seen_ids.add(id(target))
+            unique_targets.append(target)
+    targets = tuple(unique_targets)
+    with _LINE_ENDPOINT_REPLAY_LOCK:
+        legacy_class_attributes = {}
+        pending = []
+        for target in targets:
+            conflict = line_endpoint_replay_conflict(target)
+            if conflict is not None:
+                raise conflict
+            owner, class_value = _line_endpoint_class_attribute(target)
+            if owner is not None:
+                legacy_class_attributes[owner] = class_value
+            instance_value = vars(target).get(_LINE_ENDPOINT_REPLAY_ATTR, _MISSING)
+            if instance_value is _MISSING:
+                pending.append(target)
+
+        removed = []
+        bound = []
+        try:
+            for owner, value in legacy_class_attributes.items():
+                if vars(owner).get(_LINE_ENDPOINT_REPLAY_ATTR) is not value:
+                    raise LineEndpointReplayConflictError(
+                        targets[0],
+                        scope="class",
+                        owner=owner,
+                    )
+                delattr(owner, _LINE_ENDPOINT_REPLAY_ATTR)
+                removed.append((owner, value))
+            for target in pending:
+                vars(target)[_LINE_ENDPOINT_REPLAY_ATTR] = MethodType(
+                    _set_line_endpoints,
+                    target,
+                )
+                bound.append(target)
+        except Exception:
+            for target in reversed(bound):
+                current = vars(target).get(_LINE_ENDPOINT_REPLAY_ATTR)
+                if _owned_line_endpoint_replay(current):
+                    vars(target).pop(_LINE_ENDPOINT_REPLAY_ATTR, None)
+            for owner, value in removed:
+                setattr(owner, _LINE_ENDPOINT_REPLAY_ATTR, value)
+            raise
+
+
+def ensure_line_endpoint_replay_api(target: Line2D) -> Line2D:
+    """Bind compact endpoint replay to exactly one Line2D instance."""
+
+    _install_line_endpoint_replay_bindings((target,))
+    return target
+
+
+def _figure_line_endpoint_replay_targets(figure):
+    """Yield only explicit line inventories with stable generated locators."""
+
+    seen = set()
+
+    def add(target):
+        if isinstance(target, Line2D) and id(target) not in seen:
+            seen.add(id(target))
+            yield target
+
+    owners = [figure]
+    for owner in owners:
+        owners.extend(getattr(owner, "subfigs", ()))
+        for artist in getattr(owner, "artists", ()):
+            yield from add(artist)
+    for axes in figure.axes:
+        for line in axes.lines:
+            yield from add(line)
 
 
 
@@ -264,6 +436,20 @@ def install_legacy_legend_replay_compatibility(figure) -> None:
         axes.get_legend_handles_labels = MethodType(compatible, axes)
 
 
+def install_line_endpoint_replay_api(figure) -> None:
+    """Bind endpoint replay to the Figure's explicitly referenceable lines.
+
+    Normal editor attachment uses the O(1) single-target helper instead.  This
+    Figure-level compatibility API deliberately walks ``Axes.lines`` and
+    direct owner ``artists`` only, never renderer-managed ticks or Legend
+    proxy children.
+    """
+
+    _install_line_endpoint_replay_bindings(
+        _figure_line_endpoint_replay_targets(figure)
+    )
+
+
 @dataclass(frozen=True)
 class InteractionState:
     """Selection, tool scope, and non-document transform UI state."""
@@ -285,5 +471,9 @@ __all__ = [
     "migrate_generated_command",
     "migrate_generated_source",
     "install_legacy_legend_replay_compatibility",
+    "install_line_endpoint_replay_api",
+    "ensure_line_endpoint_replay_api",
+    "line_endpoint_replay_conflict",
+    "LineEndpointReplayConflictError",
     "semantic_equal",
 ]
