@@ -45,6 +45,16 @@ _TEXT_STATE_PROPERTIES = frozenset(
         "visible",
     }
 )
+# These independently recorded properties are not represented losslessly by
+# the legacy Text snapshot.  Keep the list explicit: a compound font setter or
+# an alias for a snapshot property could otherwise overwrite the new snapshot.
+TEXT_INDEPENDENT_SETTERS = {
+    ".set_alpha": "alpha",
+    ".set_fontfamily": "fontfamily",
+    ".set_family": "fontfamily",
+    ".set_zorder": "zorder",
+    ".set_label": "label",
+}
 _AXES_STATE_PROPERTIES = frozenset(
     {
         "xlim",
@@ -393,7 +403,7 @@ class PropertyPlan:
                 and operation.property_name in _TEXT_STATE_PROPERTIES
             ):
                 if id(target) not in recorded_text:
-                    self.tracker.addNewTextChange(target)
+                    self._record_text_change(target)
                     recorded_text.add(id(target))
                 continue
             if (
@@ -405,6 +415,36 @@ class PropertyPlan:
                     recorded_axes.add(id(target))
                 continue
             self.tracker.addChange(target, operation.generated_command(value))
+
+    def _record_text_change(self, target: Text) -> None:
+        """Refresh a Text snapshot without dropping known independent edits.
+
+        Capture current values rather than retaining old setter arguments: a
+        simultaneous fontname edit can change the family, and either property
+        may precede the snapshot operation in this plan.  The ordinary replay
+        sorter emits the snapshot (or new Text creation) before these setters.
+        """
+
+        changes = getattr(self.tracker, "changes", None)
+        properties = {}
+        if isinstance(changes, Mapping):
+            for (owner, command), _recording in changes.items():
+                if owner is target and command in TEXT_INDEPENDENT_SETTERS:
+                    name = TEXT_INDEPENDENT_SETTERS[command]
+                    properties[name] = getattr(target, f"get_{name}")()
+        commands = [
+            f".set_{name}({replay_literal(value)})"
+            for name, value in properties.items()
+        ]
+        self.tracker.addNewTextChange(target)
+        if getattr(target, "is_new_text", False) and (
+            not target.get_visible() or target.get_text() == ""
+        ):
+            # The snapshot intentionally omits creation for suppressed new
+            # Text.  A retained setter would reference an object never made.
+            return
+        for command in commands:
+            self.tracker.addChange(target, command)
 
     def _notify(self) -> None:
         signal = getattr(
@@ -473,4 +513,5 @@ __all__ = [
     "PropertyOperation",
     "PropertyPlan",
     "PropertyPreflightError",
+    "TEXT_INDEPENDENT_SETTERS",
 ]
