@@ -19,7 +19,6 @@
 # You should have received a copy of the GNU General Public License
 # along with Pylustrator. If not, see <http://www.gnu.org/licenses/>
 
-from .QtGuiDrag import initialize as start
 from .helper_functions import (
     fig_text,
     add_axes,
@@ -36,7 +35,6 @@ from .helper_functions import (
     add_letter,
     add_letters,
 )
-from .QtGui import initialize as StartColorChooser
 from .lab_colormap import LabColormap
 from .helper_functions import loadFigureFromFile as load
 from .artist_adapters import (
@@ -46,6 +44,7 @@ from .artist_adapters import (
     ArtistAdapterRegistry,
     ArtistCapabilities,
     ChangeRecord,
+    PointHandleModel,
     RigidRotationPlan,
     UnsupportedArtistError,
     get_artist_adapter,
@@ -72,9 +71,20 @@ from .operations import OperationSupport, TransformIntent, TransformOperation
 from .transform_engine import (
     GeometryTransformPlan,
     NativeRotationPlan,
+    PointEditPlan,
+    PointEditSource,
+    PreparedPointEditPlan,
     StaleTransformPlanError,
     TransformPlan,
     TransformPreflightError,
+)
+from .property_adapters import (
+    StaleTextContentPlanError,
+    TextContentKind,
+    TextContentPlan,
+    TextContentPreflightError,
+    TextContentSupport,
+    text_content_support,
 )
 from .commands import (
     GENERATED_STATE_VERSION,
@@ -87,6 +97,28 @@ from .source_doctor import (
     SourceDoctorReport,
     diagnose_generated_source,
 )
+
+
+def start(*args, **kwargs):
+    """Start the optional desktop editor without importing Qt on package import."""
+    try:
+        from .QtGuiDrag import initialize
+    except ImportError as exc:
+        raise ImportError(
+            "The desktop editor needs Qt. Install pylustrator[desktop], or use "
+            "pylustrator.web for the headless browser workspace."
+        ) from exc
+    return initialize(*args, **kwargs)
+
+
+def StartColorChooser(*args, **kwargs):
+    """Open the optional desktop color chooser."""
+    try:
+        from .QtGui import initialize
+    except ImportError as exc:
+        raise ImportError("Install pylustrator[desktop] to use the color chooser.") from exc
+    return initialize(*args, **kwargs)
+
 
 __version__ = "1.3.0"
 
@@ -115,6 +147,7 @@ __all__ = [
     "ArtistAdapterRegistry",
     "ArtistCapabilities",
     "ChangeRecord",
+    "PointHandleModel",
     "RigidRotationPlan",
     "UnsupportedArtistError",
     "get_artist_adapter",
@@ -139,9 +172,18 @@ __all__ = [
     "TransformOperation",
     "GeometryTransformPlan",
     "NativeRotationPlan",
+    "PointEditPlan",
+    "PointEditSource",
+    "PreparedPointEditPlan",
     "StaleTransformPlanError",
     "TransformPlan",
     "TransformPreflightError",
+    "StaleTextContentPlanError",
+    "TextContentKind",
+    "TextContentPlan",
+    "TextContentPreflightError",
+    "TextContentSupport",
+    "text_content_support",
     "GENERATED_STATE_VERSION",
     "ObjectLocator",
     "migrate_generated_command",

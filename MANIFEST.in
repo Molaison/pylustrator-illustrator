@@ -1,3 +1,5 @@
 include README.md
 include pylustrator/icons/*.ico
 include pylustrator/icons/*.png
+recursive-include pylustrator/web/static *.html *.css *.js *.json *.txt *.md
+recursive-include pylustrator/web/examples *.pdb *.md

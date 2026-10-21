@@ -1304,6 +1304,10 @@ class ChangeTracker:
                 return "0"
             if reference_command.startswith(".get_legend"):
                 return "2"
+            if reference_command == "._pylustrator_set_line_endpoints":
+                # A compact endpoint delta composes on top of an existing
+                # full-data transform for the same line.
+                return "2"
             return "1"
 
         def getRef(obj):
@@ -1404,6 +1408,10 @@ class ChangeTracker:
         if self.no_save is True:
             return
         generated_changes = self.sorted_changes()
+        line_endpoint_replay_command = "._pylustrator_set_line_endpoints("
+        line_endpoint_replay_ensure = (
+            "_pylustrator_ensure_line_endpoint_replay_api"
+        )
         header = [
             getReference(self.figure)
             + ".ax_dict = {ax.get_label(): ax for ax in "
@@ -1417,6 +1425,14 @@ class ChangeTracker:
             for line in generated_changes
         ):
             header.extend(legend_layout_replay_bootstrap().splitlines())
+        if any(
+            line_endpoint_replay_command in line for line in generated_changes
+        ):
+            header.append(
+                "from pylustrator.commands import "
+                "ensure_line_endpoint_replay_api as "
+                f"{line_endpoint_replay_ensure}"
+            )
         header.extend(
             [
                 f"getattr({getReference(self.figure)}, '_pylustrator_init', lambda: ...)()",
@@ -1433,6 +1449,13 @@ class ChangeTracker:
             output.append(line)
         # add all lines from the changes
         for line in generated_changes:
+            target_reference, separator, _arguments = line.partition(
+                line_endpoint_replay_command
+            )
+            if separator:
+                output.append(
+                    f"{line_endpoint_replay_ensure}({target_reference})"
+                )
             output.append(line)
             if line.startswith("fig.add_axes"):
                 output.append(header[1])

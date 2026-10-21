@@ -599,71 +599,74 @@ def test_idle_warmup_publishes_hit_index_before_guides(monkeypatch) -> None:
 def test_idle_warmup_makes_first_fig2_scale_hit_query_hot(monkeypatch) -> None:
     app = QtWidgets.QApplication.instance()
     fig, ax = plt.subplots(figsize=(7, 5), dpi=100)
-    rectangles = []
-    for ix in range(24):
-        for iy in range(18):
-            rectangles.append(
-                ax.add_patch(
-                    Rectangle(
-                        (ix / 24, iy / 18),
-                        0.7 / 24,
-                        0.7 / 18,
-                        linewidth=0.2,
+    manager = None
+    try:
+        rectangles = []
+        for ix in range(24):
+            for iy in range(18):
+                rectangles.append(
+                    ax.add_patch(
+                        Rectangle(
+                            (ix / 24, iy / 18),
+                            0.7 / 24,
+                            0.7 / 18,
+                            linewidth=0.2,
+                        )
                     )
                 )
+        fig.canvas.draw()
+        manager = _attach_manager(fig)
+        manager._smart_guide_idle_warmup_enabled = True
+        manager._smart_guide_scene_cache = None
+        roster, _editable, _order = manager._interaction_roster_snapshot()
+        measured = 0
+        original_bounds = manager._interaction_index_bounds
+
+        def counted_bounds(*args, **kwargs):
+            nonlocal measured
+            measured += 1
+            return original_bounds(*args, **kwargs)
+
+        monkeypatch.setattr(manager, "_interaction_index_bounds", counted_bounds)
+        assert schedule_smart_guide_warmup(manager, batch_budget_ms=0.25)
+        # Scheduling performs no synchronous per-Artist hit-envelope work on draw.
+        assert measured == 0
+
+        deadline = monotonic() + 5.0
+        while (
+            not manager._interaction_index.is_current(
+                revision=manager._interaction_revision,
+                source_ids=roster.source_ids,
             )
-    fig.canvas.draw()
-    manager = _attach_manager(fig)
-    manager._smart_guide_idle_warmup_enabled = True
-    manager._smart_guide_scene_cache = None
-    roster, _editable, _order = manager._interaction_roster_snapshot()
-    measured = 0
-    original_bounds = manager._interaction_index_bounds
-
-    def counted_bounds(*args, **kwargs):
-        nonlocal measured
-        measured += 1
-        return original_bounds(*args, **kwargs)
-
-    monkeypatch.setattr(manager, "_interaction_index_bounds", counted_bounds)
-    assert schedule_smart_guide_warmup(manager, batch_budget_ms=0.25)
-    # Scheduling performs no synchronous per-Artist hit-envelope work on draw.
-    assert measured == 0
-
-    deadline = monotonic() + 5.0
-    while (
-        not manager._interaction_index.is_current(
+            and monotonic() < deadline
+        ):
+            app.processEvents()
+        assert manager._interaction_index.is_current(
             revision=manager._interaction_revision,
             source_ids=roster.source_ids,
         )
-        and monotonic() < deadline
-    ):
-        app.processEvents()
-    assert manager._interaction_index.is_current(
-        revision=manager._interaction_revision,
-        source_ids=roster.source_ids,
-    )
-    assert measured == len(roster.artists)
+        assert measured == len(roster.artists)
 
-    def unexpected_pointer_measurement(*_args, **_kwargs):
-        raise AssertionError("first pointer query rebuilt the full scene")
+        def unexpected_pointer_measurement(*_args, **_kwargs):
+            raise AssertionError("first pointer query rebuilt the full scene")
 
-    monkeypatch.setattr(
-        manager, "_interaction_index_bounds", unexpected_pointer_measurement
-    )
-    x, y = ax.transData.transform((0.51, 0.51))
-    event = _event(fig, "button_press_event", float(x), float(y))
-    samples = []
-    for _ in range(80):
-        started = perf_counter()
-        stack = manager.get_hit_stack(event)
-        samples.append(perf_counter() - started)
-    assert any(rectangle in stack.artists for rectangle in rectangles)
-    assert np.percentile(samples, 95) < 0.004
-
-    manager._smart_guide_idle_warmup_enabled = False
-    manager.selection.clear_targets()
-    plt.close(fig)
+        monkeypatch.setattr(
+            manager, "_interaction_index_bounds", unexpected_pointer_measurement
+        )
+        x, y = ax.transData.transform((0.51, 0.51))
+        event = _event(fig, "button_press_event", float(x), float(y))
+        samples = []
+        for _ in range(80):
+            started = perf_counter()
+            stack = manager.get_hit_stack(event)
+            samples.append(perf_counter() - started)
+        assert any(rectangle in stack.artists for rectangle in rectangles)
+        assert np.percentile(samples, 95) < 0.004
+    finally:
+        if manager is not None:
+            manager._smart_guide_idle_warmup_enabled = False
+            manager.selection.clear_targets()
+        plt.close(fig)
 
 
 def test_object_direct_and_isolation_scopes_filter_guide_sources() -> None:

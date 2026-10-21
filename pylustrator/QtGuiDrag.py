@@ -87,6 +87,20 @@ def _restore_matplotlib_entry_points() -> None:
         plt.figure = old_pltfigure
 
 
+def _is_pyplot_managed_figure(owner) -> bool:
+    """Limit desktop source tracking to live pyplot-owned figures.
+
+    The text/savefig wrappers are process-wide. A bare ``Figure`` used by an
+    Agg renderer or Web session has no pyplot identity and must retain the
+    original Matplotlib behavior, even after a desktop editor was initialized.
+    Checking the registry directly avoids changing the active pyplot figure.
+    """
+    figure = owner if isinstance(owner, Figure) else getattr(owner, "figure", None)
+    number = getattr(figure, "number", None)
+    manager = _pylab_helpers.Gcf.figs.get(number)
+    return manager is not None and manager.canvas.figure is figure
+
+
 def initialize(
     use_global_variable_names=False, use_exception_silencer=False, disable_save=False
 ):
@@ -117,6 +131,8 @@ def initialize(
             return text
 
         def wrapped_text(*args, **kwargs):
+            if not args or not _is_pyplot_managed_figure(args[0]):
+                return text(*args, **kwargs)
             element = text(
                 *args, fontdict=kwargs["fontdict"] if "fontdict" in kwargs else None
             )
@@ -200,9 +216,10 @@ def initialize(
         sf = Figure.savefig
 
         def savefig(self, filename, *args, **kwargs):
-            self._last_saved_figure = getattr(self, "_last_saved_figure", []) + [
-                (filename, args, kwargs)
-            ]
+            if _is_pyplot_managed_figure(self):
+                self._last_saved_figure = getattr(self, "_last_saved_figure", []) + [
+                    (filename, args, kwargs)
+                ]
             return sf(self, filename, *args, **kwargs)
 
         savefig._pylustrator_savefig_wrapper = True
@@ -1113,7 +1130,11 @@ class PlotWindow(QtWidgets.QWidget):
                 figure.signals = None
             manager = getattr(figure, "figure_dragger", None)
             if manager is not None:
-                manager.deactivate(redraw=False)
+                dispose = getattr(manager, "dispose", None)
+                if callable(dispose):
+                    dispose(redraw=False)
+                else:
+                    manager.deactivate(redraw=False)
                 if getattr(figure, "figure_dragger", None) is manager:
                     figure.figure_dragger = None
                 if getattr(figure, "selection", None) is getattr(

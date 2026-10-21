@@ -527,39 +527,41 @@ def test_warm_query_reduces_native_tests_and_defers_capabilities_to_hits(
 
 def test_fig2_scale_warm_hit_p95_stays_below_four_milliseconds() -> None:
     fig, ax = plt.subplots(figsize=(7, 5), dpi=100)
-    for ix in range(24):
-        for iy in range(18):
-            ax.add_patch(
-                Rectangle(
-                    (ix / 24, iy / 18),
-                    0.7 / 24,
-                    0.7 / 18,
-                    linewidth=0.2,
+    try:
+        for ix in range(24):
+            for iy in range(18):
+                ax.add_patch(
+                    Rectangle(
+                        (ix / 24, iy / 18),
+                        0.7 / 24,
+                        0.7 / 18,
+                        linewidth=0.2,
+                    )
                 )
-            )
-    fig.canvas.draw()
-    manager = _manager_for_figure(fig)
-    x, y = ax.transData.transform((0.51, 0.51))
-    event = _event(fig, float(x), float(y))
-    manager.get_hit_stack(event)
-    roster, _editable, _order = manager._interaction_roster_snapshot()
-
-    samples = []
-    for _ in range(80):
-        start = perf_counter()
+        fig.canvas.draw()
+        manager = _manager_for_figure(fig)
+        x, y = ax.transData.transform((0.51, 0.51))
+        event = _event(fig, float(x), float(y))
         manager.get_hit_stack(event)
-        samples.append(perf_counter() - start)
+        roster, _editable, _order = manager._interaction_roster_snapshot()
 
-    assert np.percentile(samples, 95) < 0.004
-    assert manager._interaction_index._source_ids is roster.source_ids
-    assert manager._interaction_roster_snapshot()[0] is roster
+        samples = []
+        for _ in range(80):
+            start = perf_counter()
+            manager.get_hit_stack(event)
+            samples.append(perf_counter() - start)
 
-    manager.invalidate_geometry_cache()
-    assert manager._interaction_roster_snapshot()[0] is roster
-    rectangle = ax.add_patch(Rectangle((0.2, 0.2), 0.01, 0.01))
-    manager.make_draggable(rectangle, ax)
-    assert manager._interaction_roster_snapshot()[0] is not roster
-    plt.close(fig)
+        assert np.percentile(samples, 95) < 0.004
+        assert manager._interaction_index._source_ids is roster.source_ids
+        assert manager._interaction_roster_snapshot()[0] is roster
+
+        manager.invalidate_geometry_cache()
+        assert manager._interaction_roster_snapshot()[0] is roster
+        rectangle = ax.add_patch(Rectangle((0.2, 0.2), 0.01, 0.01))
+        manager.make_draggable(rectangle, ax)
+        assert manager._interaction_roster_snapshot()[0] is not roster
+    finally:
+        plt.close(fig)
 
 
 def test_draw_and_inventory_changes_advance_index_revision() -> None:

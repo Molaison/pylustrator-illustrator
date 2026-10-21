@@ -1,0 +1,3 @@
+# Preserve fixed-column molecular records and verbatim upstream vendor files.
+pylustrator/web/examples/*.pdb -whitespace
+pylustrator/web/static/vendor/** -whitespace linguist-vendored

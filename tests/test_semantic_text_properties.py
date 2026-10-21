@@ -18,7 +18,14 @@ from pylustrator.change_tracker import (
     getReference,
     init_figure,
 )
-from pylustrator.property_adapters import edit_text_content_if_axis_managed
+from pylustrator.property_adapters import (
+    StaleTextContentPlanError,
+    TextContentKind,
+    TextContentPlan,
+    TextContentPreflightError,
+    edit_text_content_if_axis_managed,
+    text_content_support,
+)
 
 
 class Signal:
@@ -322,4 +329,353 @@ def test_tick_label_content_noop_does_not_dirty_document() -> None:
         assert tracker.edits == []
         assert tracker.saved
     finally:
+        plt.close(fig)
+
+
+@pytest.mark.parametrize(
+    "target_name",
+    [
+        "axes text",
+        "annotation",
+        "axes title",
+        "axis label",
+        "figure title",
+        "legend entry",
+        "legend title",
+    ],
+)
+def test_inline_text_plan_supports_replayable_text_owners(
+    target_name: str,
+) -> None:
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    line = ax.plot([0, 1], label="legend entry")[0]
+    legend = ax.legend(handles=[line], title="legend title")
+    targets = {
+        "axes text": ax.text(0.25, 0.5, "axes text"),
+        "annotation": ax.annotate("annotation", (0.5, 0.5)),
+        "axes title": ax.set_title("axes title"),
+        "axis label": ax.set_ylabel("axis label"),
+        "figure title": fig.suptitle("figure title"),
+        "legend entry": legend.get_texts()[0],
+        "legend title": legend.get_title(),
+    }
+    target = targets[target_name]
+    fig.canvas.draw()
+    tracker = install_tracker(fig, selected=(target,))
+    edited = f"edited {target_name}"
+
+    try:
+        support = text_content_support(target)
+        assert support.supported
+        assert support.kind is TextContentKind.ORDINARY
+
+        plan = TextContentPlan.preflight(target)
+        assert plan.kind is TextContentKind.ORDINARY
+        assert plan.commit(edited)
+        fig.canvas.draw()
+
+        assert target.get_text() == edited
+        assert len(tracker.edits) == 1
+        tracker.backEdit()
+        assert target.get_text() == target_name
+        tracker.forwardEdit()
+        assert target.get_text() == edited
+    finally:
+        plt.close(fig)
+
+
+def test_inline_ordinary_text_commit_draw_undo_redo_and_replay() -> None:
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    target = ax.text(0.25, 0.5, "before")
+    fig.canvas.draw()
+    tracker = install_tracker(fig, selected=(target,))
+
+    try:
+        plan = TextContentPlan.preflight(target)
+        assert plan.commit("after\nline")
+        assert target.get_text() == "after\nline"
+        assert fig.signals.figure_selection_property_changed.emissions == 1
+
+        generated = list(tracker.changes.values())
+        assert len(generated) == 1
+        assert generated[0][0] is target
+        assert "after\\nline" in generated[0][1]
+
+        tracker.backEdit()
+        assert target.get_text() == "before"
+        tracker.forwardEdit()
+        assert target.get_text() == "after\nline"
+
+        tracker.backEdit()
+        replay_changes(generated)
+        fig.canvas.draw()
+        assert target.get_text() == "after\nline"
+    finally:
+        plt.close(fig)
+
+
+def test_inline_tick_plan_preserves_identity_limits_and_replays() -> None:
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    ax.set_ylim(-0.25, 1.25)
+    ax.set_yticks([0, 1], labels=["first", "second"])
+    fig.canvas.draw()
+    ticks = ax.yaxis.get_major_ticks()
+    target = ticks[0].label1
+    other = ticks[1].label1
+    tracker = install_tracker(fig, selected=(target,))
+    locator_before = ax.yaxis.major.locator
+    formatter_before = ax.yaxis.major.formatter
+    limits_before = ax.get_ylim()
+
+    try:
+        plan = TextContentPlan.preflight(target)
+        assert plan.kind is TextContentKind.AXIS_TICK_LABEL
+        assert plan.commit("edited")
+        fig.canvas.draw()
+
+        assert ticks[0].label1 is target
+        assert target.get_text() == "edited"
+        assert other.get_text() == "second"
+        assert ax.get_ylim() == pytest.approx(limits_before)
+        assert len(tracker.edits) == 1
+        generated = list(tracker.changes.values())
+        assert len(generated) == 1
+        assert generated[0][0] is ax
+        assert ".set_yticks(" in generated[0][1]
+
+        tracker.backEdit()
+        assert ax.yaxis.major.locator is locator_before
+        assert ax.yaxis.major.formatter is formatter_before
+        assert target.get_text() == "first"
+        assert ax.get_ylim() == pytest.approx(limits_before)
+        tracker.forwardEdit()
+        assert ticks[0].label1 is target
+        assert target.get_text() == "edited"
+
+        tracker.backEdit()
+        replay_changes(generated)
+        fig.canvas.draw()
+        assert ticks[0].label1 is target
+        assert target.get_text() == "edited"
+        assert other.get_text() == "second"
+        assert ax.get_ylim() == pytest.approx(limits_before)
+    finally:
+        plt.close(fig)
+
+
+def test_inline_tick_plan_rejects_reordered_inventory_without_mutation() -> None:
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    ax.set_yticks([0, 1], labels=["first", "second"])
+    fig.canvas.draw()
+    target = ax.yaxis.majorTicks[0].label1
+    tracker = install_tracker(fig, selected=(target,))
+    plan = TextContentPlan.preflight(target)
+    ax.yaxis.majorTicks[0], ax.yaxis.majorTicks[1] = (
+        ax.yaxis.majorTicks[1],
+        ax.yaxis.majorTicks[0],
+    )
+
+    try:
+        with pytest.raises(StaleTextContentPlanError, match="ownership changed"):
+            plan.commit("must not apply")
+        assert target.get_text() == "first"
+        assert tracker.changes == {}
+        assert tracker.edits == []
+        assert tracker.last_edit == -1
+    finally:
+        plt.close(fig)
+
+
+def test_inline_ordinary_plan_rejects_changed_replay_address() -> None:
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    target = ax.text(0.25, 0.5, "first")
+    ax.text(0.75, 0.5, "second")
+    fig.canvas.draw()
+    tracker = install_tracker(fig, selected=(target,))
+    plan = TextContentPlan.preflight(target)
+    target.remove()
+    ax.add_artist(target)
+
+    try:
+        with pytest.raises(
+            StaleTextContentPlanError,
+            match="generated-source address changed",
+        ):
+            plan.commit("must not apply")
+        assert target.get_text() == "first"
+        assert tracker.changes == {}
+        assert tracker.edits == []
+    finally:
+        plt.close(fig)
+
+
+def test_inline_axis_offset_text_is_a_typed_preflight_denial() -> None:
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    ax.plot([1_000_000, 1_000_001], [0, 1])
+    fig.canvas.draw()
+    target = ax.xaxis.get_offset_text()
+    tracker = install_tracker(fig, selected=(target,))
+
+    try:
+        support = text_content_support(target)
+        assert not support.supported
+        assert support.kind is TextContentKind.AXIS_OFFSET_TEXT
+        assert "formatter output" in support.reason
+        with pytest.raises(TextContentPreflightError) as raised:
+            TextContentPlan.preflight(target)
+        assert raised.value.support.kind is TextContentKind.AXIS_OFFSET_TEXT
+        assert tracker.changes == {}
+        assert tracker.edits == []
+        assert tracker.last_edit == -1
+    finally:
+        plt.close(fig)
+
+
+def test_inline_secondary_axis_managed_text_is_explicitly_denied() -> None:
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    secondary = ax.secondary_xaxis("top")
+    secondary.set_xlabel("secondary")
+    fig.canvas.draw()
+    tracker = install_tracker(fig)
+    targets = (
+        secondary.xaxis.get_label(),
+        secondary.xaxis.get_major_ticks()[0].label1,
+    )
+
+    try:
+        for target in targets:
+            support = text_content_support(target)
+            assert not support.supported
+            assert "secondary, inset, or z-axis" in support.reason
+            with pytest.raises(TextContentPreflightError):
+                TextContentPlan.preflight(target)
+        assert tracker.changes == {}
+        assert tracker.edits == []
+    finally:
+        plt.close(fig)
+
+
+def test_inline_z_axis_managed_text_is_explicitly_denied() -> None:
+    fig = plt.figure(figsize=(4, 3), dpi=100)
+    ax = fig.add_subplot(projection="3d")
+    ax.set_zlabel("depth")
+    fig.canvas.draw()
+    tracker = install_tracker(fig)
+    targets = (ax.zaxis.get_label(), ax.zaxis.get_major_ticks()[0].label1)
+
+    try:
+        for target in targets:
+            support = text_content_support(target)
+            assert not support.supported
+            with pytest.raises(TextContentPreflightError):
+                TextContentPlan.preflight(target)
+        assert tracker.changes == {}
+        assert tracker.edits == []
+    finally:
+        plt.close(fig)
+
+
+def test_inline_unregistered_text_is_denied_without_side_effects() -> None:
+    fig, _ax = plt.subplots(figsize=(4, 3), dpi=100)
+    target = matplotlib.text.Text(0, 0, "unregistered")
+    target.set_figure(fig)
+    tracker = install_tracker(fig, selected=(target,))
+    recording_before = tracker.capture_recording_state()
+
+    try:
+        support = text_content_support(target)
+        assert not support.supported
+        assert support.kind is TextContentKind.ORDINARY
+        assert "stable generated-source reference" in support.reason
+        with pytest.raises(TextContentPreflightError):
+            TextContentPlan.preflight(target)
+        assert tracker.capture_recording_state() == recording_before
+        assert tracker.edits == []
+        assert tracker.last_edit == -1
+    finally:
+        plt.close(fig)
+
+
+def test_inline_text_noop_does_not_draw_record_or_create_history() -> None:
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    target = ax.text(0.5, 0.5, "same")
+    fig.canvas.draw()
+    tracker = install_tracker(fig, selected=(target,))
+    original_draw = fig.canvas.draw
+    draw_calls = 0
+
+    def counted_draw(*args, **kwargs):
+        nonlocal draw_calls
+        draw_calls += 1
+        return original_draw(*args, **kwargs)
+
+    fig.canvas.draw = counted_draw
+    try:
+        assert not TextContentPlan.preflight(target).commit("same")
+        assert draw_calls == 0
+        assert tracker.changes == {}
+        assert tracker.edits == []
+        assert tracker.saved
+    finally:
+        fig.canvas.draw = original_draw
+        plt.close(fig)
+
+
+def test_inline_tick_text_noop_returns_false_without_recording() -> None:
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    ax.set_yticks([0], labels=["same"])
+    fig.canvas.draw()
+    target = ax.yaxis.get_major_ticks()[0].label1
+    tracker = install_tracker(fig, selected=(target,))
+
+    try:
+        assert not TextContentPlan.preflight(target).commit("same")
+        assert tracker.changes == {}
+        assert tracker.edits == []
+        assert tracker.saved
+    finally:
+        plt.close(fig)
+
+
+def test_inline_text_detects_external_content_drift_before_commit() -> None:
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    target = ax.text(0.5, 0.5, "initial")
+    fig.canvas.draw()
+    tracker = install_tracker(fig, selected=(target,))
+    plan = TextContentPlan.preflight(target)
+    target.set_text("external")
+
+    try:
+        with pytest.raises(StaleTextContentPlanError, match="content changed"):
+            plan.commit("inline")
+        assert target.get_text() == "external"
+        assert tracker.changes == {}
+        assert tracker.edits == []
+    finally:
+        plt.close(fig)
+
+
+def test_inline_text_recording_failure_rolls_back_state_and_history() -> None:
+    fig, ax = plt.subplots(figsize=(4, 3), dpi=100)
+    target = ax.text(0.5, 0.5, "before")
+    fig.canvas.draw()
+    tracker = install_tracker(fig, selected=(target,))
+    plan = TextContentPlan.preflight(target)
+    recording_before = tracker.capture_recording_state()
+    original_record = tracker.addNewTextChange
+
+    def fail_after_recording(text):
+        original_record(text)
+        raise RuntimeError("injected inline recording failure")
+
+    tracker.addNewTextChange = fail_after_recording
+    try:
+        with pytest.raises(RuntimeError, match="inline recording failure"):
+            plan.commit("after")
+        assert target.get_text() == "before"
+        assert tracker.capture_recording_state() == recording_before
+        assert tracker.edits == []
+        assert tracker.last_edit == -1
+    finally:
+        tracker.addNewTextChange = original_record
         plt.close(fig)

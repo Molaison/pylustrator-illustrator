@@ -1,0 +1,8 @@
+{
+  "name": "pylustrator-forge-web",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node ../../../tests/web/state.test.mjs"
+  }
+}

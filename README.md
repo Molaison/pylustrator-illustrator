@@ -82,6 +82,11 @@ Undo/Redo.
 
 - **Object Selection (`V`)** selects the logical object or group.
 - **Direct Selection (`A`)** reaches the exact Matplotlib artist.
+  Adapter-owned path anchors support batched polygon vertices, linear PathPatch
+  anchors, Line2D endpoints, and Annotation text/data anchors without synthetic
+  Matplotlib Artists. Preview, typed preflight, and commit share one contract;
+  unsupported curves, layout-owned leaves, and unrepresentable storage reject
+  with typed reasons before mutation.
 - Hover, click, Alt/Option click-through, candidate menus, and marquee
   selection share one ordered hit-resolution model.
 - Containers stay out of ordinary marquee selection unless container mode is
@@ -114,6 +119,9 @@ fully preflighted before the first artist changes.
   replacing handles, labels, or title artists.
 - Formatter-owned tick labels and axis labels edit through their semantic axis
   owner instead of accidentally moving the containing axes.
+- **Semantic inline text editing.** Enter/double-click opens a draft overlay for
+  Text, Annotation, axis labels, tick labels, and Legend text. Ctrl/Cmd+Enter
+  or focus commits; Escape cancels. Formatter-owned ticks commit through Axis.
 - `Line2D` movement and rotation preserve ndarray/MaskedArray dtype, shape,
   masks, fill values, categorical data, and datetime semantics.
 - Editor windows can close and reopen without accumulating hidden Qt managers,
@@ -182,7 +190,48 @@ change tracker.
 
 ## Quick start
 
-### Install this fork
+### Headless Web research workspace
+
+The Web workspace runs without Qt, a display server, or a remote desktop. From
+this checkout:
+
+```bash
+python -m pip install -e '.[web]'
+pylustrator-web --data-dir ./research-workspace --port 8765
+```
+
+Open **http://127.0.0.1:8765**. Create a project or use the explicitly labeled
+example, then move through **Data → Figure → Structures → Versions**. Raw datasets
+remain immutable; processing creates derived data with reproducible recipes.
+SVG, PNG, PDF, replayable Python, and complete project bundles are downloadable.
+
+To edit a Figure produced by your existing trusted Python script:
+
+```python
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from pylustrator.web import serve
+
+fig, ax = plt.subplots()
+ax.plot([0, 1, 2], [0, 1, 0], marker="o")
+serve(fig, data_dir="./research-workspace")
+```
+
+The **Matplotlib** view uses the existing semantic adapters for live artist
+editing and undo/redo. Native sessions and persistent composition documents have
+explicitly different lifetimes and support boundaries; see the
+[Web workspace guide](docs/web_workspace.md), [API contract](docs/web_contract.md),
+[architecture](docs/web_architecture.md), [migration/reference review](docs/web_research.md),
+and [executed verification and runtime boundaries](docs/web_verification.md).
+
+For a headless remote machine, leave the server on loopback and connect with
+`ssh -L 8765:127.0.0.1:8765 user@host`. The browser UI, including its bundled
+molecular renderer, has no runtime CDN dependency.
+
+![The Web structure workspace rendering the bundled real 1CRN protein](docs/assets/web-research-structures.png)
+
+### Install this fork for desktop editing
 
 This fork is not published under the upstream `pylustrator` distribution name.
 `pip install pylustrator` installs the upstream project, not the interaction
@@ -192,14 +241,14 @@ Install Forge directly from GitHub:
 
 ```bash
 python -m pip install \
-  "pylustrator @ git+https://github.com/Molaison/pylustrator-illustrator.git@main"
+  "pylustrator[desktop] @ git+https://github.com/Molaison/pylustrator-illustrator.git@main"
 ```
 
 With `uv`:
 
 ```bash
 uv pip install \
-  "pylustrator @ git+https://github.com/Molaison/pylustrator-illustrator.git@main"
+  "pylustrator[desktop] @ git+https://github.com/Molaison/pylustrator-illustrator.git@main"
 ```
 
 For a reproducible environment, replace `main` with a release tag or full
@@ -280,6 +329,14 @@ See:
   serializers.
 
 ## Validation snapshot
+
+The 2026-10-21 Web migration has a separate [verification report](docs/web_verification.md):
+99 tests passed in a Qt-free installation, 7 browser state tests passed, and real
+Chromium workflows passed. The complete Python run recorded 1,515 passes, 178
+capability skips, and 3 failures at existing 4 ms desktop timing gates on the local
+shared runtime. Independent GitHub Python 3.12 and 3.13 runs then passed **1,518
+tests with 178 capability skips**, including all unchanged timing gates. The
+report preserves both results and the baseline comparisons.
 
 At the 2026-07-18 fork milestone:
 

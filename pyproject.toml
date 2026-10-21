@@ -16,14 +16,12 @@ dependencies = [
     "natsort>=4.0.0",
     "numpy>=1.23.5",
     "matplotlib>=3.8.4",
-    "PyQt5>=5.15.2",
-    "qtawesome>=0.5.0",
     "scikit-image>=0.21.0",
-    "qtpy>=2.4.3",
 ]
 
 [project.scripts]
 pylustrator-source = "pylustrator.source_doctor:main"
+pylustrator-web = "pylustrator.web.__main__:main"
 
 [project.urls]
 Homepage = "https://github.com/Molaison/pylustrator-illustrator"
@@ -33,6 +31,9 @@ Documentation = "https://pylustrator.readthedocs.io/en/latest/"
 Upstream = "https://github.com/rgerum/pylustrator"
 
 [project.optional-dependencies]
+desktop = ["PyQt5>=5.15.2", "qtpy>=2.4.3", "qtawesome>=0.5.0"]
+web = ["fastapi>=0.115,<1", "uvicorn>=0.30,<1", "httpx>=0.27,<1", "gemmi>=0.6,<1"]
+browser-test = ["playwright==1.56.0"]
 dev = ["ruff>=0.14.11", "ty>=0.0.10"]
 test = ["pytest>=7.2.0,<8.0.0"]
 
@@ -56,3 +57,6 @@ include-package-data = true
 
 [tool.setuptools.packages.find]
 include = ["pylustrator*"]
+
+[tool.setuptools.package-data]
+"pylustrator.web" = ["static/*", "static/vendor/*", "examples/*"]
