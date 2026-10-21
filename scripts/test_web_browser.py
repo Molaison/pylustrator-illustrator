@@ -18,8 +18,6 @@ import time
 import urllib.error
 import urllib.request
 
-from playwright.sync_api import expect, sync_playwright
-
 ROOT = Path(__file__).resolve().parents[1]
 SERVER = """
 import sys
@@ -52,6 +50,8 @@ def wait_server(url, process):
 
 
 def run_browser(url: str, artifacts: Path):
+    from playwright.sync_api import expect, sync_playwright
+
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True, args=["--no-sandbox", "--enable-unsafe-swiftshader"])
         context = browser.new_context(viewport={"width": 1440, "height": 1000}, accept_downloads=True)

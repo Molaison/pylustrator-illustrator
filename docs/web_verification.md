@@ -14,6 +14,7 @@ the source for the remote Python/dependency matrix.
 | Check | Observed result |
 |---|---|
 | Complete Python suite after desktop/headless isolation repair | **1,515 passed, 178 skipped, 3 failed** in 183.06 s; all three failures are existing `<4 ms` timing assertions, detailed below |
+| Independent GitHub runners, Python 3.12 and 3.13 locked stacks | **1,518 passed, 178 skipped** on each; all three unchanged strict timing assertions passed |
 | All Web tests in a separate installation without PyQt5 or qtpy | **99 passed** in 19.47 s, including native downloaded-code replay |
 | Browser editor state tests | **7 passed**: gesture history/cancel, locking, true line geometry, groups/IDs, saved-state concurrency, rotation bounds, direct points |
 | Real Chromium complete workflow | **Passed**, including native keyboard history and Python download, data processing, plotted output, 1CRN WebGL, provenance snapshot, checkpoint, export/reload and two-tab conflict |
@@ -25,10 +26,11 @@ the source for the remote Python/dependency matrix.
 | Vendor resources | 3Dmol.js 2.5.5 SHA-256 matches its manifest; both license notices and the real structure's attribution are included |
 
 The 178 skips belong to the existing supported/denied artist capability matrix;
-they are not a claim that the skipped operation is supported. The full suite was
-not all green, and the timing failures have not been removed or loosened.
+they are not a claim that the skipped operation is supported. The local full run
+was not all green. Independent remote runs were green; no timing assertion was
+removed or loosened.
 
-## Remaining desktop performance gates
+## Local timing variability and independent remote confirmation
 
 The exact three failures were rerun once in isolation, then against the untouched
 archived baseline with the same dependencies. Values below are measured p95 in ms.
@@ -41,10 +43,23 @@ archived baseline with the same dependencies. Values below are measured p95 in m
 
 Every limit remains `<4 ms`. The baseline reproduces two failures; it does not
 reproduce the direct-point failure in this single comparison. The measurements
-vary substantially on this shared runtime. That suggests runtime sensitivity,
-but **the direct-point timing gate remains unresolved**. It must not be described
-as baseline-confirmed or as a functional/visual pass. Use a stable runner to
-assess the strict latency contract before merging.
+vary substantially on this shared runtime; that local direct-point result must
+not be described as baseline-confirmed.
+
+Subsequent independent GitHub runners passed the **complete 1,518-test suite**
+on both locked Python versions, including those exact timing assertions:
+[Python 3.12](https://github.com/Molaison/pylustrator-illustrator/actions/runs/39561007480/job/119091982178)
+and [Python 3.13](https://github.com/Molaison/pylustrator-illustrator/actions/runs/39561007480/job/119091982272).
+This confirms the performance contract on those runners while retaining the
+local measurements as evidence of runtime sensitivity. It is not a guarantee
+of a 4 ms deadline on every machine.
+
+The initial remote run also exposed two CI setup defects: the unversioned lint
+job selected Python 3.15, outside the tested matrix, and minimum-stack pytest
+collection imported optional Playwright from the browser script. The follow-up
+commit pins lint to Python 3.12 and delays that optional import until the browser
+script is actually invoked. Neither change weakens an assertion or adds a GUI
+dependency to the headless install.
 
 The interop defect uncovered earlier was functional and was fixed separately:
 desktop process-wide text/save wrappers now track only live pyplot-managed

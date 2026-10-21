@@ -223,7 +223,7 @@ editing and undo/redo. Native sessions and persistent composition documents have
 explicitly different lifetimes and support boundaries; see the
 [Web workspace guide](docs/web_workspace.md), [API contract](docs/web_contract.md),
 [architecture](docs/web_architecture.md), [migration/reference review](docs/web_research.md),
-and [executed verification with remaining performance gates](docs/web_verification.md).
+and [executed verification and runtime boundaries](docs/web_verification.md).
 
 For a headless remote machine, leave the server on loopback and connect with
 `ssh -L 8765:127.0.0.1:8765 user@host`. The browser UI, including its bundled
@@ -333,8 +333,10 @@ See:
 The 2026-10-21 Web migration has a separate [verification report](docs/web_verification.md):
 99 tests passed in a Qt-free installation, 7 browser state tests passed, and real
 Chromium workflows passed. The complete Python run recorded 1,515 passes, 178
-capability skips, and 3 failures at existing 4 ms desktop timing gates. The report
-includes baseline comparisons and does not present those gates as resolved.
+capability skips, and 3 failures at existing 4 ms desktop timing gates on the local
+shared runtime. Independent GitHub Python 3.12 and 3.13 runs then passed **1,518
+tests with 178 capability skips**, including all unchanged timing gates. The
+report preserves both results and the baseline comparisons.
 
 At the 2026-07-18 fork milestone:
 
