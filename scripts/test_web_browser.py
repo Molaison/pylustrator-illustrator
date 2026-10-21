@@ -30,7 +30,9 @@ ax = fig.add_subplot()
 ax.plot([0, 1, 2], [2, 1, 3], label='Signal')
 fig.text(.2, .9, 'Browser native text')
 session = FigureSession(fig, name='Browser native figure')
-app = create_app(sys.argv[1], sessions=[session])
+other = Figure(figsize=(4, 3), dpi=96)
+other.text(.3, .7, 'Second native figure')
+app = create_app(sys.argv[1], sessions=[session, FigureSession(other, name='Second native figure')])
 uvicorn.run(app, host='127.0.0.1', port=int(sys.argv[2]), log_level='warning')
 """
 
@@ -55,6 +57,40 @@ def run_browser(url: str, artifacts: Path):
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True, args=["--no-sandbox", "--enable-unsafe-swiftshader"])
         context = browser.new_context(viewport={"width": 1440, "height": 1000}, accept_downloads=True)
+        # Slow the first Figure detail response to reproduce an early user switch.
+        quick = context.new_page()
+        quick.add_init_script("""
+          const originalFetch = window.fetch.bind(window);
+          window.__listRequests = 0;
+          window.__detailRequests = 0;
+          window.fetch = async (...args) => {
+            const path = String(args[0]);
+            if (path === "/api/sessions") window.__listRequests++;
+            if (path.startsWith("/api/sessions/") && path.split("/").length === 4) {
+              window.__detailRequests++;
+              if (window.__detailRequests === 1)
+                await new Promise(resolve => setTimeout(resolve, 1500));
+            }
+            return originalFetch(...args);
+          };
+        """)
+        quick.goto(url)
+        select = quick.locator("#native-session")
+        select.wait_for()
+        quick.wait_for_function("window.__detailRequests > 0")
+        selected_id = select.select_option(label="Second native figure")[0]
+        expect(quick.locator("#native-status")).to_contain_text("Revision 0")
+        expect(select).to_have_value(selected_id)
+        quick.wait_for_timeout(1800)  # original delayed response has now settled
+        expect(select).to_have_value(selected_id)
+        expect(quick.get_by_role("button", name="Second native figure · Text", exact=True)).to_be_visible()
+        quick.locator('[data-view="figure"]').click()
+        quick.locator('[data-view="native"]').click()
+        expect(select).to_have_value(selected_id)
+        assert quick.evaluate("window.__listRequests") == 1
+        quick.close()
+        print("PASS lightweight discovery and latest-choice-wins during early Figure switching", flush=True)
+
         page = context.new_page()
         page.set_default_timeout(20000)
         failures = []

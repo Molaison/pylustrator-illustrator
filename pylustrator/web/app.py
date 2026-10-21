@@ -352,7 +352,8 @@ def create_app(data_dir: str | Path | None = None, *, token: str | None = None,
     @app.get("/api/sessions")
     def list_sessions():
         with app.state.session_lock:
-            return {"sessions": [session.describe() for session in app.state.sessions.values()]}
+            return {"sessions": [{"id": session.id, "name": session.name, "revision": session.revision}
+                                 for session in app.state.sessions.values()]}
 
     @app.get("/api/sessions/{session_id}")
     def describe_session(session_id: str):

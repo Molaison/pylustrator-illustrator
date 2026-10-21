@@ -149,3 +149,43 @@ Development and research records are in
 [Linear project P-MOL-14](https://linear.app/molaison/project/pylustrator-web-research-studio-3476632f1788),
 including MOL-251–MOL-261. When the workspace's free issue limit was reached,
 second-review findings were appended to MOL-259 instead of leaving them untracked.
+
+## P0/P1 native loading and rapid-switch regression — 2026-10-21
+
+The session-list API now returns only `id`, `name` and `revision`, deferring the
+expensive artist description until a figure is selected. The native frontend
+coalesces concurrent discovery/mount calls, discards stale figure-detail responses
+and errors, and avoids redundant SVG image loads. If no figures are initially
+attached, a later mount retries discovery.
+
+The existing Astrolabe **predicted** structure `examples/input/9TP_cid.cif`
+generated two real Matplotlib figures (268 and 104 artists). The matched source
+workflow contained 7,395 chain-pair distances, 19 Cα and 205 all-atom contacts
+at 8 Å. Its figure exports, pixel-exact PNG comparisons, artist editing,
+Undo/Redo and downloaded Python replay passed end to end. Chromium passed a
+rapid-switch regression with the first detail response delayed 1,800 ms: the
+last selected figure remained active, including after navigating away/back,
+with only one `/api/sessions` request and no page errors. The full browser
+workflow passed, plus **19 Python** API/session tests and **7 Node** state tests.
+
+On this shared host, Astrolabe list discovery measured **473,966 B / 1.431 s**
+before versus **226 B / 0.002 s** after the fix. Initial heatmap loading
+measured **7.66 s** before versus **4.56 s** after. These are observed single-run
+measurements, not universal latency guarantees; a large selected figure still
+requires an expensive description. Public Chromium validation of the temporary
+Cloudflare preview also passed for the 104-artist figure.
+
+Reproduce the relevant regression checks from the repository root:
+
+```bash
+MPLBACKEND=Agg QT_QPA_PLATFORM=offscreen .venv/bin/python -m pytest -q tests/test_web_api.py tests/test_web_session.py
+node --check pylustrator/web/static/native.js
+node tests/web/state.test.mjs
+MPLBACKEND=Agg PYTHONDONTWRITEBYTECODE=1 .venv/bin/python scripts/test_web_browser.py --artifacts ./browser-results
+```
+
+Astrolabe-specific input preparation and screenshot artifacts remain in the
+external project workspace's `04_astrolabe_figure_web_test.py`,
+`04_astrolabe_results/` and `06_p0_p1_preview/`; these files are **not** part of
+the repository commit. Do not interpret predicted structural contacts as
+experimentally confirmed observations.

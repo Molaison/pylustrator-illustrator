@@ -10,28 +10,37 @@ export class NativeWorkspace {
     this.drag = null;
     this.el = document.querySelector("#native-workspace");
     this.sequence = 0;
+    this.discoverPromise = null;
+    this.mountPromise = null;
   }
-  async discover() {
-    try {
-      const response = await api.get("/api/sessions");
-      this.sessions = response.sessions || [];
-      document.querySelector("[data-view=native]").hidden =
-        !this.sessions.length;
-      return this.sessions;
-    } catch {
-      return [];
-    }
+  discover() {
+    if (!this.discoverPromise)
+      this.discoverPromise = api.get("/api/sessions").then((response) => {
+        this.sessions = response.sessions || [];
+        document.querySelector("[data-view=native]").hidden = !this.sessions.length;
+        return this.sessions;
+      }).catch(() => {
+        this.discoverPromise = null;
+        return [];
+      });
+    return this.discoverPromise;
   }
-  async mount() {
+  mount() {
+    if (!this.mountPromise) this.mountPromise = this.mountOnce();
+    return this.mountPromise;
+  }
+  async mountOnce() {
     this.el.innerHTML =
       '<div class="research-main"><div class="loading-placeholder" role="status">Loading attached Matplotlib figures…</div></div>';
     await this.discover();
     if (!this.sessions.length) {
       this.el.innerHTML =
         '<div class="empty-state"><h2>Attach a Matplotlib figure</h2><p>From a trusted Python process, call <code>pylustrator.web.serve(fig)</code>. The figure remains a live Matplotlib figure and can be edited here without Qt.</p></div>';
+      this.discoverPromise = null;
+      this.mountPromise = null;
       return;
     }
-    this.el.innerHTML = `<aside class="research-sidebar"><h2>Matplotlib figures</h2><label>Attached figure<select id="native-session">${this.sessions.map((s) => `<option value="${esc(s.id)}">${esc(s.name || s.id)}</option>`).join("")}</select></label><div id="native-artist-list" class="native-artist-list"></div></aside><div class="native-canvas-wrap"><div id="native-frame" class="native-frame"><img id="native-image" src="/api/sessions/${encodeURIComponent(this.session?.id || this.sessions[0].id)}/render.svg" alt="Live Matplotlib figure"><svg id="native-overlay" xmlns="http://www.w3.org/2000/svg" aria-label="Figure artist selection overlay"></svg></div></div><aside class="research-controls"><h3>Native artist properties</h3><div id="native-properties"><p class="muted">Select an artist in the list or on the figure.</p></div><hr><div class="inline-actions"><button id="native-undo" disabled>Undo</button><button id="native-redo" disabled>Redo</button><button id="native-refresh">Refresh</button></div><p id="native-status" class="inline-status" role="status"></p><label>Export attached figure<select id="native-export-format"><option value="svg">SVG vector</option><option value="png">PNG image</option><option value="pdf">PDF figure</option><option value="python">Python changes</option></select></label><button id="native-export" class="full-width">Download attached figure</button><p class="small-note">Python changes replay against the original Figure; keep the original plotting script.</p><p class="small-note">Native edits use the existing Matplotlib adapter transaction engine. Unsupported operations report their capability reason.</p></aside>`;
+    this.el.innerHTML = `<aside class="research-sidebar"><h2>Matplotlib figures</h2><label>Attached figure<select id="native-session">${this.sessions.map((s) => `<option value="${esc(s.id)}">${esc(s.name || s.id)}</option>`).join("")}</select></label><div id="native-artist-list" class="native-artist-list"></div></aside><div class="native-canvas-wrap"><div id="native-frame" class="native-frame"><img id="native-image" src="/api/sessions/${encodeURIComponent(this.session?.id || this.sessions[0].id)}/render.svg?revision=${this.session?.revision ?? this.sessions[0].revision}" alt="Live Matplotlib figure"><svg id="native-overlay" xmlns="http://www.w3.org/2000/svg" aria-label="Figure artist selection overlay"></svg></div></div><aside class="research-controls"><h3>Native artist properties</h3><div id="native-properties"><p class="muted">Select an artist in the list or on the figure.</p></div><hr><div class="inline-actions"><button id="native-undo" disabled>Undo</button><button id="native-redo" disabled>Redo</button><button id="native-refresh">Refresh</button></div><p id="native-status" class="inline-status" role="status"></p><label>Export attached figure<select id="native-export-format"><option value="svg">SVG vector</option><option value="png">PNG image</option><option value="pdf">PDF figure</option><option value="python">Python changes</option></select></label><button id="native-export" class="full-width">Download attached figure</button><p class="small-note">Python changes replay against the original Figure; keep the original plotting script.</p><p class="small-note">Native edits use the existing Matplotlib adapter transaction engine. Unsupported operations report their capability reason.</p></aside>`;
     this.el.querySelector("#native-session").onchange = (e) =>
       this.load(e.target.value);
     this.el.querySelector("#native-undo").onclick = () =>
@@ -66,14 +75,15 @@ export class NativeWorkspace {
         this.selected = null;
       this.render();
     } catch (error) {
-      this.hooks.notify(error.message, "error");
+      if (sequence === this.sequence) this.hooks.notify(error.message, "error");
     }
   }
   render() {
     if (!this.session) return;
     const s = this.session;
-    this.el.querySelector("#native-image").src =
-      `/api/sessions/${encodeURIComponent(s.id)}/render.svg?revision=${s.revision}`;
+    const img = this.el.querySelector("#native-image");
+    const source = `/api/sessions/${encodeURIComponent(s.id)}/render.svg?revision=${s.revision}`;
+    if (img.getAttribute("src") !== source) img.src = source;
     this.el.querySelector("#native-frame").style.width = `${s.width}px`;
     this.el
       .querySelector("#native-overlay")

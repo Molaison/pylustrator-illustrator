@@ -131,6 +131,22 @@ def test_native_figure_api_retains_semantics(tmp_path):
         assert b"<svg" in client.get(f"/api/sessions/{session.id}/render.svg").content
 
 
+def test_native_session_list_does_not_describe_artists(tmp_path, monkeypatch):
+    figure = Figure(figsize=(6, 4), dpi=96)
+    figure.text(0.2, 0.3, "Real text")
+    session = FigureSession(figure, name="Live Matplotlib")
+
+    def no_expensive_describe():
+        raise AssertionError("Session discovery must not redraw or describe artists")
+
+    with TestClient(create_app(tmp_path, sessions=[session])) as client:
+        monkeypatch.setattr(session, "describe", no_expensive_describe)
+        response = client.get("/api/sessions")
+        assert good(response) == {"sessions": [{"id": session.id, "name": "Live Matplotlib", "revision": 0}]}
+        assert len(response.content) < 200
+    session.close()
+
+
 def test_example_is_real_data_bound_figure(client):
     project = good(client.post("/api/projects", json={"name": "Example", "example": True}))
     assert len(project["datasets"]) == 1

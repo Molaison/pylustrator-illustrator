@@ -89,7 +89,8 @@ bounds and supported operations, executes adapter-owned commands, and renders us
 This preserves existing scientific semantic editing without accepting uploaded Python
 or pickles. The static document workflow and native figure sessions are both headless.
 
-Native session endpoints: `GET /api/sessions`, `GET /api/sessions/{id}`,
+Native session endpoints: `GET /api/sessions` (lightweight `{id,name,revision}` list,
+without artist geometry), `GET /api/sessions/{id}` (full editable artist description),
 `POST /api/sessions/{id}/commands`, `GET /api/sessions/{id}/render.svg` (PNG/PDF
 also accepted), and `GET /api/sessions/{id}/changes.py`. The changes snippet
 requires the original `fig` construction and rejects a different initial size/DPI.
