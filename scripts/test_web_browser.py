@@ -153,7 +153,7 @@ def run_browser(url: str, artifacts: Path):
         expect(page.locator("#save-state")).to_have_text("Saved")
         expect(page.locator("#asset-summary")).to_contain_text("1 structures")
         # Wait for plot responses before recording the final layout.
-        page.wait_for_function("!document.querySelector('#artwork')?.textContent.includes('Rendering plot')")
+        expect(page.locator("#artwork")).not_to_contain_text("Rendering plot")
         page.screenshot(path=str(artifacts / "web-figure.png"), full_page=True)
         print("PASS named checkpoint, vector export and persisted reload", flush=True)
 
