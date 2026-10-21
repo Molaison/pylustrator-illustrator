@@ -8,3 +8,10 @@ docs/_build_html/
 dist/
 build/
 development/playground
+.venv/
+.venv-headless/
+.pytest_cache/
+.ruff_cache/
+.pylustrator/
+playwright-report/
+test-results/

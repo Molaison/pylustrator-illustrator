@@ -1,0 +1,382 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <title>Pylustrator Forge — Research workspace</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+    <script type="module" src="/static/app.js"></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to workspace</a>
+    <header class="app-header">
+      <div class="brand">
+        <svg width="28" height="28" viewBox="0 0 28 28" aria-hidden="true">
+          <path
+            d="M5 23V5h18M9 19l5-8 5 4 4-7"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+          />
+          <circle cx="9" cy="19" r="2" fill="currentColor" />
+        </svg>
+        <h1>Pylustrator <span>Forge</span></h1>
+      </div>
+      <div class="project-picker">
+        <label class="sr-only" for="project-select"
+          >Current research project</label
+        ><select id="project-select">
+          <option value="">Loading projects…</option></select
+        ><button id="new-project" title="Create a new research project">
+          New project
+        </button>
+      </div>
+      <div class="save-actions">
+        <span id="save-state" class="save-state" role="status">Connecting…</span
+        ><button
+          id="save-project"
+          class="primary"
+          disabled
+          title="Save editable project (Ctrl or Command + S)"
+        >
+          Save</button
+        ><button id="project-menu-button" aria-haspopup="dialog">
+          Project details
+        </button>
+      </div>
+    </header>
+    <div class="workspace-bar">
+      <nav class="workspace-tabs" aria-label="Workspace views">
+        <button data-view="figure" class="active" aria-current="page">
+          Figure
+        </button>
+        <button data-view="data">Data</button>
+        <button data-view="structures">Structures</button>
+        <button data-view="versions">Versions</button>
+        <button data-view="native" hidden>Matplotlib</button>
+      </nav>
+      <div class="workspace-actions">
+        <button id="undo" disabled title="Undo (Ctrl or Command + Z)">
+          Undo</button
+        ><button id="redo" disabled title="Redo (Ctrl or Command + Shift + Z)">
+          Redo</button
+        ><span class="divider"></span
+        ><label class="sr-only" for="export-format">Export format</label
+        ><select id="export-format">
+          <option value="svg">SVG vector</option>
+          <option value="png">PNG image</option>
+          <option value="pdf">PDF figure</option>
+          <option value="python">Python source</option></select
+        ><button id="export-button" disabled>Export figure</button
+        ><button id="help-button" title="Keyboard shortcuts and workflow">
+          Help
+        </button>
+      </div>
+    </div>
+    <div id="notice" class="notice" role="status" hidden>
+      <span id="notice-text"></span><button id="notice-action" hidden></button
+      ><button id="notice-dismiss" aria-label="Dismiss notification">×</button>
+    </div>
+    <main id="main" tabindex="-1">
+      <section
+        id="view-figure"
+        class="workspace-view figure-workspace"
+        aria-label="Figure editor"
+      >
+        <aside class="panel layers-panel" aria-label="Layers and assets">
+          <div class="panel-title">
+            <h2>Layers</h2>
+            <span id="layer-count" class="count">0</span>
+          </div>
+          <div id="layers" class="layer-list" aria-label="Figure layers"></div>
+          <div class="panel-section">
+            <h3>Arrange selection</h3>
+            <div class="button-grid">
+              <button data-command="group">Group</button
+              ><button data-command="ungroup">Ungroup</button
+              ><button data-command="backward">Backward</button
+              ><button data-command="forward">Forward</button
+              ><button data-command="duplicate">Duplicate</button
+              ><button data-command="delete">Delete</button>
+            </div>
+          </div>
+          <div class="panel-section">
+            <h3>Project assets</h3>
+            <div id="asset-summary" class="muted">
+              Create a project to begin.
+            </div>
+            <button class="full-width" data-go="data">
+              Import or inspect data</button
+            ><button class="full-width" data-go="structures">
+              Add a protein structure
+            </button>
+          </div>
+        </aside>
+        <div class="editor-center">
+          <div class="drawing-toolbar" role="toolbar" aria-label="Figure tools">
+            <button
+              id="toggle-layers"
+              class="panel-toggle"
+              aria-controls="layers"
+              aria-expanded="false"
+            >
+              Layers
+            </button>
+            <button
+              data-tool="select"
+              class="active"
+              aria-pressed="true"
+              title="Object selection (V)"
+            >
+              Select <kbd>V</kbd></button
+            ><button
+              data-tool="direct"
+              aria-pressed="false"
+              title="Edit line and path vertices (A)"
+            >
+              Points <kbd>A</kbd></button
+            ><button
+              data-tool="pan"
+              aria-pressed="false"
+              title="Pan canvas (hold Space)"
+            >
+              Hand
+            </button>
+            <span class="divider"></span>
+            <button data-add="text" title="Add text">Text</button
+            ><button data-add="rect" title="Add rectangle">Rectangle</button
+            ><button data-add="ellipse" title="Add ellipse">Ellipse</button
+            ><button data-add="line" title="Add line">Line</button
+            ><button data-add="path" title="Add editable path">Path</button
+            ><button id="add-image" title="Import a PNG image">Image</button>
+            <button
+              id="toggle-properties"
+              class="panel-toggle"
+              aria-controls="inspector"
+              aria-expanded="false"
+            >
+              Properties
+            </button>
+          </div>
+          <div
+            id="canvas-viewport"
+            class="canvas-viewport"
+            tabindex="0"
+            aria-label="Figure canvas. Select objects using the Layers panel or mouse. Arrow keys move the selection."
+          >
+            <svg
+              id="artboard"
+              xmlns="http://www.w3.org/2000/svg"
+              role="img"
+              aria-label="Editable scientific figure"
+            >
+              <g id="artwork"></g>
+              <g id="guides" aria-hidden="true"></g>
+              <g id="selection-overlay" aria-hidden="true"></g>
+            </svg>
+            <div id="figure-empty" class="canvas-empty">
+              <div class="empty-sheet" aria-hidden="true">A</div>
+              <h2>Your next figure starts here</h2>
+              <p>
+                Create a research project, then import data or start with a
+                blank figure.
+              </p>
+              <div class="inline-actions">
+                <button id="empty-new-project" class="primary">
+                  Create project</button
+                ><button id="open-example">Open example</button>
+              </div>
+            </div>
+          </div>
+          <footer class="canvas-status">
+            <span id="selection-status" role="status">No project open</span>
+            <div class="inline-actions">
+              <label class="check"
+                ><input type="checkbox" id="snap-enabled" checked /> Smart
+                guides</label
+              ><button id="zoom-out" aria-label="Zoom out">−</button
+              ><span id="zoom-value">100%</span
+              ><button id="zoom-in" aria-label="Zoom in">+</button
+              ><button id="zoom-fit">Fit</button>
+            </div>
+          </footer>
+        </div>
+        <aside class="panel inspector-panel" aria-label="Properties">
+          <div class="panel-title"><h2>Properties</h2></div>
+          <div id="inspector"></div>
+        </aside>
+      </section>
+      <section
+        id="view-data"
+        class="workspace-view"
+        aria-label="Data workspace"
+        hidden
+      >
+        <div id="data-workspace" class="research-layout"></div>
+      </section>
+      <section
+        id="view-structures"
+        class="workspace-view"
+        aria-label="Protein structures workspace"
+        hidden
+      >
+        <div id="structures-workspace" class="research-layout"></div>
+      </section>
+      <section
+        id="view-versions"
+        class="workspace-view"
+        aria-label="Project versions"
+        hidden
+      >
+        <div id="versions-workspace" class="content-page"></div>
+      </section>
+      <section
+        id="view-native"
+        class="workspace-view"
+        aria-label="Native Matplotlib figures"
+        hidden
+      >
+        <div id="native-workspace" class="native-workspace"></div>
+      </section>
+    </main>
+    <dialog id="new-project-dialog" aria-labelledby="new-project-title">
+      <form id="new-project-form">
+        <div class="dialog-heading">
+          <h2 id="new-project-title">New research project</h2>
+          <button type="button" data-close aria-label="Close dialog">×</button>
+        </div>
+        <label
+          >Project name<input
+            name="name"
+            required
+            maxlength="200"
+            autocomplete="off"
+            placeholder="e.g. Enzyme activity study" /></label
+        ><label
+          >Description<textarea
+            name="description"
+            rows="3"
+            maxlength="5000"
+            placeholder="Research question, sample provenance, or figure notes"
+          ></textarea></label
+        ><label class="check"
+          ><input type="checkbox" name="example" /> Start with clearly labeled
+          example data and a figure</label
+        >
+        <p class="form-error" role="alert" hidden></p>
+        <div class="dialog-actions">
+          <button type="button" data-close>Cancel</button
+          ><button type="submit" class="primary">Create project</button>
+        </div>
+      </form>
+    </dialog>
+    <dialog id="project-dialog" aria-labelledby="project-title">
+      <form id="project-form">
+        <div class="dialog-heading">
+          <h2 id="project-title">Project details</h2>
+          <button type="button" data-close aria-label="Close dialog">×</button>
+        </div>
+        <label>Name<input name="name" required maxlength="200" /></label
+        ><label
+          >Research notes<textarea
+            name="description"
+            rows="6"
+            maxlength="20000"
+          ></textarea></label
+        ><label
+          >Tags, separated by commas<input
+            name="tags"
+            maxlength="1000"
+            placeholder="protein, experiment-01"
+        /></label>
+        <p class="form-error" role="alert" hidden></p>
+        <div class="inline-actions">
+          <button type="button" id="export-bundle">
+            Download project bundle</button
+          ><button type="button" id="import-bundle">
+            Import project bundle
+          </button>
+        </div>
+        <div class="dialog-actions">
+          <button type="button" data-close>Cancel</button
+          ><button type="submit" class="primary">Save details</button>
+        </div>
+      </form>
+    </dialog>
+    <dialog id="help-dialog" aria-labelledby="help-title">
+      <div class="dialog-heading">
+        <h2 id="help-title">Working in Forge</h2>
+        <button data-close aria-label="Close help">×</button>
+      </div>
+      <p>
+        Import a dataset in <strong>Data</strong>, prepare it without changing
+        the source, and create a plot. Compose your figure, add a protein view,
+        then save a named checkpoint in <strong>Versions</strong>.
+      </p>
+      <table class="shortcuts">
+        <tbody>
+          <tr>
+            <th scope="row">Select / edit points</th>
+            <td><kbd>V</kbd> / <kbd>A</kbd></td>
+          </tr>
+          <tr>
+            <th scope="row">Extend selection / cycle overlap</th>
+            <td><kbd>Shift</kbd> / <kbd>Alt</kbd> + click</td>
+          </tr>
+          <tr>
+            <th scope="row">Pan / zoom</th>
+            <td><kbd>Space</kbd> + drag / Ctrl + wheel</td>
+          </tr>
+          <tr>
+            <th scope="row">Move selection</th>
+            <td>Arrow keys; Shift for 10 px</td>
+          </tr>
+          <tr>
+            <th scope="row">Undo / redo</th>
+            <td>Ctrl/⌘ + Z / Shift + Z</td>
+          </tr>
+          <tr>
+            <th scope="row">Group / ungroup</th>
+            <td>Ctrl/⌘ + G / Shift + G</td>
+          </tr>
+          <tr>
+            <th scope="row">Duplicate / copy / paste</th>
+            <td>Ctrl/⌘ + D / C / V</td>
+          </tr>
+          <tr>
+            <th scope="row">Cancel gesture / clear selection</th>
+            <td>Escape</td>
+          </tr>
+          <tr>
+            <th scope="row">Save editable project</th>
+            <td>Ctrl/⌘ + S</td>
+          </tr>
+        </tbody>
+      </table>
+      <p class="muted">
+        Save persists the editable project. Checkpoints preserve research
+        versions. Export creates a publication file. A drag creates one undo
+        step; locked objects stay in place.
+      </p>
+      <p class="muted">
+        In Matplotlib, Undo and Redo apply to the attached figure. Ctrl/⌘ + S
+        downloads Python changes to replay against the original Figure; keep the
+        original plotting script.
+      </p>
+      <div class="dialog-actions">
+        <button data-close class="primary">Got it</button>
+      </div>
+    </dialog>
+    <input id="file-image" type="file" accept="image/png" hidden /><input
+      id="file-bundle"
+      type="file"
+      accept="application/json,.json"
+      hidden
+    />
+    <noscript
+      >This research workspace requires JavaScript. Enable JavaScript and
+      reload.</noscript
+    >
+  </body>
+</html>

@@ -190,7 +190,48 @@ change tracker.
 
 ## Quick start
 
-### Install this fork
+### Headless Web research workspace
+
+The Web workspace runs without Qt, a display server, or a remote desktop. From
+this checkout:
+
+```bash
+python -m pip install -e '.[web]'
+pylustrator-web --data-dir ./research-workspace --port 8765
+```
+
+Open **http://127.0.0.1:8765**. Create a project or use the explicitly labeled
+example, then move through **Data → Figure → Structures → Versions**. Raw datasets
+remain immutable; processing creates derived data with reproducible recipes.
+SVG, PNG, PDF, replayable Python, and complete project bundles are downloadable.
+
+To edit a Figure produced by your existing trusted Python script:
+
+```python
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from pylustrator.web import serve
+
+fig, ax = plt.subplots()
+ax.plot([0, 1, 2], [0, 1, 0], marker="o")
+serve(fig, data_dir="./research-workspace")
+```
+
+The **Matplotlib** view uses the existing semantic adapters for live artist
+editing and undo/redo. Native sessions and persistent composition documents have
+explicitly different lifetimes and support boundaries; see the
+[Web workspace guide](docs/web_workspace.md), [API contract](docs/web_contract.md),
+[architecture](docs/web_architecture.md), [migration/reference review](docs/web_research.md),
+and [executed verification with remaining performance gates](docs/web_verification.md).
+
+For a headless remote machine, leave the server on loopback and connect with
+`ssh -L 8765:127.0.0.1:8765 user@host`. The browser UI, including its bundled
+molecular renderer, has no runtime CDN dependency.
+
+![The Web structure workspace rendering the bundled real 1CRN protein](docs/assets/web-research-structures.png)
+
+### Install this fork for desktop editing
 
 This fork is not published under the upstream `pylustrator` distribution name.
 `pip install pylustrator` installs the upstream project, not the interaction
@@ -200,14 +241,14 @@ Install Forge directly from GitHub:
 
 ```bash
 python -m pip install \
-  "pylustrator @ git+https://github.com/Molaison/pylustrator-illustrator.git@main"
+  "pylustrator[desktop] @ git+https://github.com/Molaison/pylustrator-illustrator.git@main"
 ```
 
 With `uv`:
 
 ```bash
 uv pip install \
-  "pylustrator @ git+https://github.com/Molaison/pylustrator-illustrator.git@main"
+  "pylustrator[desktop] @ git+https://github.com/Molaison/pylustrator-illustrator.git@main"
 ```
 
 For a reproducible environment, replace `main` with a release tag or full
@@ -288,6 +329,12 @@ See:
   serializers.
 
 ## Validation snapshot
+
+The 2026-10-21 Web migration has a separate [verification report](docs/web_verification.md):
+99 tests passed in a Qt-free installation, 7 browser state tests passed, and real
+Chromium workflows passed. The complete Python run recorded 1,515 passes, 178
+capability skips, and 3 failures at existing 4 ms desktop timing gates. The report
+includes baseline comparisons and does not present those gates as resolved.
 
 At the 2026-07-18 fork milestone:
 

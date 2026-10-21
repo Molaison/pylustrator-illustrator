@@ -44,7 +44,7 @@ jobs:
         if: matrix.dependencies == 'minimum'
         run: |
           uv venv --python ${{ matrix.python-version }}
-          uv pip install --resolution lowest-direct --editable ".[test]"
+          uv pip install --resolution lowest-direct --editable ".[test,desktop,web]"
 
       - name: Install locked dependencies
         if: matrix.dependencies == 'locked'
@@ -54,3 +54,29 @@ jobs:
         run: .venv/bin/python -m pytest
         env:
           QT_QPA_PLATFORM: "offscreen"
+
+  headless-web:
+    name: Web without Qt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+      - run: uv sync --locked --extra web --extra test --no-default-groups
+      - name: Verify no GUI runtime is installed
+        run: .venv/bin/python -c "import importlib.util; assert importlib.util.find_spec('PyQt5') is None; assert importlib.util.find_spec('qtpy') is None; import pylustrator; import pylustrator.web"
+      - run: .venv/bin/python -m pytest tests/test_web_*.py
+        env:
+          MPLBACKEND: Agg
+
+  browser-workflow:
+    name: Web browser workflow
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+      - run: uv sync --locked --extra web --extra test --extra browser-test --no-default-groups
+      - run: .venv/bin/python -m playwright install --with-deps chromium
+      - run: node tests/web/state.test.mjs
+      - run: .venv/bin/python scripts/test_web_browser.py
+        env:
+          MPLBACKEND: Agg

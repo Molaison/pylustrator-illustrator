@@ -19,7 +19,6 @@
 # You should have received a copy of the GNU General Public License
 # along with Pylustrator. If not, see <http://www.gnu.org/licenses/>
 
-from .QtGuiDrag import initialize as start
 from .helper_functions import (
     fig_text,
     add_axes,
@@ -36,7 +35,6 @@ from .helper_functions import (
     add_letter,
     add_letters,
 )
-from .QtGui import initialize as StartColorChooser
 from .lab_colormap import LabColormap
 from .helper_functions import loadFigureFromFile as load
 from .artist_adapters import (
@@ -99,6 +97,28 @@ from .source_doctor import (
     SourceDoctorReport,
     diagnose_generated_source,
 )
+
+
+def start(*args, **kwargs):
+    """Start the optional desktop editor without importing Qt on package import."""
+    try:
+        from .QtGuiDrag import initialize
+    except ImportError as exc:
+        raise ImportError(
+            "The desktop editor needs Qt. Install pylustrator[desktop], or use "
+            "pylustrator.web for the headless browser workspace."
+        ) from exc
+    return initialize(*args, **kwargs)
+
+
+def StartColorChooser(*args, **kwargs):
+    """Open the optional desktop color chooser."""
+    try:
+        from .QtGui import initialize
+    except ImportError as exc:
+        raise ImportError("Install pylustrator[desktop] to use the color chooser.") from exc
+    return initialize(*args, **kwargs)
+
 
 __version__ = "1.3.0"
 
