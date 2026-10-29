@@ -1,13 +1,19 @@
 {
   "browser": "154.0.8037.57",
   "source": "scripts/demo_content_regions.py",
-  "coordinateSpace": "artboard",
-  "units": "document-px",
-  "viewportZoomApplied": false,
   "beforeTruePlotLeftPx": [
     252.54000000000002,
     374.4
   ],
+  "serverPackage": "installed-wheel",
+  "runtime": {
+    "python": "3.12.14",
+    "matplotlib": "3.11.2",
+    "fastapi": "0.162.0"
+  },
+  "coordinateSpace": "artboard",
+  "units": "document-px",
+  "viewportZoomApplied": false,
   "afterTruePlotLeftPx": [
     252.54000000000002,
     252.9
@@ -23,5 +29,14 @@
   "controlsFitDrawer": true,
   "nativePlotDetection": true,
   "resizedPlotInvalidation": true,
+  "unappliedCorrectionCannotConfirmOrAlign": true,
+  "ordinaryPngImport": true,
+  "manualBoundsSavedReload": true,
+  "imageSourceReplacementInvalidation": true,
+  "zoomRotationKeepLocalFractions": true,
+  "simulatedTransportChecks": [
+    "cancel held request",
+    "503 then retry"
+  ],
   "pageErrors": []
 }

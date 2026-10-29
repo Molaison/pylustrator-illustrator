@@ -11,6 +11,32 @@ Agent observation/command APIs and the separate live native-session UI are outsi
 this change. Matplotlib **composition plots** use exact renderer-owned Axes;
 `matplotlib_regions(figure)` also exposes the same measurement for trusted callers.
 
+## Ordinary project workflow and recovery
+
+No demo setup is needed: start `pylustrator-web`, create a blank project and use
+the **Image** button to import a PNG, or add a data plot from **Data**. Selecting
+that panel opens **Content alignment** in Properties. The built-in Help dialog
+also describes this entry point.
+
+- A changed numeric field is an **unapplied preview**. Confirmation, detection
+  and alignment pause until **Apply correction** or **Discard correction**;
+  Escape in the form also discards the draft. Confirming a different, previously
+  detected outline while a draft is visible is prevented.
+- **Cancel detection** aborts the browser request and leaves the prior metadata
+  and history intact. Changing the project, selection or document also cancels
+  stale work. The server may finish an already-running read-only computation;
+  cancelled results are never committed to the document.
+- Detector errors name the affected panel and offer retry or manual bounds.
+  No partially completed batch replaces selected bounds. Unsupported selections
+  explain that only visible, unlocked images and plots can be edited.
+- After source replacement or plot layout changes, **Source changed** explains
+  how to re-detect or enter new bounds. Old overlays disappear. Manual corrections
+  persist through ordinary Save/reload and the existing Undo/Redo workflow.
+- Percentages always refer to the complete source panel before its rotation or
+  viewport zoom. A rotated region's outer bounds determine its alignment edge.
+
+[Ordinary PNG import and source replacement in the editor](assets/content-regions/ordinary-import-workflow.png)
+
 ## Try the interactive editor
 
 ```bash
@@ -131,6 +157,43 @@ overlay. Future Arena integration can consume this contract without editing thes
 modules. An older application version ignores this optional metadata on load/save;
 keep an exported bundle before rolling back if region annotations must survive.
 
+## Local compatibility with the native Arena branch
+
+The content branch and `codex/figreflow-agent-arena` at `cbf2730` were combined
+in an isolated local worktree, with no file conflicts. No Arena files or its
+remote branch were modified, and no remote merge was performed.
+
+The combined contract check verifies actual project detection/save alongside
+Arena observe/move/undo in one app. The native Axes plot bounds match
+`matplotlib_regions(figure)` after multiplying normalized coordinates by the
+Arena Figure's own width/height. Native session actions leave the saved project,
+its region metadata and its immutable PNG bytes unchanged; project detection
+does not advance the native session revision.
+
+These are **two distinct object domains**. Arena IDs belong to live native
+Figures, while content panel IDs belong to persisted project documents. Passing
+a project panel ID to the native Arena rejects rather than editing another
+object. Agent actions on imported project PNGs would need a project-document
+command adapter; this change does not imply that native Arena already supports
+them. The existing project-scoped detection response is available for that later
+integration without reimplementing detection or browser history.
+
+Run the optional combined check only in a checkout containing both branches:
+
+```bash
+python -m pytest -q tests/test_web_content_arena_integration.py
+```
+
+It skips explicitly in the standalone content branch when Arena is absent.
+
+The combined wheel was also installed in a fresh virtual environment through
+normal dependency resolution with `[web,browser-test]`. From outside the checkout,
+the installed app served the region UI/CSS and real detection route, and opt-in
+Arena observation loaded its packaged CSV. The complete browser workflow then ran
+against that installed app, using Matplotlib 3.11.2 and FastAPI 0.162.0, without Qt.
+See [installation record](assets/content-regions/installed-package.json) and
+[installed-app browser record](assets/content-regions/verification.json).
+
 ## Reproduce validation
 
 ```bash
@@ -147,15 +210,33 @@ Install Playwright Chromium if needed, or set `CHROMIUM_PATH` to an already
 installed Chromium. The browser script starts a separate local server and creates
 its own demo workspace. It emits genuine screenshots, an aligned PNG export,
 original assets, before/after project bundles, and a JSON verification record.
+The browser flow first creates an ordinary blank project, imports PNGs via the
+existing file picker, saves/reloads manual bounds, and replaces an image through
+the real versioned project API to verify invalidation and recovery. Normal
+detection, rendering and persistence use the real backend. A held request and
+an HTTP 503 are explicitly simulated to exercise cancellation and error recovery.
+No benchmark or performance improvement is claimed.
 
-Verified in this cloud environment: Python 3.12, Matplotlib 3.10.8, FastAPI 0.141.1,
-Chromium 154.0.8037.57. All 105 Web tests and 13 state/geometry tests passed. Browser
+To run the same browser flow against a wheel installed outside the checkout,
+use its Python environment and pass the installation's site-packages directory:
+
+```bash
+python scripts/test_content_regions_browser.py --output /tmp/wheel-evidence \
+  --installed-package /path/to/venv/lib/python3.12/site-packages
+```
+
+The initial checkout checks used Python 3.12, Matplotlib 3.10.8 and FastAPI 0.141.1.
+The current screenshots and browser record come from the installed combined wheel
+with Python 3.12.14, Matplotlib 3.11.2, FastAPI 0.162.0 and Chromium 154.0.8037.57.
+All 105 Web tests and 13 state/geometry tests passed; the optional Arena integration
+test skips on the standalone content branch and passes in the combined worktree. Browser
 checks cover real detection, confirmation, alignment, correction, Undo/Redo,
 unchanged PNG source bytes, save/reload, delayed response rejection, native plot
 measurement, resized plot invalidation and a 390 px drawer. No page errors.
-Ruff 0.14.11 and the targeted Ty 0.0.44 check pass. Full-repository Ty cannot pass
-in this intentionally Qt-free environment because PyQt5/qtpy/scikit-image imports
-are unavailable; desktop interaction and full locked CI are unverified here.
+Ruff 0.14.11 and the targeted Ty 0.0.44 check pass. Full-repository Ty in the original
+test environment remains limited by missing desktop/scikit-image imports; desktop
+interaction and full locked CI are unverified here. The separate clean wheel
+installation resolved all declared headless dependencies successfully.
 
 Review used the evidence-review workflow on the code, independent Axes truth and
 real browser outputs. The author performed this review; no independent subagent

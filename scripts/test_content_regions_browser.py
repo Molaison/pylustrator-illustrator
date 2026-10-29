@@ -19,7 +19,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-def run(output):
+def run(output, installed_package=None):
+    from importlib.metadata import version
+
     from playwright.sync_api import expect, sync_playwright
     from scripts.demo_content_regions import build_demo
 
@@ -30,9 +32,12 @@ def run(output):
         port = sock.getsockname()[1]
     url = f"http://127.0.0.1:{port}"
     env = {**os.environ, "MPLCONFIGDIR": str(output / "mpl-cache")}
+    if installed_package is not None:
+        env["PYTHONPATH"] = str(installed_package.resolve())
     with (output / "server.log").open("w") as log:
         process = subprocess.Popen([sys.executable, "-m", "pylustrator.web", "--data-dir", str(output / "demo/workspace"),
-                                    "--port", str(port)], cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT)
+                                    "--port", str(port)], cwd=output if installed_package else ROOT,
+                                   env=env, stdout=log, stderr=subprocess.STDOUT)
         try:
             for _ in range(150):
                 if process.poll() is not None:
@@ -52,6 +57,75 @@ def run(output):
                 errors = []
                 page.on("pageerror", lambda error: errors.append(str(error)))
                 page.goto(url)
+                # Use the ordinary project and PNG import controls, without the
+                # pre-seeded demo document or private access to browser state.
+                page.locator("#new-project").click()
+                page.locator('#new-project-form input[name="name"]').fill("Imported panel workflow")
+                page.locator('#new-project-form input[name="example"]').uncheck()
+                page.locator('#new-project-form button[type="submit"]').click()
+                expect(page.locator("#layer-count")).to_have_text("0")
+                imported_id = page.locator("#project-select").input_value()
+                page.locator("#file-image").set_input_files(str(output / "demo/panel-a.png"))
+                expect(page.locator("#layer-count")).to_have_text("1")
+                expect(page.locator("#content-regions")).to_be_visible()
+
+                # These two transport outcomes are intentionally simulated. The
+                # normal detector, import, persistence and renderer below are real.
+                def cancel_held_request(route):
+                    page.locator("#region-cancel-detection").click()
+                    route.abort()
+
+                page.route("**/content-regions/detect", cancel_held_request)
+                page.locator("#region-detect").click()
+                expect(page.locator("#notice-text")).to_contain_text("Detection cancelled")
+                expect(page.locator("#region-detect")).to_be_enabled()
+                expect(page.locator("#region-status")).to_have_text("Detection needed")
+                page.unroute("**/content-regions/detect")
+                page.route("**/content-regions/detect", lambda route: route.fulfill(
+                    status=503, json={"error": {"message": "Temporary detector failure"}}))
+                page.locator("#region-detect").click()
+                expect(page.locator("#notice-text")).to_contain_text("No selected bounds changed")
+                expect(page.locator("#region-detect")).to_be_enabled()
+                page.unroute("**/content-regions/detect")
+                page.locator("#region-detect").click()
+                expect(page.locator("#region-status")).to_have_text("Suggestion · review outline")
+                for key, value in truth[0]["plotBounds"].items():
+                    page.locator(f'#region-form [name="{key}"]').fill(str(value * 100))
+                page.get_by_role("button", name="Apply correction", exact=True).click()
+                expect(page.locator("#region-status")).to_have_text("Manual bounds · confirmed")
+                page.locator("#save-project").click()
+                expect(page.locator("#save-state")).to_have_text("Saved")
+                page.reload()
+                expect(page.locator("#layer-count")).to_have_text("1")
+                page.locator('.layer-select[title^="panel-a.png"]').click()
+                expect(page.locator("#region-status")).to_have_text("Manual bounds · confirmed")
+                page.locator("#zoom-in").click()
+                page.locator('[data-prop="rotation"]').fill("15")
+                page.locator('[data-prop="rotation"]').press("Tab")
+                expect(page.locator("#region-status")).to_have_text("Manual bounds · confirmed")
+                assert float(page.locator('#region-form [name="x"]').input_value()) == 13
+                page.locator("#undo").click()
+                # Source replacement is exercised through the real versioned
+                # project API: the UI has import, not an image-replace control.
+                page.locator("#file-image").set_input_files(str(output / "demo/panel-b.png"))
+                expect(page.locator("#layer-count")).to_have_text("2")
+                page.locator("#save-project").click()
+                expect(page.locator("#save-state")).to_have_text("Saved")
+                imported = context.request.get(url + f"/api/projects/{imported_id}").json()
+                imported["document"]["elements"][0]["assetId"] = imported["document"]["elements"][1]["assetId"]
+                changed = context.request.put(url + f"/api/projects/{imported_id}", data={
+                    "revision": imported["revision"], "document": imported["document"]})
+                assert changed.ok
+                page.reload()
+                expect(page.locator("#layer-count")).to_have_text("2")
+                page.locator('.layer-select[title^="panel-a.png"]').click()
+                expect(page.locator("#region-status")).to_have_text("Source changed · detect again or set new bounds")
+                expect(page.locator("#content-region-overlay polygon")).to_have_count(0)
+                page.locator("#region-detect").click()
+                expect(page.locator("#region-status")).to_have_text("Suggestion · review outline")
+                assert float(page.locator('#region-form [name="x"]').input_value()) == 30
+                page.screenshot(path=str(output / "ordinary-import-workflow.png"), full_page=True)
+
                 page.locator("#project-select").select_option(project["id"])
                 expect(page.locator("#layer-count")).to_have_text("2")
 
@@ -70,6 +144,13 @@ def run(output):
                 select_both()
                 page.locator("#region-detect").click()
                 expect(page.locator("#region-status")).to_have_text("Suggestion · review outline")
+                suggested_x = page.locator('#region-form [name="x"]').input_value()
+                page.locator('#region-form [name="x"]').fill(str(float(suggested_x) + 1))
+                expect(page.locator("#region-confirm")).to_be_disabled()
+                expect(page.locator('[data-region-align="left"]')).to_be_disabled()
+                expect(page.locator("#region-draft-status")).to_contain_text("preview only")
+                page.locator("#region-discard").click()
+                expect(page.locator('#region-form [name="x"]')).to_have_value(suggested_x)
                 # Unreviewed raster guesses cannot silently drive a transform.
                 initial_transform = panel_x()
                 page.locator('[data-region-align="left"]').click()
@@ -172,17 +253,22 @@ def run(output):
                 assert abs(float(page.locator('#region-form [name="x"]').input_value()) - expected_x) < 1e-5
                 page.locator('[data-prop="width"]').fill("700")
                 page.locator('[data-prop="width"]').press("Tab")
-                expect(page.locator("#region-status")).to_have_text("Detection needed")
+                expect(page.locator("#region-status")).to_have_text("Source changed · detect again or set new bounds")
                 page.locator("#undo").click()
                 expect(page.locator("#region-status")).to_have_text("Confirmed bounds")
                 assert not errors, errors
                 report = {"browser": browser.version, "source": "scripts/demo_content_regions.py", "beforeTruePlotLeftPx": before_lefts,
+                          "serverPackage": "installed-wheel" if installed_package else "checkout",
+                          "runtime": {"python": sys.version.split()[0], "matplotlib": version("matplotlib"), "fastapi": version("fastapi")},
                           "coordinateSpace": "artboard", "units": "document-px", "viewportZoomApplied": False,
                           "afterTruePlotLeftPx": after_lefts, "beforeGapPx": abs(before_lefts[1] - before_lefts[0]),
                           "afterGapPx": abs(after_lefts[1] - after_lefts[0]), "originalPngBytesPreserved": True,
                           "undoRedoAlignment": True, "undoRedoCorrection": True, "savedReload": True, "narrowCorrection": True,
                           "lateDetectionDiscarded": True, "controlsFitDrawer": True, "nativePlotDetection": True,
-                          "resizedPlotInvalidation": True, "pageErrors": errors}
+                          "resizedPlotInvalidation": True, "unappliedCorrectionCannotConfirmOrAlign": True,
+                          "ordinaryPngImport": True, "manualBoundsSavedReload": True, "imageSourceReplacementInvalidation": True,
+                          "zoomRotationKeepLocalFractions": True, "simulatedTransportChecks": ["cancel held request", "503 then retry"],
+                          "pageErrors": errors}
                 (output / "verification.json").write_text(json.dumps(report, indent=2) + "\n")
                 print(json.dumps(report, indent=2))
                 browser.close()
@@ -194,4 +280,6 @@ def run(output):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=Path("/tmp/content-regions-evidence"))
-    run(parser.parse_args().output.resolve())
+    parser.add_argument("--installed-package", type=Path, help="Installed site-packages directory; run its server outside the checkout")
+    args = parser.parse_args()
+    run(args.output.resolve(), args.installed_package)
