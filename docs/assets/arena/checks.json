@@ -1,0 +1,37 @@
+{
+  "source": "Bundled illustrative CSV; no research data modified",
+  "panelA": "object-d9c0268b04ff4b4a96a4bf83119d178e",
+  "panelB": "object-f39d8ac4082c41abacb8a6ffaf559ec4",
+  "beforeBounds": [
+    600.0,
+    280.0,
+    240.0,
+    179.2
+  ],
+  "movedBounds": [
+    555.0,
+    240.0,
+    240.0,
+    179.2
+  ],
+  "scaledBounds": [
+    555.0,
+    240.0,
+    320.0,
+    268.79999999999995
+  ],
+  "alignedBounds": [
+    555.0,
+    140.0,
+    320.0,
+    268.79999999999995
+  ],
+  "finalRevision": 5,
+  "sourceValuesUnchanged": true,
+  "axisLimitsUnchanged": true,
+  "fontSizesUnchanged": true,
+  "objectIdsStable": true,
+  "retryAppliedOnce": true,
+  "undoRestoresScaledGeometry": true,
+  "redoRestoresActualPixels": true
+}

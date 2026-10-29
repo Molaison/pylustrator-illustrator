@@ -1,0 +1,88 @@
+[
+  {
+    "request": {
+      "requestId": "01-move",
+      "revision": 0,
+      "operation": "move",
+      "target": "object-f39d8ac4082c41abacb8a6ffaf559ec4",
+      "dx": -45,
+      "dy": -40
+    },
+    "receipt": {
+      "requestId": "01-move",
+      "operation": "move",
+      "sessionId": "session-36090685913d4adf950850df3dffcebb",
+      "beforeRevision": 0,
+      "appliedRevision": 1,
+      "changed": true
+    }
+  },
+  {
+    "request": {
+      "requestId": "02-scale",
+      "revision": 1,
+      "operation": "scale",
+      "target": "object-f39d8ac4082c41abacb8a6ffaf559ec4",
+      "factorX": 1.3333333333333333,
+      "factorY": 1.5,
+      "basis": "plot_area"
+    },
+    "receipt": {
+      "requestId": "02-scale",
+      "operation": "scale",
+      "sessionId": "session-36090685913d4adf950850df3dffcebb",
+      "beforeRevision": 1,
+      "appliedRevision": 2,
+      "changed": true
+    }
+  },
+  {
+    "request": {
+      "requestId": "03-align",
+      "revision": 2,
+      "operation": "align",
+      "target": "object-f39d8ac4082c41abacb8a6ffaf559ec4",
+      "reference": "object-d9c0268b04ff4b4a96a4bf83119d178e",
+      "edge": "top",
+      "basis": "plot_area"
+    },
+    "receipt": {
+      "requestId": "03-align",
+      "operation": "align",
+      "sessionId": "session-36090685913d4adf950850df3dffcebb",
+      "beforeRevision": 2,
+      "appliedRevision": 3,
+      "changed": true
+    }
+  },
+  {
+    "request": {
+      "requestId": "04-undo",
+      "revision": 3,
+      "operation": "undo"
+    },
+    "receipt": {
+      "requestId": "04-undo",
+      "operation": "undo",
+      "sessionId": "session-36090685913d4adf950850df3dffcebb",
+      "beforeRevision": 3,
+      "appliedRevision": 4,
+      "changed": true
+    }
+  },
+  {
+    "request": {
+      "requestId": "05-redo",
+      "revision": 4,
+      "operation": "redo"
+    },
+    "receipt": {
+      "requestId": "05-redo",
+      "operation": "redo",
+      "sessionId": "session-36090685913d4adf950850df3dffcebb",
+      "beforeRevision": 4,
+      "appliedRevision": 5,
+      "changed": true
+    }
+  }
+]
