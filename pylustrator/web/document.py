@@ -190,6 +190,11 @@ def validate_document(document):
             e["plot"] = validate_plot(item.get("plot"))
         elif kind == "image":
             e["assetId"] = identifier(item.get("assetId"), "element.assetId")
+        if "contentRegions" in item:
+            from .content_regions import validate_regions
+            if kind not in {"image", "plot"}:
+                raise DocumentError("Content regions apply only to image and plot panels.")
+            e["contentRegions"] = validate_regions(item["contentRegions"])
         doc["elements"].append(e)
     if point_count > 500000:
         raise DocumentError("The figure exceeds the 500000 point budget.")

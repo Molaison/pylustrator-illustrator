@@ -1,0 +1,24 @@
+{
+  "browser": "154.0.8037.57",
+  "source": "scripts/demo_content_regions.py",
+  "beforeTruePlotLeftPx": [
+    252.54000000000002,
+    374.4
+  ],
+  "afterTruePlotLeftPx": [
+    252.54000000000002,
+    252.9
+  ],
+  "beforeGapPx": 121.85999999999996,
+  "afterGapPx": 0.3599999999999852,
+  "originalPngBytesPreserved": true,
+  "undoRedoAlignment": true,
+  "undoRedoCorrection": true,
+  "savedReload": true,
+  "narrowCorrection": true,
+  "lateDetectionDiscarded": true,
+  "controlsFitDrawer": true,
+  "nativePlotDetection": true,
+  "resizedPlotInvalidation": true,
+  "pageErrors": []
+}

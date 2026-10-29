@@ -11,6 +11,7 @@ import { FigureEditor } from "./editor.js";
 import { DataWorkspace } from "./datasets.js";
 import { StructuresWorkspace } from "./structures.js";
 import { NativeWorkspace } from "./native.js";
+import { ContentRegionsPanel } from "./content-regions.js";
 
 const state = new EditorState();
 let project = null,
@@ -87,6 +88,7 @@ const editor = new FigureEditor(state, hooks),
   data = new DataWorkspace(hooks),
   structures = new StructuresWorkspace(hooks),
   native = new NativeWorkspace(hooks);
+new ContentRegionsPanel(state, hooks);
 state.subscribe(() => status());
 
 function navigationBusy(active) {

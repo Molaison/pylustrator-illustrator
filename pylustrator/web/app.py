@@ -20,6 +20,7 @@ from PIL import Image, UnidentifiedImageError
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from . import ai
+from .content_region_routes import install_content_region_routes
 from .document import new_document, validate_document
 from .protein import parse_structure, validate_view
 from .render import render_document, render_plot
@@ -379,5 +380,6 @@ def create_app(data_dir: str | Path | None = None, *, token: str | None = None,
     def index():
         return FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-cache"})
 
+    install_content_region_routes(app, store)
     app.mount("/static", StaticFiles(directory=STATIC_DIR, check_dir=False), name="static")
     return app
