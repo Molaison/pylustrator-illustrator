@@ -177,6 +177,7 @@ def run(output):
                 expect(page.locator("#region-status")).to_have_text("Confirmed bounds")
                 assert not errors, errors
                 report = {"browser": browser.version, "source": "scripts/demo_content_regions.py", "beforeTruePlotLeftPx": before_lefts,
+                          "coordinateSpace": "artboard", "units": "document-px", "viewportZoomApplied": False,
                           "afterTruePlotLeftPx": after_lefts, "beforeGapPx": abs(before_lefts[1] - before_lefts[0]),
                           "afterGapPx": abs(after_lefts[1] - after_lefts[0]), "originalPngBytesPreserved": True,
                           "undoRedoAlignment": True, "undoRedoCorrection": True, "savedReload": True, "narrowCorrection": True,

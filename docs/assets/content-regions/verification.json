@@ -1,6 +1,9 @@
 {
   "browser": "154.0.8037.57",
   "source": "scripts/demo_content_regions.py",
+  "coordinateSpace": "artboard",
+  "units": "document-px",
+  "viewportZoomApplied": false,
   "beforeTruePlotLeftPx": [
     252.54000000000002,
     374.4

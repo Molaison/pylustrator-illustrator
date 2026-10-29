@@ -40,13 +40,17 @@ Original products: [panel A](assets/content-regions/panel-a.png) and
 
 ## Observed result
 
+All distances below use document (artboard) pixel coordinates, computed as
+`element.x + element.width × source Axes fraction`, before viewport zoom. The
+screenshots show a 104% viewport zoom; the report uses unscaled document geometry.
+
 Before: the source image frames share an X coordinate, but the actual data axes
-are **121.86 CSS px apart** because the white margins and tick labels differ.
+are **121.86 document px apart** because the white margins and tick labels differ.
 
 ![Before: outer frames align but data axes do not](assets/content-regions/before.png)
 
 After: the detected axes align exactly. Compared with the original Matplotlib
-geometry, the residual difference is **0.36 CSS px**, below one pixel; this is
+geometry, the residual difference is **0.36 document px**, below one document pixel; this is
 the expected raster sampling difference. Source bytes, labels and legends are
 preserved. Native composition plots do not incur this raster estimation error.
 
